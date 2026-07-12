@@ -1,0 +1,468 @@
+<title>betterparsec 설계 메모</title>
+<style>
+  :root{
+    --font-sans: system-ui, -apple-system, "Apple SD Gothic Neo", "Pretendard", "Malgun Gothic", sans-serif;
+    --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+
+    --bg:#eceef2;
+    --surface:#f7f8fa;
+    --surface-2:#ffffff;
+    --ink:#12161d;
+    --ink-2:#39424f;
+    --muted:#69717d;
+    --line:#d8dce3;
+    --line-strong:#c3c9d2;
+    --accent:#0e7a88;
+    --accent-2:#0a5560;
+    --accent-wash:#0e7a8814;
+    --good:#1c8f52;
+    --good-wash:#1c8f5216;
+    --warn:#b0741a;
+    --warn-wash:#b0741a18;
+    --crit:#c23a4a;
+    --crit-wash:#c23a4a16;
+    --info:#3a6ea5;
+    --code-bg:#e9ebef;
+    --shadow:0 1px 2px rgba(18,22,29,.05), 0 8px 24px -16px rgba(18,22,29,.22);
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0c1015;
+      --surface:#141a22;
+      --surface-2:#1a212b;
+      --ink:#e9edf2;
+      --ink-2:#aeb8c4;
+      --muted:#7e8996;
+      --line:#232b36;
+      --line-strong:#313b48;
+      --accent:#37c3d3;
+      --accent-2:#8fe6ef;
+      --accent-wash:#37c3d31f;
+      --good:#3ed083;
+      --good-wash:#3ed0831c;
+      --warn:#e2a63c;
+      --warn-wash:#e2a63c1e;
+      --crit:#e86d79;
+      --crit-wash:#e86d791c;
+      --info:#77a8de;
+      --code-bg:#101820;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px -18px rgba(0,0,0,.7);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#eceef2;--surface:#f7f8fa;--surface-2:#ffffff;--ink:#12161d;--ink-2:#39424f;--muted:#69717d;
+    --line:#d8dce3;--line-strong:#c3c9d2;--accent:#0e7a88;--accent-2:#0a5560;--accent-wash:#0e7a8814;
+    --good:#1c8f52;--good-wash:#1c8f5216;--warn:#b0741a;--warn-wash:#b0741a18;--crit:#c23a4a;--crit-wash:#c23a4a16;
+    --info:#3a6ea5;--code-bg:#e9ebef;--shadow:0 1px 2px rgba(18,22,29,.05), 0 8px 24px -16px rgba(18,22,29,.22);
+  }
+  :root[data-theme="dark"]{
+    --bg:#0c1015;--surface:#141a22;--surface-2:#1a212b;--ink:#e9edf2;--ink-2:#aeb8c4;--muted:#7e8996;
+    --line:#232b36;--line-strong:#313b48;--accent:#37c3d3;--accent-2:#8fe6ef;--accent-wash:#37c3d31f;
+    --good:#3ed083;--good-wash:#3ed0831c;--warn:#e2a63c;--warn-wash:#e2a63c1e;--crit:#e86d79;--crit-wash:#e86d791c;
+    --info:#77a8de;--code-bg:#101820;--shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px -18px rgba(0,0,0,.7);
+  }
+
+  *{box-sizing:border-box}
+  body{margin:0}
+  .page{
+    font-family:var(--font-sans);
+    background:var(--bg);
+    color:var(--ink);
+    line-height:1.62;
+    -webkit-font-smoothing:antialiased;
+    padding:clamp(20px,4vw,56px) clamp(16px,4vw,40px) 80px;
+  }
+  .wrap{max-width:880px;margin:0 auto;display:flex;flex-direction:column;gap:clamp(30px,5vw,52px)}
+
+  /* header */
+  .masthead{display:flex;flex-direction:column;gap:16px}
+  .eyebrow{
+    font-family:var(--font-mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--accent-2);display:flex;align-items:center;gap:10px;
+  }
+  .eyebrow::before{content:"";width:26px;height:2px;background:var(--accent);border-radius:2px}
+  h1{
+    font-size:clamp(28px,5.4vw,44px);line-height:1.08;margin:0;font-weight:760;letter-spacing:-.02em;
+    text-wrap:balance;
+  }
+  h1 .tp{color:var(--accent)}
+  .dek{font-size:clamp(16px,2.4vw,18.5px);color:var(--ink-2);max-width:64ch;margin:0;text-wrap:pretty}
+  .meta{
+    display:flex;flex-wrap:wrap;gap:8px 10px;margin-top:4px;
+    font-family:var(--font-mono);font-size:12px;color:var(--muted);
+  }
+  .meta span{background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:3px 11px}
+
+  /* thesis callout */
+  .thesis{
+    background:linear-gradient(180deg,var(--accent-wash),transparent 140%);
+    border:1px solid var(--line);border-left:3px solid var(--accent);
+    border-radius:14px;padding:clamp(18px,3vw,26px);box-shadow:var(--shadow);
+  }
+  .thesis .lbl{font-family:var(--font-mono);font-size:11.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent-2);margin-bottom:8px}
+  .thesis p{margin:0;font-size:clamp(16px,2.5vw,19px);font-weight:520;line-height:1.5}
+  .thesis strong{color:var(--accent-2);font-weight:720}
+
+  section{display:flex;flex-direction:column;gap:18px}
+  .sec-head{display:flex;align-items:baseline;gap:12px;border-bottom:1px solid var(--line);padding-bottom:10px}
+  .sec-num{font-family:var(--font-mono);font-size:13px;color:var(--accent);font-weight:600;flex:none}
+  h2{font-size:clamp(19px,3vw,24px);margin:0;font-weight:680;letter-spacing:-.01em}
+  h3{font-size:15.5px;margin:0 0 2px;font-weight:660}
+  p{margin:0}
+  .lead{color:var(--ink-2);font-size:15.5px;max-width:66ch}
+
+  /* verdict chips */
+  .chip{
+    font-family:var(--font-mono);font-size:11px;font-weight:600;letter-spacing:.03em;
+    padding:2px 8px;border-radius:6px;white-space:nowrap;display:inline-block;border:1px solid transparent;
+  }
+  .chip.ok{color:var(--good);background:var(--good-wash);border-color:color-mix(in srgb,var(--good) 30%,transparent)}
+  .chip.dis{color:var(--crit);background:var(--crit-wash);border-color:color-mix(in srgb,var(--crit) 30%,transparent)}
+  .chip.ctx{color:var(--warn);background:var(--warn-wash);border-color:color-mix(in srgb,var(--warn) 30%,transparent)}
+  .chip.unv{color:var(--muted);background:var(--code-bg);border-color:var(--line-strong)}
+
+  code{font-family:var(--font-mono);font-size:.9em;background:var(--code-bg);padding:1.5px 6px;border-radius:5px;color:var(--ink)}
+
+  /* cards */
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media (max-width:640px){.grid2{grid-template-columns:1fr}}
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px 18px;display:flex;flex-direction:column;gap:9px;box-shadow:var(--shadow)}
+  .card .tag{font-family:var(--font-mono);font-size:11px;letter-spacing:.05em;color:var(--muted);text-transform:uppercase}
+  .card p{font-size:14px;color:var(--ink-2);line-height:1.55}
+  .card ul{margin:0;padding-left:18px;font-size:13.5px;color:var(--ink-2);display:flex;flex-direction:column;gap:4px}
+
+  /* cause ranking */
+  .causes{display:flex;flex-direction:column;gap:12px}
+  .cause{display:grid;grid-template-columns:180px 1fr;gap:14px;align-items:center}
+  @media (max-width:560px){.cause{grid-template-columns:1fr;gap:4px}}
+  .cause .name{font-size:14px;font-weight:600}
+  .cause .name small{display:block;font-weight:400;color:var(--muted);font-size:12px;font-family:var(--font-mono)}
+  .bar{height:26px;background:var(--code-bg);border-radius:7px;overflow:hidden;position:relative;border:1px solid var(--line)}
+  .bar span{position:absolute;inset:0 auto 0 0;border-radius:7px 0 0 7px;display:flex;align-items:center;padding-left:11px;font-family:var(--font-mono);font-size:11.5px;font-weight:600;color:#fff}
+  .bar .l-dom{background:linear-gradient(90deg,var(--crit),color-mix(in srgb,var(--crit) 70%,#000));width:92%}
+  .bar .l-mid{background:linear-gradient(90deg,var(--warn),color-mix(in srgb,var(--warn) 72%,#000));width:56%}
+  .bar .l-mid2{background:linear-gradient(90deg,var(--warn),color-mix(in srgb,var(--warn) 72%,#000));width:50%}
+  .bar .l-low{background:linear-gradient(90deg,var(--accent),var(--accent-2));width:30%;color:#04222a}
+
+  /* diagram */
+  .diagram-wrap{border:1px solid var(--line);border-radius:14px;background:var(--surface);padding:12px;overflow-x:auto;box-shadow:var(--shadow)}
+  .diagram-wrap svg{display:block;min-width:720px;width:100%;height:auto}
+  .di-cap{font-size:13px;color:var(--muted);margin-top:2px;padding:0 4px}
+
+  /* table */
+  .tbl-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow)}
+  table{border-collapse:collapse;width:100%;min-width:560px;font-size:13.5px;background:var(--surface)}
+  th,td{text-align:left;padding:11px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{font-family:var(--font-mono);font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);font-weight:600;background:var(--surface-2)}
+  tr:last-child td{border-bottom:none}
+  td.claim{color:var(--ink);font-weight:500}
+  td.note{color:var(--ink-2)}
+  td.vd{white-space:nowrap}
+
+  /* timeline */
+  .timeline{display:flex;flex-direction:column;gap:0}
+  .phase{display:grid;grid-template-columns:auto 1fr;gap:16px;position:relative;padding-bottom:20px}
+  .phase:last-child{padding-bottom:0}
+  .rail{display:flex;flex-direction:column;align-items:center}
+  .dot{width:15px;height:15px;border-radius:50%;background:var(--surface-2);border:2.5px solid var(--accent);flex:none;margin-top:4px;z-index:1}
+  .phase.opt .dot{border-color:var(--line-strong)}
+  .line{width:2px;flex:1;background:var(--line-strong);margin-top:2px}
+  .phase:last-child .line{display:none}
+  .p-body{display:flex;flex-direction:column;gap:5px;padding-bottom:6px}
+  .p-title{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+  .p-title strong{font-size:15px}
+  .p-when{font-family:var(--font-mono);font-size:11.5px;color:var(--accent-2);background:var(--accent-wash);padding:1px 8px;border-radius:6px}
+  .phase.opt .p-when{color:var(--muted);background:var(--code-bg)}
+  .p-body p{font-size:13.5px;color:var(--ink-2);max-width:62ch}
+
+  .callout{border:1px solid var(--line);border-left:3px solid var(--warn);background:var(--warn-wash);border-radius:12px;padding:16px 18px;display:flex;flex-direction:column;gap:6px}
+  .callout.crit{border-left-color:var(--crit);background:var(--crit-wash)}
+  .callout .lbl{font-family:var(--font-mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--warn);font-weight:600}
+  .callout.crit .lbl{color:var(--crit)}
+  .callout p{font-size:14px;color:var(--ink-2);line-height:1.55}
+
+  .legend{display:flex;flex-wrap:wrap;gap:8px 14px;font-size:12px;color:var(--muted);align-items:center}
+  .legend .chip{font-size:10px}
+
+  .next{background:var(--surface-2);border:1px solid var(--line-strong);border-radius:14px;padding:clamp(18px,3vw,26px);display:flex;flex-direction:column;gap:14px;box-shadow:var(--shadow)}
+  .next ol{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:10px;font-size:14.5px}
+  .next ol strong{color:var(--accent-2)}
+  .next li span{color:var(--ink-2);font-size:13.5px}
+
+  .foot{font-size:12px;color:var(--muted);font-family:var(--font-mono);border-top:1px solid var(--line);padding-top:16px;text-wrap:pretty;line-height:1.7}
+
+  a{color:var(--accent-2);text-decoration:none;border-bottom:1px solid color-mix(in srgb,var(--accent) 40%,transparent)}
+  @media (prefers-reduced-motion:no-preference){
+    .card,.thesis,.next{animation:rise .5s cubic-bezier(.2,.7,.3,1) both}
+    @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  }
+</style>
+
+<div class="page">
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="eyebrow">설계 · 검증 메모 / remote desktop</div>
+    <h1><span class="tp">betterparsec</span> — 저지연 원격제어, 만들 가치가 있나</h1>
+    <p class="dek">사지방 공용 PC에서 집 Windows PC로. 3차에 걸친 다중 에이전트 리서치로 “Sunshine이 Parsec보다 낫다”를 엄격히 검증하고, 실제 만들 수 있는 아키텍처와 정직한 빌드 vs 구매 판정까지 정리한다.</p>
+    <div class="meta">
+      <span>3× multi-agent 워크플로</span>
+      <span>34건 적대적 검증</span>
+      <span>전송 = Cloudflare WARP (고정)</span>
+      <span>2026-07</span>
+    </div>
+  </header>
+
+  <div class="thesis">
+    <div class="lbl">한 줄 결론</div>
+    <p>재페어링은 <strong>이미 해결된 문제(빌드 불필요)</strong>이고, 진짜 병목은 인증이 아니라 <strong>WARP 연결성 + 적응형 비트레이트 부재</strong>다. 그런데 당신의 실제 불만인 “뭉개짐”을 막아주는 게 적응형 비트레이트인데 — 그건 Parsec엔 있고 Sunshine 계열엔 없다. 그래서 뭉개짐만 놓고 보면 <strong>Parsec이 솔직히 더 나은 도구</strong>다.</p>
+  </div>
+
+  <!-- 1. 뭉개짐 원인 -->
+  <section>
+    <div class="sec-head"><span class="sec-num">01</span><h2>화질 “뭉개짐”의 원인 순위</h2></div>
+    <p class="lead">코덱은 가장 작은 레버다. 지배 요인은 전송(WARP)이고, 그 다음이 레이트컨트롤과 4:2:0 크로마다. 막대 폭은 정량 측정이 아니라 <em>기여도의 정성 순위</em>다.</p>
+    <div class="causes">
+      <div class="cause">
+        <div class="name">WARP 전송<small>대역폭·jitter·loss</small></div>
+        <div class="bar"><span class="l-dom">지배적</span></div>
+      </div>
+      <div class="cause">
+        <div class="name">모션 레이트컨트롤<small>single-frame VBV 스파이크</small></div>
+        <div class="bar"><span class="l-mid">중간 · 스크롤 시</span></div>
+      </div>
+      <div class="cause">
+        <div class="name">4:2:0 크로마<small>색 텍스트 fringing</small></div>
+        <div class="bar"><span class="l-mid2">중간 · 정지 시</span></div>
+      </div>
+      <div class="cause">
+        <div class="name">코덱 세대<small>Parsec은 AV1 없음</small></div>
+        <div class="bar"><span class="l-low">작음</span></div>
+      </div>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <span class="tag">왜 WARP인가</span>
+        <p>무료 WARP은 처리량을 <strong>~50% 삭감</strong>하고 <span class="chip ok">CONFIRMED</span>, edge-relay라 jitter/loss가 붙는다. UDP가 완전 차단되면 <strong>TCP 443 폴백</strong> <span class="chip ok">CONFIRMED</span> — 실시간 스트림이 TCP 터널로 들어가면 HoL 블로킹으로 그 자체가 뭉개짐을 만든다.</p>
+      </div>
+      <div class="card">
+        <span class="tag">왜 코덱은 작은가</span>
+        <p>하드웨어 AV1은 HEVC 대비 <strong>~15–25%(한 눈금)</strong>. 큰 스크린콘텐츠 이득(HEVC-SCC −57%, palette/IBC)은 <strong>소프트웨어 인코더 전용</strong>이라 실시간 GPU 경로엔 실현되지 않는다 <span class="chip ok">CONFIRMED</span>. 하드웨어엔 <code>AV1+4:4:4</code>가 아예 없다.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 2. 재페어링 -->
+  <section>
+    <div class="sec-head"><span class="sec-num">02</span><h2>재페어링 — 공짜로 해결됨, 코드 불필요</h2></div>
+    <p class="lead">유일하게 번거롭다던 “매 세션 재페어링”은 커스텀 코드 없이 없앨 수 있다. <span class="chip ok">CONFIRMED</span></p>
+    <div class="grid2">
+      <div class="card">
+        <span class="tag">방법 A · 네이티브</span>
+        <h3>포터블 Moonlight + 신원 복원</h3>
+        <p>페어링된 신원(<code>cert/key/uniqueid</code> + 호스트 cert)을 미리 심은 포터블 폴더를 실행 → PIN 없이 즉시 mutual-TLS 연결.</p>
+        <ul>
+          <li>장점: 무설치급, 코드 0</li>
+          <li>단점: 공용 PC에 private key 노출, 집 <code>sunshine_state.json</code> 고정 필요</li>
+        </ul>
+      </div>
+      <div class="card">
+        <span class="tag">방법 B · 브라우저</span>
+        <h3>moonlight-web-stream (서버측 페어링)</h3>
+        <p>페어링을 <strong>서버측 JSON에 저장</strong> → 브라우저는 로그인만, 재페어링 원천 없음. Vibeshine도 Sunshine 웹UI 계정 세션 기반. <span class="chip ok">CONFIRMED</span></p>
+        <ul>
+          <li>장점: 무설치 + 재페어링 0 + key가 서버측</li>
+          <li>단점: WebRTC 경로 → 연결성·화질은 §4 이슈</li>
+        </ul>
+      </div>
+    </div>
+    <p class="lead" style="color:var(--muted);font-size:13.5px">참고: Sunshine/Apollo에 계정·토큰 인증 기능은 <em>없다</em> <span class="chip ok">CONFIRMED</span> — 위 두 방법이 “계정처럼” 동작하게 만드는 우회다.</p>
+  </section>
+
+  <!-- 3. 빌드 vs 구매 -->
+  <section>
+    <div class="sec-head"><span class="sec-num">03</span><h2>빌드 vs 구매 — 정직한 판정</h2></div>
+    <p class="lead">Parsec Warp 유료는 DIY가 가장 고전하는 3가지(계정 인증 · 4:4:4 · 적응형 비트레이트)를 이미 제공한다. 그리고 당신 네트워크에선 Parsec이 이미 된다.</p>
+    <div class="grid2">
+      <div class="card" style="border-left:3px solid var(--good)">
+        <span class="tag" style="color:var(--good)">대부분의 경우 이김</span>
+        <h3>Parsec Warp 유료 · $8.33–9.99/월</h3>
+        <ul>
+          <li>✅ 계정 인증(1회 로그인, 재페어링 0)</li>
+          <li>✅ 10-bit <strong>4:4:4</strong> — 색 텍스트 번짐 제거</li>
+          <li>✅ <strong>BUD 적응형 비트레이트</strong> — jitter 뭉개짐 방지</li>
+          <li>→ 뭉개짐 두 축을 동시에 침</li>
+        </ul>
+      </div>
+      <div class="card" style="border-left:3px solid var(--accent)">
+        <span class="tag" style="color:var(--accent-2)">이럴 때만 이김</span>
+        <h3>DIY betterparsec</h3>
+        <ul>
+          <li>구독 회피 + 자가호스트 <strong>소유·제어</strong></li>
+          <li>무료 4:4:4 / AV1 그 자체가 목적</li>
+          <li>Parsec이 그 망에서 막히는데 자가 443은 뚫릴 때</li>
+          <li>⚠️ jitter 구간 화질은 <strong>오히려 열위</strong>(적응성 부재)</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4. 아키텍처 -->
+  <section>
+    <div class="sec-head"><span class="sec-num">04</span><h2>만든다면 — 확정 아키텍처</h2></div>
+    <p class="lead">최소 미검증 의존성으로 “1회 로그인 · 재페어링 0 · WARP에서 볼 만함”을 만족하는 스택: <strong>브라우저 WebRTC/WebCodecs + 서버측 계정 인증 + coturn TURN-over-TLS(443)</strong>.</p>
+    <div class="diagram-wrap">
+      <svg viewBox="0 0 920 336" role="img" aria-label="betterparsec 아키텍처 다이어그램">
+        <defs>
+          <marker id="arw" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+            <path d="M0,0 L9,4.5 L0,9 Z" fill="var(--accent)"/>
+          </marker>
+          <marker id="arwd" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+            <path d="M0,0 L9,4.5 L0,9 Z" fill="var(--muted)"/>
+          </marker>
+        </defs>
+
+        <!-- WARP band -->
+        <rect x="18" y="30" width="330" height="46" rx="10" fill="var(--accent-wash)" stroke="var(--accent)" stroke-width="1.2" stroke-dasharray="5 4"/>
+        <text x="34" y="52" font-family="var(--font-mono)" font-size="12.5" font-weight="700" fill="var(--accent-2)">Cloudflare WARP</text>
+        <text x="34" y="68" font-family="var(--font-sans)" font-size="11.5" fill="var(--ink-2)">사지방 유일 egress · UDP 차단 우회 · full-tunnel</text>
+
+        <!-- Node A -->
+        <g>
+          <rect x="18" y="128" width="250" height="104" rx="12" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.4"/>
+          <text x="36" y="158" font-family="var(--font-mono)" font-size="11" fill="var(--muted)">CLIENT · 사지방</text>
+          <text x="36" y="182" font-family="var(--font-sans)" font-size="16" font-weight="700" fill="var(--ink)">Plain Chromium</text>
+          <text x="36" y="204" font-family="var(--font-sans)" font-size="12.5" fill="var(--ink-2)">무설치 · 계정 로그인 1회</text>
+          <text x="36" y="221" font-family="var(--font-sans)" font-size="12.5" fill="var(--ink-2)">WebCodecs 디코드</text>
+        </g>
+
+        <!-- Node B -->
+        <g>
+          <rect x="335" y="128" width="250" height="104" rx="12" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.4"/>
+          <text x="353" y="158" font-family="var(--font-mono)" font-size="11" fill="var(--muted)">RELAY · 공인 VPS</text>
+          <text x="353" y="182" font-family="var(--font-sans)" font-size="16" font-weight="700" fill="var(--ink)">coturn TURN/TLS</text>
+          <text x="353" y="204" font-family="var(--font-mono)" font-size="12.5" fill="var(--accent-2)">turns :443?transport=tcp</text>
+          <text x="353" y="221" font-family="var(--font-sans)" font-size="12.5" fill="var(--ink-2)">relay-only ICE 강제</text>
+        </g>
+
+        <!-- Node C -->
+        <g>
+          <rect x="652" y="128" width="250" height="104" rx="12" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.4"/>
+          <text x="670" y="158" font-family="var(--font-mono)" font-size="11" fill="var(--muted)">HOST · 집 Windows</text>
+          <text x="670" y="182" font-family="var(--font-sans)" font-size="16" font-weight="700" fill="var(--ink)">Sunshine + web-stream</text>
+          <text x="670" y="204" font-family="var(--font-sans)" font-size="12.5" fill="var(--ink-2)">서버측 페어링(재페어링 0)</text>
+          <text x="670" y="221" font-family="var(--font-sans)" font-size="12.5" fill="var(--ink-2)">NVENC AV1 / HEVC 4:4:4</text>
+        </g>
+
+        <!-- A -> B -->
+        <line x1="268" y1="170" x2="330" y2="170" stroke="var(--accent)" stroke-width="2" marker-end="url(#arw)"/>
+        <text x="299" y="160" text-anchor="middle" font-family="var(--font-mono)" font-size="10.5" fill="var(--muted)">TCP 443</text>
+        <!-- B -> C -->
+        <line x1="585" y1="170" x2="647" y2="170" stroke="var(--accent)" stroke-width="2" marker-end="url(#arw)"/>
+        <text x="616" y="160" text-anchor="middle" font-family="var(--font-mono)" font-size="10.5" fill="var(--muted)">relay</text>
+
+        <!-- return video path -->
+        <path d="M652,214 C520,300 400,300 268,214" fill="none" stroke="var(--muted)" stroke-width="1.6" stroke-dasharray="6 5" marker-end="url(#arwd)"/>
+        <text x="460" y="300" text-anchor="middle" font-family="var(--font-sans)" font-size="12" fill="var(--muted)">영상 스트림 · HEVC/AV1 → H.264 폴백 · WebCodecs 디코드</text>
+      </svg>
+    </div>
+    <p class="di-cap">전송 부품은 전부 오늘 존재하나, <strong>Cloudflare edge + VPS 릴레이 경유 게임 지연은 미검증</strong> <span class="chip ctx">CONTEXT-DEP</span> — Phase 0에서 반드시 실측.</p>
+  </section>
+
+  <!-- 5. 검증 표 -->
+  <section>
+    <div class="sec-head"><span class="sec-num">05</span><h2>검증된 핵심 사실</h2></div>
+    <div class="legend">
+      <span class="chip ok">CONFIRMED</span> 출처로 확증
+      <span class="chip dis">DISPUTED</span> 반박/정정됨
+      <span class="chip ctx">CONTEXT-DEP</span> 조건부
+      <span class="chip unv">UNVERIFIABLE</span> 확인 불가
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>주장</th><th>판정</th><th>정정/조건</th></tr></thead>
+        <tbody>
+          <tr><td class="claim">Parsec은 closed-source, SDK가 포크·파생물 금지 → 포크 불가</td><td class="vd"><span class="chip ok">CONFIRMED</span></td><td class="note">betterparsec은 Sunshine(GPL) 위에 지어야 함</td></tr>
+          <tr><td class="claim">Parsec은 AV1 미지원(H.264/H.265만), Sunshine은 AV1 지원</td><td class="vd"><span class="chip ok">CONFIRMED</span></td><td class="note">RTX40/Arc/RX7000 하드웨어 AV1</td></tr>
+          <tr><td class="claim">무료 WARP 처리량 ~50% 감소, UDP 완전차단 시 TCP 443 폴백</td><td class="vd"><span class="chip ok">CONFIRMED</span></td><td class="note">280→132 Mbps 측정; 지역 편차 큼</td></tr>
+          <tr><td class="claim">Sunshine 계열 어떤 프로젝트도 적응형 비트레이트(GCC) 미커플링</td><td class="vd"><span class="chip ok">CONFIRMED</span></td><td class="note">Parsec BUD의 핵심 우위가 여기</td></tr>
+          <tr><td class="claim">재페어링은 인증서 복원 / 서버측 페어링으로 제거 가능</td><td class="vd"><span class="chip ok">CONFIRMED</span></td><td class="note">커스텀 코드 불필요</td></tr>
+          <tr><td class="claim">Sunshine/Apollo에 계정·토큰 인증 부재</td><td class="vd"><span class="chip ok">CONFIRMED</span></td><td class="note">moonlight-qt #1576 open·미구현</td></tr>
+          <tr><td class="claim">Parsec Web App은 Chrome 무설치로 자기 호스트 접속</td><td class="vd"><span class="chip ok">CONFIRMED</span></td><td class="note">단 SW 디코드, macOS 호스트 불가</td></tr>
+          <tr><td class="claim">Sunshine은 4:4:4 무료, Parsec은 유료(Warp) — “Sunshine은 4:2:0만”은 낡음</td><td class="vd"><span class="chip dis">DISPUTED</span></td><td class="note">Sunshine 4:4:4 2025-01 정식(AMD 제외)</td></tr>
+          <tr><td class="claim">WARP-to-Tunnel private-net UDP가 실시간 영상에 신뢰성 있음</td><td class="vd"><span class="chip dis">DISPUTED</span></td><td class="note">changelog는 DNS 예시; 게임 지연 미검증</td></tr>
+          <tr><td class="claim">coturn TURN-over-TLS 443 릴레이로 WARP 통과 가능</td><td class="vd"><span class="chip ctx">CONTEXT-DEP</span></td><td class="note">부품은 존재, 릴레이 지연은 실측 필요</td></tr>
+          <tr><td class="claim">브라우저 HEVC/AV1 HW 디코드 (Sunshine급 화질)</td><td class="vd"><span class="chip ctx">CONTEXT-DEP</span></td><td class="note">Chrome 136+·HW·GPU 필요, 아니면 H.264</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 6. 단계별 계획 -->
+  <section>
+    <div class="sec-head"><span class="sec-num">06</span><h2>단계별 계획 — 측정 먼저, 그다음 MVP</h2></div>
+    <div class="timeline">
+      <div class="phase">
+        <div class="rail"><div class="dot"></div><div class="line"></div></div>
+        <div class="p-body"><div class="p-title"><strong>Phase 0 · 사전 de-risk</strong><span class="p-when">1–2일</span></div>
+          <p>아무것도 짓기 전에: ① 대상 망에서 Parsec 연결되나(build-vs-buy를 좌우) ② 대상 PC → 공인 VPS로 outbound TCP 443 뚫리나(<code>curl/iperf</code>) ③ 브라우저 Chrome 버전·<code>chrome://gpu</code> 코덱 확인.</p></div>
+      </div>
+      <div class="phase">
+        <div class="rail"><div class="dot"></div><div class="line"></div></div>
+        <div class="p-body"><div class="p-title"><strong>Phase 1 · MVP</strong><span class="p-when">~1주</span></div>
+          <p>증명 목표 = “1회 로그인 · 재페어링 0 · WARP에서 볼 만함”. 집 Sunshine → moonlight-web-stream 계정 1개·호스트 1회 서버측 페어링 → VPS coturn TLS/443 + relay-only ICE → 사지방 브라우저 접속. 검증: wipe 후 재로그인만으로 재페어링 없이 연결.</p></div>
+      </div>
+      <div class="phase">
+        <div class="rail"><div class="dot"></div><div class="line"></div></div>
+        <div class="p-body"><div class="p-title"><strong>Phase 2 · 화질 하드닝</strong><span class="p-when">~1주</span></div>
+          <p>대상 브라우저/GPU에서 HEVC·AV1 HW 디코드 실제 확인(안 되면 H.264 수용). <strong>WARP 하한 아래 보수적 고정 비트레이트</strong> + 완만 FEC, HW 허용 시 4:4:4/10-bit.</p></div>
+      </div>
+      <div class="phase">
+        <div class="rail"><div class="dot"></div><div class="line"></div></div>
+        <div class="p-body"><div class="p-title"><strong>Phase 3 · 보안 하드닝</strong><span class="p-when">~1–2주</span></div>
+          <p>토큰 <strong>전 필드 서명</strong> · 짧은 수명+refresh(공용 PC엔 refresh 미저장) · <strong>상수시간 비교</strong> · replay/nonce · 안전 인코딩 · HttpOnly/Secure · least-privilege. Vibeshine 채택 시 AI 생성 인증 코드 정밀 감사 필수.</p></div>
+      </div>
+      <div class="phase opt">
+        <div class="rail"><div class="dot"></div><div class="line"></div></div>
+        <div class="p-body"><div class="p-title"><strong>Phase 4 · (선택) 품질 천장</strong><span class="p-when">규모 큼 · 불확실</span></div>
+          <p>사용가능 UDP 전송이 실측 확인되면 네이티브 Moonlight로 지연 개선; 또는 <code>rtpgccbwe</code>→NVENC 적응형을 자체 배선(무겁고 오늘 존재하지 않음).</p></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 7. 리스크 -->
+  <section>
+    <div class="sec-head"><span class="sec-num">07</span><h2>Top 리스크 + de-risk 테스트</h2></div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>#</th><th>리스크</th><th>사전 검증 테스트</th></tr></thead>
+        <tbody>
+          <tr><td class="vd"><strong>1</strong></td><td class="claim">WARP-only 연결성이 실사용 지연에 도달 못함</td><td class="note">WARP 경유 VPS로 TCP 443 iperf/RTT/jitter → 실 미디어 세션 체감</td></tr>
+          <tr><td class="vd"><strong>2</strong></td><td class="claim">TCP 릴레이 + 적응성 부재로 jitter 시 뭉개짐</td><td class="note">부하 하 실게임 frame drop 측정, 보수적 비트레이트+AV1 후 재측정, Parsec 대조</td></tr>
+          <tr><td class="vd"><strong>3</strong></td><td class="claim">잠금 브라우저에서 HW 디코드 불가 → SW H.264</td><td class="note">대상 PC <code>chrome://gpu</code>·Chrome≥136·실사용 코덱 확인</td></tr>
+          <tr><td class="vd"><strong>4</strong></td><td class="claim">공용 PC가 secure-context·외부 443·입력 API 차단</td><td class="note">실기기에서 Chromium·secure-context·외부 443·Gamepad/Keyboard-Lock 동작</td></tr>
+          <tr><td class="vd"><strong>5</strong></td><td class="claim">AI 생성 포크 인증 코드의 취약점</td><td class="note"><code>authenticate()</code>·토큰 코드 감사 + replay/변조/타이밍 침투 테스트</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="callout crit">
+    <span class="lbl">⚠ 규정 리스크 (2회 확인)</span>
+    <p>사지방 이용수칙은 <strong>필터 우회·원격접속을 명시 금지</strong>하고, 사용이 로깅되며 위반 시 징계·계정삭제 소지가 있다(근거: 국방부 훈령 「사이버지식정보방 운영 및 관리에 관한 훈령」). WARP 설치 자체가 우회로 걸릴 수 있다. <strong>기술적 성공 ≠ 사용 허용.</strong> 규정 리스크 없는 환경(집 외부망·휴가지)을 기준으로 설계·사용 권장.</p>
+  </div>
+
+  <!-- next -->
+  <div class="next">
+    <div class="eyebrow" style="color:var(--accent-2)">추천 다음 스텝</div>
+    <ol>
+      <li><strong>무빌드로 뭉개짐 직격:</strong> <span>Parsec Warp 4:4:4 켜기 + WARP 실 대역폭/jitter 측정. 대부분 여기서 해결될 가능성이 높다.</span></li>
+      <li><strong>그래도 소유권·무구독이 목적이면:</strong> <span>Phase 0 측정 → moonlight-web-stream + coturn + compose 스캐폴딩으로 MVP 착수.</span></li>
+      <li><strong>대역폭이 상한이면:</strong> <span>WARP+(Argo smart routing) 라우팅 개선 시도 — 그 이상은 물리적 한계.</span></li>
+    </ol>
+  </div>
+
+  <p class="foot">근거: 3× 다중 에이전트 리서치(에이전트 53 · 적대적 검증 34건), 2026-07. 출처는 각 워크플로 저널에 URL로 기록. 정량 벤치는 대부분 vendor/커뮤니티 측정이며 독립 동일조건 glass-to-glass 벤치는 미확보(UNVERIFIABLE). 판정 태그는 작성 시점 기준.</p>
+
+</div>
+</div>

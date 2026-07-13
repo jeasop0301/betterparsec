@@ -2,18 +2,6 @@
 
 _이 문서 하나로 맥락을 이어받을 수 있게 쓴 인수인계서. 새 세션(GitHub Copilot / 새 Claude 등)에 이 파일을 그대로 붙여넣고 시작하면 된다._
 
-## 🔧 세션 워크플로 규칙 (요약 — 전문은 [AGENTS.md](AGENTS.md))
-
-ChatGPT/DevSpace 세션은 **컨텍스트가 작고 세션 간 기억이 없다.** 규칙은 [AGENTS.md](AGENTS.md)(DevSpace가 매 세션 자동 로드)가 authoritative이며, 핵심만:
-
-1. **시작** — 이 "지금 상태" 절 → 건드릴 seam 파일을 실제로 `read` 후 착수. 추측 코딩 금지.
-2. **한 세션 = 한 논리 단위.** 못 끝낼 규모면 먼저 쪼갠다. 큰 과제는 새 대화로 분리(서브세션, [docs/agent/session-playbook.md](docs/agent/session-playbook.md) C).
-3. **검증** — 코드 바꾸면 빌드/테스트를 **실제로 돌려** 출력 확인. "될 것 같다" 금지. 성능 주장은 2대 실측 전까지 금지.
-4. **커밋** — 논리 단위마다, **세션 종료 전 반드시** `commit` + `push origin betterparsec`. 워크트리 작업도 커밋해 남긴다(백업 아님).
-5. **기록** — 종료 전 이 "지금 상태" 갱신 + [docs/agent/worklog.md](docs/agent/worklog.md) 한 줄. 결정은 대화가 아니라 파일에 남긴다.
-
-반복 절차·워크트리·서브세션 사용법은 [docs/agent/session-playbook.md](docs/agent/session-playbook.md) 참조.
-
 ## 이 프로젝트가 뭐냐
 
 제약된 공용 네트워크(구체적으로 한국군 **사지방** 공용 PC)에서 **집 Windows PC(GPU)** 로 붙는 **저지연·저비트율 원격 데스크톱**. [moonlight-web-stream](https://github.com/MrCreativ3001/moonlight-web-stream)(GPL-3.0) **포크**로, Parsec엔 있고 오픈 스택엔 없던 3가지를 직접 얹는다: **적응형 비트레이트 · WARP 없이 접속 · AV1/화질**.

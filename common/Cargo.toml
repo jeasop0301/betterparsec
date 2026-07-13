@@ -19,6 +19,8 @@ bytes = { workspace = true, features = ["serde"] }
 
 pem = { workspace = true, features = ["serde"] }
 
+openssl = { workspace = true }
+
 serde = { workspace = true }
 serde_json = { workspace = true }
 

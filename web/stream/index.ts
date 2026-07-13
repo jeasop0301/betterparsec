@@ -9,7 +9,7 @@ import { BIG_BUFFER, ByteBuffer } from "./buffer.js"
 import { defaultStreamInputConfig, StreamInput } from "./input.js"
 import { Logger, LogMessageInfo } from "./log.js"
 import { gatherPipeInfo } from "./pipeline/index.js"
-import { StreamStats } from "./stats.js"
+import { BenchmarkContext, StreamStats } from "./stats.js"
 import { Transport, TransportShutdown } from "./transport/index.js"
 import { WebSocketTransport } from "./transport/web_socket.js"
 import { WebRTCTransport } from "./transport/webrtc.js"
@@ -69,8 +69,6 @@ function getVideoCodecHint(settings: Settings): VideoCodecSupport {
     } else if (settings.videoCodec == "av1") {
         videoCodecHint.AV1_MAIN8 = true
         videoCodecHint.AV1_MAIN10 = true
-        videoCodecHint.AV1_HIGH8_444 = true
-        videoCodecHint.AV1_HIGH10_444 = true
     } else if (settings.videoCodec == "auto") {
         videoCodecHint = allVideoCodecs()
     }
@@ -148,8 +146,27 @@ export class Stream implements Component {
         })
         this.input = new StreamInput(streamInputConfig)
 
-        // Stream Stats
-        this.stats = new StreamStats(this.logger)
+        // Stream Stats. Only non-sensitive, browser-observable settings are
+        // included in exported benchmark manifests; host/app query identifiers
+        // are deliberately omitted.
+        const benchmarkContext: BenchmarkContext = {
+            pageUrl: window.location.href,
+            userAgent: navigator.userAgent,
+            streamSettings: {
+                bitrateKbps: settings.bitrate,
+                width: this.streamerSize[0],
+                height: this.streamerSize[1],
+                fps: settings.fps,
+                requestedVideoCodec: settings.videoCodec,
+                requestedHdr: settings.hdr,
+                requestedDataTransport: settings.dataTransport,
+                iceTransportPolicy: settings.iceTransportPolicy ?? "all",
+                playAudioLocal: settings.playAudioLocal,
+                videoFrameQueueSize: settings.videoFrameQueueSize,
+                audioSampleQueueSize: settings.audioSampleQueueSize,
+            },
+        }
+        this.stats = new StreamStats(this.logger, benchmarkContext)
     }
 
     private debugLog(message: string, additional?: LogMessageInfo) {
@@ -519,7 +536,10 @@ export class Stream implements Component {
         transport.onsendmessage = (message) => this.sendWsMessage({ WebRtc: message })
 
         transport.initPeer({
-            iceServers: this.iceServers
+            iceServers: this.iceServers,
+            // Feature #2: relay-only forces all media/candidates through TURN
+            // (443/TLS) so a locked network never needs a direct/UDP path.
+            iceTransportPolicy: this.settings.iceTransportPolicy ?? "all"
         })
         this.setTransport(transport)
 

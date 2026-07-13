@@ -58,6 +58,7 @@ actix-ws = "0.3.0"
 # OpenSSL / Crypto
 openssl = "0.10.67"
 pem = "3.0.5"
+rustls = { version = "0.23.37", default-features = false, features = ["ring"] }
 
 # Serialization
 serde = { version = "1.0.219", features = ["derive"] }
@@ -116,9 +117,16 @@ thiserror.workspace = true
 async-trait.workspace = true
 hex.workspace = true
 sha2 = "0.10.9"
+rustls = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
 
 [lints]
 workspace = true
+
+# BetterParsec pins the upstream revision and applies the repository-owned patches
+# through tools/bootstrap-dependencies.{ps1,sh}. The generated vendor checkout is
+# ignored; patches and revision pins are the reproducible source of truth.
+[patch."https://github.com/MrCreativ3001/moonlight-common-rust.git"]
+moonlight-common = { path = "vendor/moonlight-common-rust" }

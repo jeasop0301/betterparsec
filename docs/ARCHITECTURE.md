@@ -16,24 +16,27 @@
 
 ## Feature 1 — 적응형 비트레이트 (flagship, 난이도 상)
 
-### 현재 상태 (베이스)
-- 브리지는 브라우저에서 **REMB(Receiver Estimated Maximum Bitrate)** 를 이미 받는다:
-  `streamer/src/transport/webrtc/video.rs:159`
-  ```rust
-  if let Some(_max_bitrate) = packet.downcast_ref::<ReceiverEstimatedMaximumBitrate>() {
-      // Moonlight doesn't support dynamic bitrate changing :(
-  }
-  ```
-- 비트레이트는 **스트림 시작 시 1회만** 설정: `streamer/src/main.rs:742` (`MoonlightStreamSettings { bitrate: settings.bitrate_kbps, .. }`).
-- 즉 congestion 신호는 도착하는데 **버려진다**. GameStream 프로토콜에 런타임 비트레이트 변경이 없어서다.
+### 현재 상태
+- REMB와 Receiver Report 손실을 `AbrController`가 bounded target으로 변환한다.
+- WebRTC transport가 target을 `Arc<AtomicU32>`로 apply task에 전달한다.
+- apply task는 초기 session bitrate를 baseline으로 사용하고, 일반 변경은
+  900ms/10% gate를 통과시킨다. 20% 이상 하향은 혼잡 큐 방지를 위해 즉시 보낸다.
+- active moonlight-common fork가 encrypted ENet `0x5506` 메시지를 전송한다.
+- stock Sunshine은 이 메시지를 지원하지 않는다. `x-ss-general.featureFlags`의
+  provisional `DYNAMIC_BITRATE_V1 (0x40)`을 광고한 paired host에서만 송신한다.
+- 프로토콜 ACK가 없으므로 성공 상태는 `sent_unacknowledged`이며 `applied`가 아니다.
+- 현재 ABR 신호는 bridge→browser WebRTC 구간만 관측한다. 이 설계는 Sunshine과
+  bridge가 같은 Windows 호스트에 있다는 상단 배치도를 전제로 한다. 별도 머신이나
+  원격 ingress로 분리하면 Moonlight 구간 estimator를 추가하고 두 target의 최솟값을
+  사용해야 한다.
 
 ### 설계
 1. **신호 수집 강화**: REMB만으로 부족 → transport-cc(TWCC) 피드백을 켜서 손실/RTT/도착간격 기반 대역 추정을 얻는다. (webrtc-rs 설정 + SDP에 `transport-cc` 협상)
 2. **컨트롤러**: AIMD/GCC류로 target_kbps를 평활 산출. 우선순위 = latency > framerate > quality (Parsec BUD 철학). 급락 시 즉시↓, 회복은 완만히↑. per-role `maximum_bitrate_kbps`(`common/src/lib.rs:29`) 상한 준수.
-3. **호스트로 전달 (하드 파트)**: 산출된 target을 Sunshine 인코더에 반영해야 한다. 경로 후보:
-   - **(A · 목표) Sunshine 패치** — Sunshine에 "런타임 비트레이트 변경" 제어 메시지 수용 추가(GPL이라 가능) + `moonlight-common-rust`에 sender 추가. 진짜 해법.
-   - **(B · MVP) client-driven 재설정** — 브라우저가 주기적으로 target을 브리지에 알리고, 브리지가 감내 가능한 최소 hitch로 스트림 파라미터를 갱신. Vibeshine이 유사 런타임 비트레이트 엔드포인트를 이미 추가한 선례.
-   - **(C · 최후) 스트림 재시작** — 크고 hitch 큼. 폴백일 뿐.
+3. **호스트 적용 확인**: Foundation Sunshine의 기존 `0x5506` handler와
+   encoder reconfigure를 사용하되 capability patch를 함께 배포한다. 다음 단계는
+   encoder thread 성공 뒤 request-id ACK를 보내 `queued`와 `applied`를 분리하는 것이다.
+   stock Sunshine이나 capability 없는 호스트에서는 초기 고정 bitrate를 유지한다.
 
 ### 검증
 - 집 호스트 스트림 중 `tc netem`으로 대역/지터/손실 인가 → target_kbps 그래프가 따라 내려가고 frame drop이 억제되는지. 동일 조건 Parsec과 뭉개짐 대조.

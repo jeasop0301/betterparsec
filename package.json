@@ -18,6 +18,7 @@
     "dev": "npm run generate-bindings && npm-watch build-light",
     "build": "npm run generate-bindings && npm run build-light",
     "build-light": "tsc && npm run copy-static",
+    "test:stats": "npm run build-light && node --experimental-default-type=module --test tests/stats_sampler.test.mjs tests/benchmark_manifest.test.mjs",
     "generate-bindings": "cargo test export_bindings --package common",
     "copy-static": "cpx \"web/**/*.{html,json,css,svg,png,js,wasm}\" dist/"
   },

@@ -1,0 +1,218 @@
+diff --git a/src/crypto/openssl.rs b/src/crypto/openssl.rs
+index c025a60..29c0cdc 100644
+--- a/src/crypto/openssl.rs
++++ b/src/crypto/openssl.rs
+@@ -92,6 +92,13 @@ impl PairingCryptoBackend for OpenSSLCryptoBackend {
+         builder.set_pubkey(&key)?;
+         builder.set_not_before(Asn1Time::days_from_now(0)?.as_ref())?;
+         builder.set_not_after(Asn1Time::days_from_now(365)?.as_ref())?;
++        // betterparsec fix: a serial number MUST be set. Left unset, OpenSSL defaults it to
++        // 0, violating RFC 5280 §4.1.2.2 (serial MUST be a positive integer); Sunshine's
++        // OpenSSL 3.x then rejects this client cert during pairing (on_verify_failed).
++        // moonlight-common-c (which pairs fine) uses serial=1 — match it.
++        let serial_bn = openssl::bn::BigNum::from_u32(1)?;
++        let serial = openssl::asn1::Asn1Integer::from_bn(&serial_bn)?;
++        builder.set_serial_number(&serial)?;
+         builder.sign(&key, MessageDigest::sha256())?;
+         let certificate = builder.build();
+ 
+diff --git a/src/http/client/tokio_hyper.rs b/src/http/client/tokio_hyper.rs
+index 5bab923..cdf851b 100644
+--- a/src/http/client/tokio_hyper.rs
++++ b/src/http/client/tokio_hyper.rs
+@@ -98,20 +98,29 @@ where
+ 
+     fn verify_tls12_signature(
+         &self,
+-        message: &[u8],
+-        cert: &CertificateDer<'_>,
+-        dss: &DigitallySignedStruct,
++        _message: &[u8],
++        _cert: &CertificateDer<'_>,
++        _dss: &DigitallySignedStruct,
+     ) -> Result<HandshakeSignatureValid, rustls::Error> {
+-        self.base.verify_tls12_signature(message, cert, dss)
++        // betterparsec fix: Moonlight authenticates the host via the pairing crypto
++        // (PIN challenge, phases 1-4) over a LOCALHOST bridge↔Sunshine link, not via TLS
++        // PKI. Delegating here to WebPkiServerVerifier made webpki parse+verify Sunshine's
++        // self-signed server cert (serial=0, no SAN), which webpki's strict DER parser
++        // rejects — aborting the phase-5 mTLS handshake client-side and surfacing as hyper
++        // IncompleteMessage. The reference C client (libcurl/OpenSSL, VERIFYHOST=0) never
++        // invokes webpki. `verify_server_cert` above is already a no-op, so no-op'ing the
++        // handshake-signature checks is consistent (no auth is lost — server auth is the
++        // pairing handshake, and the link is 127.0.0.1).
++        Ok(HandshakeSignatureValid::assertion())
+     }
+ 
+     fn verify_tls13_signature(
+         &self,
+-        message: &[u8],
+-        cert: &CertificateDer<'_>,
+-        dss: &rustls::DigitallySignedStruct,
++        _message: &[u8],
++        _cert: &CertificateDer<'_>,
++        _dss: &rustls::DigitallySignedStruct,
+     ) -> Result<HandshakeSignatureValid, rustls::Error> {
+-        self.base.verify_tls13_signature(message, cert, dss)
++        Ok(HandshakeSignatureValid::assertion())
+     }
+ 
+     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+diff --git a/src/stream/c/mod.rs b/src/stream/c/mod.rs
+index 40e2f0c..432c649 100644
+--- a/src/stream/c/mod.rs
++++ b/src/stream/c/mod.rs
+@@ -10,15 +10,15 @@ use std::{
+ 
+ use moonlight_common_sys::limelight::{
+     _SERVER_INFORMATION, _STREAM_CONFIGURATION, LI_BATTERY_PERCENTAGE_UNKNOWN, LI_ERR_UNSUPPORTED,
+-    LI_ROT_UNKNOWN, LiGetEstimatedRttInfo, LiGetHostFeatureFlags, LiGetLaunchUrlQueryParameters,
+-    LiInterruptConnection, LiSendControllerArrivalEvent, LiSendControllerBatteryEvent,
+-    LiSendControllerEvent, LiSendControllerMotionEvent, LiSendControllerTouchEvent,
+-    LiSendHScrollEvent, LiSendHighResHScrollEvent, LiSendHighResScrollEvent, LiSendKeyboardEvent,
+-    LiSendKeyboardEvent2, LiSendMouseButtonEvent, LiSendMouseMoveAsMousePositionEvent,
+-    LiSendMouseMoveEvent, LiSendMousePositionEvent, LiSendMultiControllerEvent, LiSendScrollEvent,
+-    LiSendTouchEvent, LiSendUtf8TextEvent, LiStartConnection, LiStopConnection,
+-    PAUDIO_RENDERER_CALLBACKS, PCONNECTION_LISTENER_CALLBACKS, PDECODER_RENDERER_CALLBACKS,
+-    PSERVER_INFORMATION, PSTREAM_CONFIGURATION,
++    LI_ROT_UNKNOWN, LiChangeBitrate, LiGetEstimatedRttInfo, LiGetHostFeatureFlags,
++    LiGetLaunchUrlQueryParameters, LiInterruptConnection, LiSendControllerArrivalEvent,
++    LiSendControllerBatteryEvent, LiSendControllerEvent, LiSendControllerMotionEvent,
++    LiSendControllerTouchEvent, LiSendHScrollEvent, LiSendHighResHScrollEvent,
++    LiSendHighResScrollEvent, LiSendKeyboardEvent, LiSendKeyboardEvent2, LiSendMouseButtonEvent,
++    LiSendMouseMoveAsMousePositionEvent, LiSendMouseMoveEvent, LiSendMousePositionEvent,
++    LiSendMultiControllerEvent, LiSendScrollEvent, LiSendTouchEvent, LiSendUtf8TextEvent,
++    LiStartConnection, LiStopConnection, PAUDIO_RENDERER_CALLBACKS, PCONNECTION_LISTENER_CALLBACKS,
++    PDECODER_RENDERER_CALLBACKS, PSERVER_INFORMATION, PSTREAM_CONFIGURATION,
+ };
+ 
+ use crate::{
+@@ -269,6 +269,29 @@ impl MoonlightStream {
+         }
+     }
+ 
++    /// Requests a runtime video bitrate change using the Sunshine 0x5506
++    /// protocol extension.
++    ///
++    /// `Ok(())` means only that the reliable control message was queued. The
++    /// extension has no acknowledgement or capability bit, so callers must not
++    /// interpret this as confirmation that the host applied the new bitrate.
++    pub fn change_bitrate(&self, bitrate_kbps: u32) -> Result<(), MoonlightError> {
++        if !(1..=800_000).contains(&bitrate_kbps) {
++            return Err(MoonlightError::EventSendError(-1));
++        }
++
++        let bitrate_kbps =
++            i32::try_from(bitrate_kbps).map_err(|_| MoonlightError::EventSendError(-1))?;
++
++        unsafe {
++            if let Some(err) = Self::send_event_error(LiChangeBitrate(bitrate_kbps)) {
++                return Err(err);
++            }
++        }
++
++        Ok(())
++    }
++
+     fn send_event_error(error: i32) -> Option<MoonlightError> {
+         match error {
+             0 => None,
+diff --git a/src/stream/c/video.rs b/src/stream/c/video.rs
+index e147a73..f8e61d8 100644
+--- a/src/stream/c/video.rs
++++ b/src/stream/c/video.rs
+@@ -80,12 +80,25 @@ unsafe extern "C" fn start() {
+     })
+ }
+ 
+ unsafe extern "C" fn submit_decode_unit(decode_unit: PDECODE_UNIT) -> c_int {
+     let unit = unsafe { convert_decode_unit(decode_unit) };
+ 
+     global_decoder(|decoder| decoder.submit_decode_unit(unit) as i32)
+ }
++
++fn presentation_time_from_micros(presentation_time_us: u64) -> Duration {
++    Duration::from_micros(presentation_time_us)
++}
++
++fn host_processing_latency(raw_tenths_of_ms: u16) -> Option<Duration> {
++    if raw_tenths_of_ms == 0 {
++        None
++    } else {
++        Some(Duration::from_micros(u64::from(raw_tenths_of_ms) * 100))
++    }
++}
++
+ /// Converts the cpp decode unit into the rust one
+ unsafe fn convert_decode_unit<'a>(decode_unit: PDECODE_UNIT) -> VideoDecodeUnit<&'a [u8]> {
+     let raw = unsafe { *decode_unit };
+ 
+@@ -111,18 +124,35 @@ unsafe fn convert_decode_unit<'a>(decode_unit: PDECODE_UNIT) -> VideoDecodeUnit<
+     VideoDecodeUnit {
+         frame_number: FrameIndex(raw.frameNumber as u32),
+         frame_type: FrameType::from_i32(raw.frameType).expect("valid frame type"),
+-        frame_processing_latency: if raw.frameHostProcessingLatency == 0 {
+-            None
+-        } else {
+-            Some(Duration::from_millis(
+-                (raw.frameHostProcessingLatency / 10) as u64,
+-            ))
+-        },
+-        timestamp: Duration::from_nanos((raw.presentationTimeUs * 1_000_000_000) / 90_000),
++        frame_processing_latency: host_processing_latency(raw.frameHostProcessingLatency),
++        timestamp: presentation_time_from_micros(raw.presentationTimeUs),
+         color_space: ColorSpace::from_u8(raw.colorspace).expect("valid Colorspace"),
+         buffers,
+     }
+ }
++
++#[cfg(test)]
++mod time_conversion_tests {
++    use super::{host_processing_latency, presentation_time_from_micros};
++    use std::time::Duration;
++
++    #[test]
++    fn presentation_time_preserves_microsecond_units() {
++        assert_eq!(
++            presentation_time_from_micros(50_000),
++            Duration::from_micros(50_000)
++        );
++    }
++
++    #[test]
++    fn host_processing_latency_preserves_tenths_of_a_millisecond() {
++        assert_eq!(
++            host_processing_latency(19),
++            Some(Duration::from_micros(1_900))
++        );
++        assert_eq!(host_processing_latency(0), None);
++    }
++}
+ 
+ unsafe extern "C" fn stop() {
+     global_decoder(|decoder| {
+diff --git a/src/stream/video.rs b/src/stream/video.rs
+index 6dcc2e2..1e08a7f 100644
+--- a/src/stream/video.rs
++++ b/src/stream/video.rs
+@@ -258,7 +258,7 @@ pub struct VideoDecodeUnit<Buf> {
+ 
+     pub frame_type: FrameType,
+ 
+-    /// Optional host processing latency of the frame, in 1/10 ms units.
++    /// Optional host processing latency of the frame as a duration.
+     /// Zero when the host doesn't provide the latency data
+     /// or frame processing latency is not applicable to the current frame
+     /// (happens when the frame is repeated).
+@@ -276,8 +276,9 @@ pub struct VideoDecodeUnit<Buf> {
+     /// can be calculated by LiGetMillis() - enqueueTimeMs.
+     // pub enqueue_time: Duration,
+ 
+-    /// The timestamp that the server sent.
+-    /// 90kHz clock time representation.
++    /// The timestamp that the server sent, represented as a duration.
++    /// C-stream decode units use the presentation time in microseconds; the
++    /// native Rust depayloader converts the 90 kHz RTP clock to a duration.
+     ///
+     /// References:
+     /// - Moonlight common c: https://github.com/moonlight-stream/moonlight-common-c/blob/62687809b1f7410c3db4be2527503a54ae408d70/src/RtpVideoQueue.c#L157

@@ -40,6 +40,9 @@ const trueDefaultSettings: Settings =
     },
     // possible values: "auto", "webrtc", "websocket"
     "dataTransport": "auto",
+    // possible values: "all", "relay" — "relay" forces every WebRTC candidate
+    // through the TURN relay (443/TLS), for locked networks that block direct/UDP.
+    "iceTransportPolicy": "all",
     "language": "en",
     "enterFullscreenOnStreamStart": false,
     "toggleFullscreenWithKeybind": false,

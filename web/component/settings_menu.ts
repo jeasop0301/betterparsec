@@ -28,6 +28,7 @@ export type Settings = {
     localCursorSensitivity: number
     controllerConfig: ControllerConfig
     dataTransport: TransportType
+    iceTransportPolicy?: IceTransportPolicy
     language: Language
     enterFullscreenOnStreamStart: boolean
     toggleFullscreenWithKeybind: boolean
@@ -38,6 +39,9 @@ export type Settings = {
 
 export type StreamCodec = "h264" | "auto" | "h265" | "av1"
 export type TransportType = "auto" | "webrtc" | "websocket"
+// "relay" forces all WebRTC traffic through a TURN relay (feature #2: connect
+// without WARP over TURN-over-TLS 443 on locked networks). "all" = base default.
+export type IceTransportPolicy = "all" | "relay"
 
 import DEFAULT_SETTINGS from "../default_settings.js"
 import { StreamPermissions } from "../api_bindings.js";

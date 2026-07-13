@@ -1,4 +1,5 @@
 use std::{
+    path::{Path, PathBuf},
     process::Stdio,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
@@ -205,7 +206,12 @@ pub async fn start_host(
         .await;
 
         // Spawn child
-        let (mut child, stdin, stdout) = match Command::new(&web_app.config().streamer_path)
+        let streamer_path = resolve_streamer_path(&web_app.config().streamer_path);
+        debug!(
+            "[Stream]: launching streamer from {}",
+            streamer_path.display()
+        );
+        let (mut child, stdin, stdout) = match Command::new(&streamer_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -366,6 +372,79 @@ async fn send_ws_message(sender: &mut Session, message: StreamServerMessage) -> 
     };
 
     sender.text(json).await
+}
+
+fn resolve_streamer_path(configured: &str) -> PathBuf {
+    let configured_path = PathBuf::from(configured);
+    if configured_path.is_file() {
+        return configured_path;
+    }
+
+    let Some(candidate) = std::env::current_exe()
+        .ok()
+        .and_then(|current_exe| sibling_streamer_candidate(configured, &current_exe))
+    else {
+        return configured_path;
+    };
+
+    if candidate.is_file() {
+        candidate
+    } else {
+        configured_path
+    }
+}
+
+fn sibling_streamer_candidate(configured: &str, current_exe: &Path) -> Option<PathBuf> {
+    let normalized = configured.replace('\\', "/");
+    let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
+    let default_name = format!("streamer{}", std::env::consts::EXE_SUFFIX);
+    if normalized != "streamer" && normalized != default_name {
+        return None;
+    }
+
+    current_exe.parent().map(|parent| parent.join(default_name))
+}
+
+#[cfg(test)]
+mod streamer_path_tests {
+    use super::sibling_streamer_candidate;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn default_streamer_path_resolves_next_to_web_server() {
+        let current_exe = Path::new("target")
+            .join("debug")
+            .join(format!("web-server{}", std::env::consts::EXE_SUFFIX));
+        let expected = Path::new("target")
+            .join("debug")
+            .join(format!("streamer{}", std::env::consts::EXE_SUFFIX));
+
+        assert_eq!(
+            sibling_streamer_candidate("./streamer", &current_exe),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn windows_style_default_path_is_supported() {
+        let current_exe = PathBuf::from("target")
+            .join("debug")
+            .join(format!("web-server{}", std::env::consts::EXE_SUFFIX));
+
+        assert!(sibling_streamer_candidate(".\\streamer", &current_exe).is_some());
+    }
+
+    #[test]
+    fn explicit_custom_path_is_never_rewritten() {
+        let current_exe = Path::new("target")
+            .join("debug")
+            .join(format!("web-server{}", std::env::consts::EXE_SUFFIX));
+
+        assert_eq!(
+            sibling_streamer_candidate("C:/custom/streamer.exe", &current_exe),
+            None
+        );
+    }
 }
 
 #[post("/host/cancel")]

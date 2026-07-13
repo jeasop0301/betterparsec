@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "name": "20-8-15mbps",
+  "description": "Deterministic congestion/recovery trace. Apply the same phases to every candidate and record the router interfaces and qdisc commands in the run artifact.",
+  "phases": [
+    {
+      "label": "healthy-20mbps",
+      "durationSeconds": 40,
+      "bandwidthMbps": 20,
+      "delayMs": 30,
+      "jitterMs": 3,
+      "lossPercent": 0.1
+    },
+    {
+      "label": "congested-8mbps",
+      "durationSeconds": 40,
+      "bandwidthMbps": 8,
+      "delayMs": 30,
+      "jitterMs": 8,
+      "lossPercent": 1.0
+    },
+    {
+      "label": "recovery-15mbps",
+      "durationSeconds": 40,
+      "bandwidthMbps": 15,
+      "delayMs": 30,
+      "jitterMs": 3,
+      "lossPercent": 0.1
+    }
+  ]
+}

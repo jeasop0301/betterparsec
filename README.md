@@ -535,11 +535,25 @@ Other changes:
 - Thanks to [@Idefix2020](https://github.com/Idefix2020) for fixing the context menu and implementing caching for app images
 
 ## Building
-Make sure you've cloned this repo with all it's submodules
+Make sure you've cloned this repo with all its submodules.
 ```sh
 git clone https://github.com/MrCreativ3001/moonlight-web-stream.git
 ```
 A [Rust](https://www.rust-lang.org/tools/install) [nightly](https://rust-lang.github.io/rustup/concepts/channels.html) installation is required.
+
+BetterParsec pins its patched Moonlight dependencies by upstream revision plus repository-owned patches. Bootstrap them before invoking Cargo directly:
+
+```sh
+bash tools/bootstrap-dependencies.sh
+```
+
+On Windows PowerShell:
+
+```powershell
+pwsh ./tools/bootstrap-dependencies.ps1
+```
+
+`build-windows.ps1` and CI run this step automatically. See [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) for the exact revisions, patch contents, and update policy. The repeatable Parsec comparison harness is documented in [tools/benchmark/README.md](tools/benchmark/README.md).
 
 There are 2 ways to build Moonlight Web:
 - Build it on your system

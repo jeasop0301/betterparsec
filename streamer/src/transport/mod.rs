@@ -1,4 +1,7 @@
-use std::ops::Range;
+use std::{
+    ops::Range,
+    sync::{Arc, atomic::AtomicU32},
+};
 
 use async_trait::async_trait;
 use common::{
@@ -22,6 +25,9 @@ use thiserror::Error;
 
 use crate::buffer::ByteBuffer;
 
+use self::metrics::VideoTransportStats;
+
+pub(crate) mod metrics;
 pub mod web_socket;
 pub mod webrtc;
 
@@ -628,6 +634,18 @@ pub trait TransportSender {
         &'a self,
         unit: VideoDecodeUnit<&'a [u8]>,
     ) -> Result<DecodeResult, TransportError>;
+
+    /// Takes and resets the current interval's application-owned video queue
+    /// counters. Transports without an equivalent queue return `None`.
+    fn take_video_transport_stats(&self) -> Option<VideoTransportStats> {
+        None
+    }
+
+    /// Returns the live ABR target when this transport produces one.
+    /// This is a target signal, not proof that the host encoder applied it.
+    fn runtime_bitrate_target_kbps(&self) -> Option<Arc<AtomicU32>> {
+        None
+    }
 
     async fn setup_audio(
         &self,

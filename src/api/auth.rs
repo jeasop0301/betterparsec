@@ -29,6 +29,53 @@ impl FromRequest for UserAuth {
         ready(extract_user_auth(req))
     }
 }
+/// The `forwarded_header` auth mode trusts a *username taken from a request
+/// header*, so it is only safe when the request provably originates from the
+/// trusted reverse proxy in front of us. Without this guard any client that can
+/// reach the server could send the username header and impersonate any account
+/// (incl. admin) — and with `auto_create_missing_user` on, even create accounts.
+///
+/// We require the TCP peer to be loopback (proxy co-located on this host, the
+/// supported deployment). `peer_addr` is the real socket address, NOT the
+/// spoofable `X-Forwarded-For`/`connection_info`. Fails closed: an unknown or
+/// non-loopback peer is not trusted. A cross-host proxy would need an explicit
+/// trusted-proxy allowlist (future config), not a widening of this check.
+fn forwarded_header_peer_trusted(peer: Option<std::net::SocketAddr>) -> bool {
+    matches!(peer, Some(addr) if addr.ip().is_loopback())
+}
+
+#[cfg(test)]
+mod forwarded_header_tests {
+    use super::forwarded_header_peer_trusted;
+    use std::net::SocketAddr;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().expect("test socket address must be valid")
+    }
+
+    #[test]
+    fn trusts_loopback_only() {
+        // Same-host reverse proxy (the supported deployment).
+        assert!(forwarded_header_peer_trusted(Some(addr("127.0.0.1:5000"))));
+        assert!(forwarded_header_peer_trusted(Some(addr("[::1]:5000"))));
+    }
+
+    #[test]
+    fn rejects_remote_private_and_unknown_peers() {
+        // A remote client spoofing the username header must NOT be trusted.
+        assert!(!forwarded_header_peer_trusted(Some(addr(
+            "203.0.113.7:443"
+        ))));
+        // A private-LAN peer is still spoofable within the LAN → not trusted.
+        assert!(!forwarded_header_peer_trusted(Some(addr(
+            "192.168.1.50:443"
+        ))));
+        assert!(!forwarded_header_peer_trusted(Some(addr("[fd00::1]:443"))));
+        // Unknown peer → fail closed.
+        assert!(!forwarded_header_peer_trusted(None));
+    }
+}
+
 fn extract_user_auth(req: &HttpRequest) -> Result<UserAuth, AppError> {
     let app = match req.app_data::<Data<App>>() {
         None => return Err(AppError::AppDestroyed),
@@ -36,6 +83,7 @@ fn extract_user_auth(req: &HttpRequest) -> Result<UserAuth, AppError> {
     };
 
     if let Some(header_auth) = &app.config().web_server.forwarded_header
+        && forwarded_header_peer_trusted(req.peer_addr())
         && let Some(username) = req.headers().get(&header_auth.username_header)
     {
         let Ok(username) = username.to_str() else {

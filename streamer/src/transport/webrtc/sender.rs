@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     sync::{Arc, Weak},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::anyhow;
@@ -29,6 +29,8 @@ use webrtc::{
         track_local_static_sample::TrackLocalStaticSample,
     },
 };
+
+use crate::transport::metrics::{DurationAccumulator, VideoTransportMetrics};
 
 const PLAYOUT_DELAY_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay";
 
@@ -75,6 +77,7 @@ where
     channel_queue_size: usize,
     new_samples_notify: Arc<Notify>,
     queue: Arc<Mutex<VecDeque<FrameSamples<Track>>>>,
+    metrics: Option<Arc<VideoTransportMetrics>>,
 }
 
 struct FrameSamples<Track>
@@ -82,6 +85,7 @@ where
     Track: TrackLike,
 {
     important: bool,
+    enqueued_at: Instant,
     samples: Vec<Track::Sample>,
 }
 
@@ -96,7 +100,28 @@ where
             channel_queue_size,
             new_samples_notify: Default::default(),
             queue: Default::default(),
+            metrics: None,
         }
+    }
+
+    pub fn new_with_metrics(
+        runtime: Handle,
+        peer: Weak<RTCPeerConnection>,
+        channel_queue_size: usize,
+        metrics: Arc<VideoTransportMetrics>,
+    ) -> Self {
+        Self {
+            runtime,
+            peer,
+            channel_queue_size,
+            new_samples_notify: Default::default(),
+            queue: Default::default(),
+            metrics: Some(metrics),
+        }
+    }
+
+    pub fn metrics(&self) -> Option<&VideoTransportMetrics> {
+        self.metrics.as_deref()
     }
 
     pub async fn create_track(
@@ -114,10 +139,11 @@ where
 
         let new_samples_notify = self.new_samples_notify.clone();
         let queue = Arc::downgrade(&self.queue);
+        let metrics = self.metrics.clone();
         self.runtime.spawn({
             let track = track.clone();
             async move {
-                sample_sender(track, &new_samples_notify, queue).await;
+                sample_sender(track, &new_samples_notify, queue, metrics).await;
             }
         });
 
@@ -140,34 +166,99 @@ where
 
     /// Returns if the frame will be delivered
     pub async fn send_samples(&self, samples: Vec<Track::Sample>, important: bool) -> bool {
+        let rtp_payload_bytes = samples.iter().map(Track::sample_payload_len).sum();
         let mut queue = self.queue.lock().await;
 
-        let result = if important {
-            queue.push_front(FrameSamples { important, samples });
-            true
-        } else {
-            if queue.len() > self.channel_queue_size {
-                return false;
-            }
+        let outcome = enqueue_frame(
+            &mut queue,
+            self.channel_queue_size,
+            FrameSamples {
+                important,
+                enqueued_at: Instant::now(),
+                samples,
+            },
+        );
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.record_enqueue(
+                outcome.accepted,
+                important,
+                rtp_payload_bytes,
+                outcome.replaced_frames,
+                queue.len(),
+            );
+        }
 
-            queue.push_front(FrameSamples { important, samples });
-            true
-        };
+        if !outcome.accepted {
+            return false;
+        }
 
-        self.new_samples_notify.notify_waiters();
+        // There is one sender task per queue. `notify_one()` retains a permit
+        // when the sender is between the empty-queue check and `notified()`, so
+        // the final frame of a burst cannot be stranded until another enqueue.
+        self.new_samples_notify.notify_one();
 
-        result
+        true
     }
 
     /// Returns if the frame will be delivered
     pub async fn clear_queue(&self, clear_important: bool) {
         let mut queue = self.queue.lock().await;
+        let previous_len = queue.len();
 
         if clear_important {
             queue.clear();
         } else {
             queue.retain(|frame| frame.important);
         }
+
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.record_clear(previous_len - queue.len(), queue.len());
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EnqueueOutcome {
+    accepted: bool,
+    replaced_frames: usize,
+}
+
+/// Enqueue a complete frame while keeping latency and memory bounded.
+///
+/// A new important frame (currently an IDR) supersedes every queued frame: older
+/// dependent frames cannot be decoded after skipping to it, and older IDRs are
+/// no longer useful for recovery. It is therefore always accepted as the sole
+/// queued frame, even when the configured queue size is zero. Non-important
+/// frames respect the configured limit exactly.
+fn enqueue_frame<Track>(
+    queue: &mut VecDeque<FrameSamples<Track>>,
+    queue_size: usize,
+    frame: FrameSamples<Track>,
+) -> EnqueueOutcome
+where
+    Track: TrackLike,
+{
+    if frame.important {
+        let replaced_frames = queue.len();
+        queue.clear();
+        queue.push_front(frame);
+        return EnqueueOutcome {
+            accepted: true,
+            replaced_frames,
+        };
+    }
+
+    if queue.len() >= queue_size {
+        return EnqueueOutcome {
+            accepted: false,
+            replaced_frames: 0,
+        };
+    }
+
+    queue.push_front(frame);
+    EnqueueOutcome {
+        accepted: true,
+        replaced_frames: 0,
     }
 }
 
@@ -175,6 +266,7 @@ async fn sample_sender<Track>(
     track: Arc<Track>,
     new_samples_notify: &Notify,
     queue: Weak<Mutex<VecDeque<FrameSamples<Track>>>>,
+    metrics: Option<Arc<VideoTransportMetrics>>,
 ) where
     Track: TrackLike,
 {
@@ -182,7 +274,7 @@ async fn sample_sender<Track>(
         let frame = {
             let Some(queue) = queue.upgrade() else {
                 debug!("no sample queue available: stopping to submit samples");
-                continue;
+                break;
             };
 
             let mut queue = queue.lock().await;
@@ -193,17 +285,35 @@ async fn sample_sender<Track>(
                 continue;
             };
 
+            if let Some(metrics) = metrics.as_ref() {
+                let rtp_packets = new_frame.samples.len();
+                let rtp_payload_bytes = new_frame
+                    .samples
+                    .iter()
+                    .map(Track::sample_payload_len)
+                    .sum();
+                metrics.record_dequeue(
+                    rtp_packets,
+                    rtp_payload_bytes,
+                    queue.len(),
+                    new_frame.enqueued_at.elapsed(),
+                );
+            }
+
             new_frame
         };
+        let mut in_flight_frame = InFlightFrame::new(metrics.as_deref());
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("clock went backwards");
+            .unwrap_or_default();
         let now_secs = now.as_secs() as f64 + now.subsec_nanos() as f64 * 1e-9;
         let abs_send_time: u64 = (now_secs * 262_144.0) as u64;
 
         for sample in frame.samples {
-            if let Err(err) = track
+            let rtp_payload_bytes = Track::sample_payload_len(&sample);
+            let write_started = Instant::now();
+            let result = track
                 .write_with_extensions(
                     sample,
                     &[
@@ -213,22 +323,78 @@ async fn sample_sender<Track>(
                         }),
                     ],
                 )
-                .await
-            {
-                warn!("[Stream]: track.write_sample failed: {err}");
+                .await;
+            let write_latency = write_started.elapsed();
+            match result {
+                Ok(TrackWriteOutcome::Written) => {
+                    if let Some(metrics) = metrics.as_ref() {
+                        metrics.record_write_succeeded(rtp_payload_bytes);
+                    }
+                    in_flight_frame.record_write_latency(write_latency);
+                }
+                Ok(TrackWriteOutcome::Skipped) => {
+                    if let Some(metrics) = metrics.as_ref() {
+                        metrics.record_write_skipped(rtp_payload_bytes);
+                    }
+                }
+                Err(err) => {
+                    if let Some(metrics) = metrics.as_ref() {
+                        metrics.record_write_failed(rtp_payload_bytes);
+                    }
+                    in_flight_frame.record_write_latency(write_latency);
+                    warn!("[Stream]: track.write_sample failed: {err}");
+                }
             }
         }
     }
 }
 
+/// Keeps the in-flight gauge truthful if the sender future is cancelled while
+/// awaiting a track write.
+struct InFlightFrame<'a> {
+    metrics: Option<&'a VideoTransportMetrics>,
+    write_latency: DurationAccumulator,
+}
+
+impl<'a> InFlightFrame<'a> {
+    fn new(metrics: Option<&'a VideoTransportMetrics>) -> Self {
+        Self {
+            metrics,
+            write_latency: DurationAccumulator::default(),
+        }
+    }
+
+    fn record_write_latency(&mut self, latency: std::time::Duration) {
+        if self.metrics.is_some() {
+            self.write_latency.record(latency);
+        }
+    }
+}
+
+impl Drop for InFlightFrame<'_> {
+    fn drop(&mut self) {
+        if let Some(metrics) = self.metrics {
+            metrics.record_frame_write_finished(self.write_latency);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackWriteOutcome {
+    Written,
+    Skipped,
+}
+
 pub trait TrackLike: Send + Sync + 'static {
     type Sample: Send + 'static;
+
+    fn sample_payload_len(sample: &Self::Sample) -> usize;
 
     fn write_with_extensions(
         &self,
         sample: Self::Sample,
         extensions: &[HeaderExtension],
-    ) -> impl Future<Output = Result<(), anyhow::Error>> + Send;
+    ) -> impl Future<Output = Result<TrackWriteOutcome, anyhow::Error>> + Send;
 
     fn track(self: Arc<Self>) -> Arc<dyn TrackLocal + Send + Sync + 'static>;
 }
@@ -236,14 +402,19 @@ pub trait TrackLike: Send + Sync + 'static {
 impl TrackLike for TrackLocalStaticSample {
     type Sample = Sample;
 
+    fn sample_payload_len(sample: &Self::Sample) -> usize {
+        sample.data.len()
+    }
+
     async fn write_with_extensions(
         &self,
         sample: Self::Sample,
         extensions: &[HeaderExtension],
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<TrackWriteOutcome, anyhow::Error> {
         self.write_sample_with_extensions(&sample, extensions)
             .await
             .map_err(anyhow::Error::from)
+            .map(|_| TrackWriteOutcome::Written)
     }
 
     fn track(self: Arc<Self>) -> Arc<dyn TrackLocal + Send + Sync + 'static> {
@@ -268,11 +439,15 @@ impl From<TrackLocalStaticRTP> for SequencedTrackLocalStaticRTP {
 impl TrackLike for SequencedTrackLocalStaticRTP {
     type Sample = rtp::packet::Packet;
 
+    fn sample_payload_len(sample: &Self::Sample) -> usize {
+        sample.payload.len()
+    }
+
     async fn write_with_extensions(
         &self,
         mut sample: Self::Sample,
         extensions: &[HeaderExtension],
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<TrackWriteOutcome, anyhow::Error> {
         let (any_paused, all_paused) = (
             self.track.any_binding_paused().await,
             self.track.all_binding_paused().await,
@@ -280,7 +455,7 @@ impl TrackLike for SequencedTrackLocalStaticRTP {
 
         if all_paused {
             // Abort already here to not increment sequence numbers.
-            return Ok(());
+            return Ok(TrackWriteOutcome::Skipped);
         }
         if any_paused {
             warn!("WebRTC: not all paused but any paused");
@@ -294,10 +469,152 @@ impl TrackLike for SequencedTrackLocalStaticRTP {
             .write_rtp_with_extensions(&sample, extensions)
             .await
             .map_err(anyhow::Error::from)
-            .map(|_| ())
+            .map(|_| TrackWriteOutcome::Written)
     }
 
     fn track(self: Arc<Self>) -> Arc<dyn TrackLocal + Send + Sync + 'static> {
         self.track.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FakeTrack {
+        calls: AtomicUsize,
+        completed: Notify,
+    }
+
+    impl TrackLike for FakeTrack {
+        type Sample = usize;
+
+        fn sample_payload_len(sample: &Self::Sample) -> usize {
+            *sample
+        }
+
+        async fn write_with_extensions(
+            &self,
+            _sample: Self::Sample,
+            _extensions: &[HeaderExtension],
+        ) -> Result<TrackWriteOutcome, anyhow::Error> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            let result = match call {
+                0 => Ok(TrackWriteOutcome::Written),
+                1 => Err(anyhow!("synthetic track write failure")),
+                _ => Ok(TrackWriteOutcome::Skipped),
+            };
+            if call == 2 {
+                self.completed.notify_one();
+            }
+            result
+        }
+
+        fn track(self: Arc<Self>) -> Arc<dyn TrackLocal + Send + Sync + 'static> {
+            panic!("the fake track is never attached to a peer")
+        }
+    }
+
+    fn frame(important: bool) -> FrameSamples<TrackLocalStaticSample> {
+        FrameSamples {
+            important,
+            enqueued_at: Instant::now(),
+            samples: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn non_important_frames_respect_the_exact_queue_limit() {
+        let mut queue = VecDeque::new();
+
+        assert!(enqueue_frame(&mut queue, 2, frame(false)).accepted);
+        assert!(enqueue_frame(&mut queue, 2, frame(false)).accepted);
+        assert!(!enqueue_frame(&mut queue, 2, frame(false)).accepted);
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn newest_important_frame_supersedes_all_queued_frames() {
+        let mut queue = VecDeque::new();
+        assert!(enqueue_frame(&mut queue, 3, frame(true)).accepted);
+        assert!(enqueue_frame(&mut queue, 3, frame(false)).accepted);
+        assert!(enqueue_frame(&mut queue, 3, frame(false)).accepted);
+
+        let outcome = enqueue_frame(&mut queue, 3, frame(true));
+
+        assert!(outcome.accepted);
+        assert_eq!(outcome.replaced_frames, 3);
+        assert_eq!(queue.len(), 1);
+        assert!(queue.front().is_some_and(|queued| queued.important));
+    }
+
+    #[test]
+    fn zero_sized_queue_still_accepts_one_recovery_frame() {
+        let mut queue = VecDeque::new();
+
+        assert!(!enqueue_frame(&mut queue, 0, frame(false)).accepted);
+        assert!(enqueue_frame(&mut queue, 0, frame(true)).accepted);
+        assert_eq!(queue.len(), 1);
+        assert!(!enqueue_frame(&mut queue, 0, frame(false)).accepted);
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sender_counts_track_write_results_instead_of_dequeue_as_delivery() {
+        let metrics = Arc::new(VideoTransportMetrics::new(2));
+        let frame = FrameSamples {
+            important: false,
+            enqueued_at: Instant::now()
+                .checked_sub(std::time::Duration::from_millis(2))
+                .expect("test instant must have two milliseconds of history"),
+            samples: vec![100, 200, 300],
+        };
+        let queue = Arc::new(Mutex::new(VecDeque::from([frame])));
+        metrics.record_enqueue(true, false, 600, 0, 1);
+
+        let track = Arc::new(FakeTrack {
+            calls: AtomicUsize::new(0),
+            completed: Notify::new(),
+        });
+        let sender_notify = Arc::new(Notify::new());
+        let task = tokio::spawn({
+            let track = track.clone();
+            let sender_notify = sender_notify.clone();
+            let queue = Arc::downgrade(&queue);
+            let metrics = metrics.clone();
+            async move {
+                sample_sender(track, &sender_notify, queue, Some(metrics)).await;
+            }
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            track.completed.notified(),
+        )
+        .await
+        .expect("sender did not process the frame");
+        drop(queue);
+        sender_notify.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("sender did not stop after its queue was dropped")
+            .expect("sender task panicked");
+
+        let stats = metrics.take_snapshot();
+        assert_eq!(stats.frames_dequeued, 1);
+        assert_eq!(stats.rtp_packets_dequeued, 3);
+        assert_eq!(stats.rtp_payload_bytes_dequeued, 600);
+        assert_eq!(stats.rtp_packets_write_succeeded, 1);
+        assert_eq!(stats.rtp_payload_bytes_write_succeeded, 100);
+        assert_eq!(stats.rtp_packets_write_failed, 1);
+        assert_eq!(stats.rtp_payload_bytes_write_failed, 200);
+        assert_eq!(stats.rtp_packets_write_skipped, 1);
+        assert_eq!(stats.rtp_payload_bytes_write_skipped, 300);
+        assert_eq!(stats.rtp_write_latency_samples, 2);
+        assert_eq!(stats.queue_wait_samples, 1);
+        assert!(stats.queue_wait_min_ms >= 1.0);
+        assert_eq!(stats.in_flight_frames, 0);
+        assert_eq!(stats.in_flight_max_frames, 1);
     }
 }

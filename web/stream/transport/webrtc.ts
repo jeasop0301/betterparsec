@@ -3,6 +3,7 @@ import { Logger } from "../log.js";
 import { StatValue } from "../stats.js";
 import { CAPABILITIES_CODECS, emptyVideoCodecs, maybeVideoCodecs, VideoCodecSupport } from "../video.js";
 import { DataTransportChannel, Transport, TransportAudioSetup, TransportChannel, TransportChannelIdKey, TransportChannelIdValue, TransportVideoSetup, AudioTrackTransportChannel, VideoTrackTransportChannel, TrackTransportChannel, TransportShutdown } from "./index.js";
+import { CounterInterval, CumulativeAverageSampler, CumulativeCounterSampler, extractSelectedIceCandidatePairStats } from "./stats_sampler.js";
 
 export class WebRTCTransport implements Transport {
     implementationName: string = "webrtc"
@@ -10,6 +11,53 @@ export class WebRTCTransport implements Transport {
     private logger: Logger | null
 
     private peer: RTCPeerConnection | null = null
+    private cumulativeAverages = new CumulativeAverageSampler()
+    private cumulativeCounters = new CumulativeCounterSampler()
+
+    private sampleAverageMilliseconds(
+        statsId: string,
+        metric: string,
+        totalSeconds: number,
+        count: number,
+        timestampMs: number,
+    ): number | null {
+        return this.cumulativeAverages.sampleMilliseconds(
+            `${statsId}:${metric}`,
+            totalSeconds,
+            count,
+            timestampMs,
+        )
+    }
+
+    private addCumulativeCounter(
+        statsData: Record<string, StatValue>,
+        statsId: string,
+        metric: string,
+        value: number,
+        timestampMs: number,
+        totalDestination: string,
+        deltaDestination: string,
+    ): CounterInterval | null {
+        if (!Number.isFinite(value) || !Number.isFinite(timestampMs)) {
+            return null
+        }
+
+        statsData[totalDestination] = value
+
+        const interval = this.cumulativeCounters.sample(
+            `${statsId}:${metric}`,
+            value,
+            timestampMs,
+        )
+        if (interval) {
+            statsData[deltaDestination] = interval.delta
+            if (!("webrtcStatsIntervalMs" in statsData)) {
+                statsData.webrtcStatsIntervalMs = interval.elapsedMs
+            }
+        }
+
+        return interval
+    }
 
     constructor(logger?: Logger) {
         this.logger = logger ?? null
@@ -375,6 +423,8 @@ export class WebRTCTransport implements Transport {
     async close(): Promise<void> {
         this.logger?.debug("Closing WebRTC Peer")
 
+        this.cumulativeAverages.clear()
+        this.cumulativeCounters.clear()
         this.peer?.close()
     }
 
@@ -386,10 +436,17 @@ export class WebRTCTransport implements Transport {
         }
         const stats = await this.videoReceiver.getStats()
 
-        console.debug("----------------- raw video stats -----------------")
-        for (const [key, value] of stats.entries()) {
-            console.debug("raw video stats", key, value)
+        let iceStats = extractSelectedIceCandidatePairStats(stats.entries())
+        if (!("webrtcSelectedCandidatePairId" in iceStats) && this.peer) {
+            // Receiver-scoped reports do not consistently include candidate
+            // dictionaries across browsers. Fall back to the complete peer
+            // report only when the selected path could not be proven.
+            const peerStats = await this.peer.getStats()
+            iceStats = extractSelectedIceCandidatePairStats(peerStats.entries())
+        }
+        Object.assign(statsData, iceStats)
 
+        for (const [key, value] of stats.entries()) {
             if ("decoderImplementation" in value && value.decoderImplementation != null) {
                 statsData.decoderImplementation = value.decoderImplementation
             }
@@ -403,41 +460,209 @@ export class WebRTCTransport implements Transport {
                 statsData.webrtcFps = value.framesPerSecond
             }
 
-            if ("jitterBufferDelay" in value && value.jitterBufferDelay != null) {
-                statsData.webrtcJitterBufferDelayMs = value.jitterBufferDelay
+            const statsId = typeof value.id == "string" ? value.id : key
+            const timestampMs = value.timestamp
+            if (typeof timestampMs != "number" || !Number.isFinite(timestampMs)) {
+                continue
             }
-            if ("jitterBufferTargetDelay" in value && value.jitterBufferTargetDelay != null) {
-                statsData.webrtcJitterBufferTargetDelayMs = value.jitterBufferTargetDelay
+            const mediaKind = value.kind ?? value.mediaType
+            if (value.type != "inbound-rtp" || (mediaKind != null && mediaKind != "video")) {
+                // receiver.getStats() also includes transport and candidate-pair
+                // dictionaries. Their byte counters have different semantics and
+                // must not overwrite the inbound-video RTP counters below.
+                continue
             }
-            if ("jitterBufferMinimumDelay" in value && value.jitterBufferMinimumDelay != null) {
-                statsData.webrtcJitterBufferMinimumDelayMs = value.jitterBufferMinimumDelay
+            const jitterBufferEmittedCount = value.jitterBufferEmittedCount
+            if (typeof jitterBufferEmittedCount == "number") {
+                const jitterBufferMetrics = [
+                    ["jitterBufferDelay", "webrtcJitterBufferDelayMs"],
+                    ["jitterBufferTargetDelay", "webrtcJitterBufferTargetDelayMs"],
+                    ["jitterBufferMinimumDelay", "webrtcJitterBufferMinimumDelayMs"],
+                ] as const
+
+                for (const [source, destination] of jitterBufferMetrics) {
+                    const totalSeconds = value[source]
+                    if (typeof totalSeconds == "number") {
+                        const averageMs = this.sampleAverageMilliseconds(
+                            statsId,
+                            source,
+                            totalSeconds,
+                            jitterBufferEmittedCount,
+                            timestampMs,
+                        )
+                        if (averageMs != null) {
+                            statsData[destination] = averageMs
+                        }
+                    }
+                }
             }
-            if ("jitter" in value && value.jitter != null) {
-                statsData.webrtcJitterMs = value.jitter
+            if (typeof value.jitter == "number") {
+                // RTCInboundRtpStreamStats.jitter is an instantaneous value in seconds.
+                statsData.webrtcJitterMs = value.jitter * 1000
             }
-            if ("totalDecodeTime" in value && value.totalDecodeTime != null) {
-                statsData.webrtcTotalDecodeTimeMs = value.totalDecodeTime
+
+            const framesDecoded = value.framesDecoded
+            if (typeof framesDecoded == "number") {
+                const frameMetrics = [
+                    ["totalDecodeTime", "webrtcAvgDecodeTimeMs"],
+                    ["totalProcessingDelay", "webrtcAvgProcessingDelayMs"],
+                ] as const
+
+                for (const [source, destination] of frameMetrics) {
+                    const totalSeconds = value[source]
+                    if (typeof totalSeconds == "number") {
+                        const averageMs = this.sampleAverageMilliseconds(
+                            statsId,
+                            source,
+                            totalSeconds,
+                            framesDecoded,
+                            timestampMs,
+                        )
+                        if (averageMs != null) {
+                            statsData[destination] = averageMs
+                        }
+                    }
+                }
             }
-            if ("totalAssemblyTime" in value && value.totalAssemblyTime != null) {
-                statsData.webrtcTotalAssemblyTimeMs = value.totalAssemblyTime
+
+            if (typeof value.totalAssemblyTime == "number"
+                && typeof value.framesAssembledFromMultiplePackets == "number") {
+                const averageMs = this.sampleAverageMilliseconds(
+                    statsId,
+                    "totalAssemblyTime",
+                    value.totalAssemblyTime,
+                    value.framesAssembledFromMultiplePackets,
+                    timestampMs,
+                )
+                if (averageMs != null) {
+                    statsData.webrtcAvgAssemblyTimeMs = averageMs
+                }
             }
-            if ("totalProcessingDelay" in value && value.totalProcessingDelay != null) {
-                statsData.webrtcTotalProcessingDelayMs = value.totalProcessingDelay
+            let packetsReceivedInterval: CounterInterval | null = null
+            if (typeof value.packetsReceived == "number") {
+                packetsReceivedInterval = this.addCumulativeCounter(
+                    statsData,
+                    statsId,
+                    "packetsReceived",
+                    value.packetsReceived,
+                    timestampMs,
+                    "webrtcPacketsReceived",
+                    "webrtcPacketsReceivedDelta",
+                )
             }
-            if ("packetsReceived" in value && value.packetsReceived != null) {
-                statsData.webrtcPacketsReceived = value.packetsReceived
+
+            let packetsLostInterval: CounterInterval | null = null
+            if (typeof value.packetsLost == "number") {
+                // packetsLost is signed and can decrease when late packets arrive.
+                // The sampler treats a decrease as a new baseline instead of
+                // reporting a misleading negative interval loss rate.
+                packetsLostInterval = this.addCumulativeCounter(
+                    statsData,
+                    statsId,
+                    "packetsLost",
+                    value.packetsLost,
+                    timestampMs,
+                    "webrtcPacketsLost",
+                    "webrtcPacketsLostDelta",
+                )
             }
-            if ("packetsLost" in value && value.packetsLost != null) {
-                statsData.webrtcPacketsLost = value.packetsLost
+
+            if (packetsReceivedInterval && packetsLostInterval) {
+                const packetOutcomeDelta = packetsReceivedInterval.delta + packetsLostInterval.delta
+                if (packetOutcomeDelta > 0) {
+                    statsData.webrtcPacketLossPercent = packetsLostInterval.delta * 100 / packetOutcomeDelta
+                }
             }
-            if ("framesDropped" in value && value.framesDropped != null) {
-                statsData.webrtcFramesDropped = value.framesDropped
+
+            const cumulativeFrameCounters = [
+                ["framesReceived", "webrtcFramesReceived", "webrtcFramesReceivedDelta"],
+                ["framesDecoded", "webrtcFramesDecoded", "webrtcFramesDecodedDelta"],
+                ["framesRendered", "webrtcFramesRendered", "webrtcFramesRenderedDelta"],
+                ["framesDropped", "webrtcFramesDropped", "webrtcFramesDroppedDelta"],
+                ["keyFramesDecoded", "webrtcKeyFramesDecoded", "webrtcKeyFramesDecodedDelta"],
+            ] as const
+
+            for (const [source, totalDestination, deltaDestination] of cumulativeFrameCounters) {
+                const total = value[source]
+                if (typeof total == "number") {
+                    this.addCumulativeCounter(
+                        statsData,
+                        statsId,
+                        source,
+                        total,
+                        timestampMs,
+                        totalDestination,
+                        deltaDestination,
+                    )
+                }
             }
-            if ("keyFramesDecoded" in value && value.keyFramesDecoded != null) {
-                statsData.webrtcKeyFramesDecoded = value.keyFramesDecoded
+
+            const feedbackCounters = [
+                ["nackCount", "webrtcNackCount", "webrtcNackCountDelta"],
+                ["pliCount", "webrtcPliCount", "webrtcPliCountDelta"],
+                ["firCount", "webrtcFirCount", "webrtcFirCountDelta"],
+                ["freezeCount", "webrtcFreezeCount", "webrtcFreezeCountDelta"],
+            ] as const
+
+            for (const [source, totalDestination, deltaDestination] of feedbackCounters) {
+                const total = value[source]
+                if (typeof total == "number") {
+                    this.addCumulativeCounter(
+                        statsData,
+                        statsId,
+                        source,
+                        total,
+                        timestampMs,
+                        totalDestination,
+                        deltaDestination,
+                    )
+                }
             }
-            if ("nackCount" in value && value.nackCount != null) {
-                statsData.webrtcNackCount = value.nackCount
+
+            if (typeof value.totalFreezesDuration == "number") {
+                statsData.webrtcTotalFreezesDurationMs = value.totalFreezesDuration * 1000
+                const interval = this.cumulativeCounters.sample(
+                    `${statsId}:totalFreezesDuration`,
+                    value.totalFreezesDuration,
+                    timestampMs,
+                )
+                if (interval) {
+                    statsData.webrtcFreezesDurationDeltaMs = interval.delta * 1000
+                }
+            }
+
+            if (typeof value.bytesReceived == "number") {
+                // RTCInboundRtpStreamStats.bytesReceived excludes RTP headers,
+                // padding, and lower-layer overhead, so this is payload bitrate,
+                // not on-the-wire bitrate.
+                const interval = this.addCumulativeCounter(
+                    statsData,
+                    statsId,
+                    "bytesReceived",
+                    value.bytesReceived,
+                    timestampMs,
+                    "webrtcPayloadBytesReceived",
+                    "webrtcPayloadBytesReceivedDelta",
+                )
+                if (interval) {
+                    // bits / millisecond is numerically equal to decimal kbit/s.
+                    statsData.webrtcPayloadReceiveBitrateKbps = interval.delta * 8 / interval.elapsedMs
+                }
+            }
+
+            if (typeof value.headerBytesReceived == "number") {
+                const interval = this.addCumulativeCounter(
+                    statsData,
+                    statsId,
+                    "headerBytesReceived",
+                    value.headerBytesReceived,
+                    timestampMs,
+                    "webrtcRtpHeaderBytesReceived",
+                    "webrtcRtpHeaderBytesReceivedDelta",
+                )
+                if (interval) {
+                    statsData.webrtcRtpHeaderReceiveBitrateKbps = interval.delta * 8 / interval.elapsedMs
+                }
             }
         }
 

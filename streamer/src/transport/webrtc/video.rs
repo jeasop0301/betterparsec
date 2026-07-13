@@ -3,7 +3,7 @@ use std::{
     ops::Range,
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
 
@@ -20,9 +20,12 @@ use tracing::{debug, error, info, trace, warn};
 use webrtc::{
     api::media_engine::{MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_HEVC, MediaEngine},
     peer_connection::RTCPeerConnection,
-    rtcp::payload_feedbacks::{
-        picture_loss_indication::PictureLossIndication,
-        receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate,
+    rtcp::{
+        payload_feedbacks::{
+            picture_loss_indication::PictureLossIndication,
+            receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate,
+        },
+        receiver_report::ReceiverReport,
     },
     rtp::{
         codecs::{av1::Av1Payloader, h265::RTP_OUTBOUND_MTU},
@@ -37,8 +40,10 @@ use webrtc::{
     track::track_local::track_local_static_rtp::TrackLocalStaticRTP,
 };
 
+use crate::abr::{AbrConfig, AbrController};
 use crate::transport::{
     TransportEvent,
+    metrics::VideoTransportMetrics,
     webrtc::{
         WebRtcInner,
         sender::{SequencedTrackLocalStaticRTP, TrackLocalSender},
@@ -77,17 +82,31 @@ pub struct WebRtcVideo {
     clock_rate: u32,
     codec: Option<VideoCodec>,
     samples: Vec<BytesMut>,
+    /// Configured stream bitrate (kbps) = the ABR ceiling. 0 until StartStream
+    /// sets it; 0 disables adaptation (no ceiling to adapt within).
+    configured_bitrate_kbps: u32,
+    /// Live adaptive-bitrate target (kbps), driven by REMB in the RTCP loop.
+    /// Consumed by the encoder-apply path (feature #1 path A, pending Sunshine).
+    target_bitrate_kbps: Arc<AtomicU32>,
 }
 
 impl WebRtcVideo {
-    pub fn new(runtime: Handle, peer: Weak<RTCPeerConnection>, frame_queue_size: usize) -> Self {
+    pub fn new(
+        runtime: Handle,
+        peer: Weak<RTCPeerConnection>,
+        frame_queue_size: usize,
+        metrics: Arc<VideoTransportMetrics>,
+        target_bitrate_kbps: Arc<AtomicU32>,
+    ) -> Self {
         Self {
             clock_rate: 0,
             needs_idr: Default::default(),
-            sender: TrackLocalSender::new(runtime, peer, frame_queue_size),
+            sender: TrackLocalSender::new_with_metrics(runtime, peer, frame_queue_size, metrics),
             codec: None,
             supported_video_formats: VideoFormats::empty(),
             samples: Default::default(),
+            configured_bitrate_kbps: 0,
+            target_bitrate_kbps,
         }
     }
 
@@ -95,6 +114,16 @@ impl WebRtcVideo {
         self.supported_video_formats = supported_codecs;
     }
 
+    /// Sets the ABR ceiling from the stream's initial bitrate (kbps), and seeds
+    /// the live target to it. Called at StartStream, before [`Self::setup`].
+    pub fn set_configured_bitrate_kbps(&mut self, kbps: u32) {
+        self.configured_bitrate_kbps = kbps;
+        self.target_bitrate_kbps.store(kbps, Ordering::Release);
+    }
+
+    /// Shared handle to the live adaptive target (kbps). Consumed by the
+    /// encoder-apply path (feature #1 path A, pending a Sunshine host patch —
+    /// see docs/ROADMAP.md M2).
     pub async fn setup(
         &mut self,
         inner: &Arc<WebRtcInner>,
@@ -138,6 +167,8 @@ impl WebRtcVideo {
         };
 
         let needs_idr = self.needs_idr.clone();
+        let target_bitrate_kbps = self.target_bitrate_kbps.clone();
+        let configured_bitrate_kbps = self.configured_bitrate_kbps;
         if let Err(err) = self
             .sender
             .create_track(
@@ -149,6 +180,12 @@ impl WebRtcVideo {
                 .into(),
                 {
                     let needs_idr = needs_idr.clone();
+                    let target_bitrate_kbps = target_bitrate_kbps.clone();
+                    // ABR controller lives in this RTCP loop (the sole REMB reader).
+                    // `None` disables adaptation when no ceiling was configured.
+                    let mut abr = (configured_bitrate_kbps > 0).then(|| {
+                        AbrController::new(AbrConfig::from_ceiling(configured_bitrate_kbps))
+                    });
 
                     move |packet| {
                         let packet = packet.as_any();
@@ -156,10 +193,47 @@ impl WebRtcVideo {
                         if packet.is::<PictureLossIndication>() {
                             needs_idr.store(true, Ordering::Release);
                         }
-                        if let Some(_max_bitrate) =
-                            packet.downcast_ref::<ReceiverEstimatedMaximumBitrate>()
+                        if let Some(remb) = packet.downcast_ref::<ReceiverEstimatedMaximumBitrate>()
                         {
-                            // Moonlight doesn't support dynamic bitrate changing :(
+                            // Feature #1: the base stack discarded this REMB estimate
+                            // ("Moonlight doesn't support dynamic bitrate changing").
+                            // We smooth it into a target bitrate here; applying that
+                            // target to the Sunshine encoder is path A (pending a host
+                            // patch) — see crate::abr and docs/ROADMAP.md M2.
+                            if let Some(abr) = abr.as_mut() {
+                                // REMB `bitrate` is bits/sec (f32); convert to kbps.
+                                let observed_kbps =
+                                    if remb.bitrate.is_finite() && remb.bitrate > 0.0 {
+                                        (remb.bitrate / 1000.0) as u32
+                                    } else {
+                                        0
+                                    };
+                                let target = abr.observe(observed_kbps);
+                                target_bitrate_kbps.store(target, Ordering::Release);
+                                trace!("[ABR] REMB {observed_kbps} kbps -> target {target} kbps");
+                            }
+                        }
+                        if let Some(rr) = packet.downcast_ref::<ReceiverReport>() {
+                            // Feature #1: packet loss is a faster congestion signal
+                            // than REMB's bandwidth estimate — cut the target
+                            // immediately on a loss spike so the send queue doesn't
+                            // build and mangle frames. Use the worst reception block
+                            // this interval; `fraction_lost` is fixed-point /256
+                            // (RFC 3550). Applying the target still needs path A.
+                            if let Some(abr) = abr.as_mut()
+                                && let Some(max_lost) =
+                                    rr.reports.iter().map(|r| r.fraction_lost).max()
+                            {
+                                let loss = max_lost as f64 / 256.0;
+                                let target = abr.observe_loss(loss);
+                                target_bitrate_kbps.store(target, Ordering::Release);
+                                if max_lost > 0 {
+                                    trace!(
+                                        "[ABR] RR loss {:.1}% -> target {target} kbps",
+                                        loss * 100.0
+                                    );
+                                }
+                            }
                         }
                     }
                 },
@@ -223,6 +297,11 @@ impl WebRtcVideo {
         }
 
         let important = matches!(unit.frame_type, FrameType::Idr);
+        // This is the encoded Moonlight decode-unit size before Annex-B parsing,
+        // filler removal, or RTP packetization.
+        if let Some(metrics) = self.sender.metrics() {
+            metrics.record_encoded_frame(full_frame.len(), important);
+        }
 
         match &mut self.codec {
             // -- H264
@@ -533,17 +612,11 @@ fn video_format_to_codec(format: VideoFormat) -> Option<RTCRtpCodecParameters> {
             payload_type: 102,
             ..Default::default()
         }),
-        VideoFormat::Av1High8_444 | VideoFormat::Av1High10_444 => Some(RTCRtpCodecParameters {
-            capability: RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_AV1.to_owned(),
-                clock_rate: 90000,
-                channels: 0,
-                sdp_fmtp_line: "profile=1".to_owned(),
-                rtcp_feedback: rtcp_feedback.clone(),
-            },
-            payload_type: 103,
-            ..Default::default()
-        }),
+        // Sunshine's supported hardware AV1 encoders currently emit Main
+        // profile 4:2:0. Do not negotiate High profile 4:4:4 merely because a
+        // browser decoder reports it; that creates a session the host cannot
+        // truthfully satisfy.
+        VideoFormat::Av1High8_444 | VideoFormat::Av1High10_444 => None,
     }
 }
 
@@ -557,4 +630,24 @@ fn trim_bytes_to_range(mut buf: BytesMut, range: Range<usize>) -> BytesMut {
     }
 
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn av1_high_profile_is_not_advertised() {
+        assert!(video_format_to_codec(VideoFormat::Av1High8_444).is_none());
+        assert!(video_format_to_codec(VideoFormat::Av1High10_444).is_none());
+    }
+
+    #[test]
+    fn av1_main_profile_remains_available() {
+        for format in [VideoFormat::Av1Main8, VideoFormat::Av1Main10] {
+            let codec = video_format_to_codec(format).expect("AV1 Main must remain supported");
+            assert_eq!(codec.capability.mime_type, MIME_TYPE_AV1);
+            assert_eq!(codec.capability.sdp_fmtp_line, "profile=0");
+        }
+    }
 }

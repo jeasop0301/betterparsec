@@ -1,0 +1,73 @@
+diff --git a/src/ControlStream.c b/src/ControlStream.c
+index 2b5182e..5c7dca0 100644
+--- a/src/ControlStream.c
++++ b/src/ControlStream.c
+@@ -2084,3 +2084,35 @@ bool LiGetHdrMetadata(PSS_HDR_METADATA metadata) {
+     *metadata = hdrMetadata;
+     return true;
+ }
++
++int LiChangeBitrate(int bitrateKbps) {
++    // 0x5506 is a non-standard Sunshine extension implemented by compatible
++    // hosts such as Foundation Sunshine. There is no capability bit or reply,
++    // so success here only means that ENet accepted the reliable message.
++    if (!IS_SUNSHINE() ||
++            !(SunshineFeatureFlags & LI_FF_DYNAMIC_BITRATE) ||
++            !encryptedControlStream ||
++            peer == NULL) {
++        return LI_ERR_UNSUPPORTED;
++    }
++
++    if (bitrateKbps <= 0 || bitrateKbps > 800000) {
++        return -1;
++    }
++
++    uint32_t payload[2] = {
++        LE32(2), // video::dynamic_param_type_e::BITRATE
++        LE32((uint32_t)bitrateKbps),
++    };
++
++    if (!sendMessageAndDiscardReply(0x5506,
++                                    sizeof(payload),
++                                    payload,
++                                    CTRL_CHANNEL_GENERIC,
++                                    ENET_PACKET_FLAG_RELIABLE,
++                                    false)) {
++        return -1;
++    }
++
++    return 0;
++}
+diff --git a/src/Limelight.h b/src/Limelight.h
+index ac87a4b..88d18c6 100644
+--- a/src/Limelight.h
++++ b/src/Limelight.h
+@@ -569,6 +569,17 @@ const char* LiGetStageName(int stage);
+ // This function may only be called between LiStartConnection() and LiStopConnection().
+ bool LiGetEstimatedRttInfo(uint32_t* estimatedRtt, uint32_t* estimatedRttVariance);
+ 
++// Sends a Sunshine protocol extension request to change the active stream's
++// video bitrate. A return value of 0 means the reliable control message was
++// queued successfully; it does not confirm that the host applied the change.
++// Stock Sunshine hosts do not currently acknowledge this extension.
++//
++// This function returns LI_ERR_UNSUPPORTED unless the connection is using a
++// Sunshine encrypted control stream whose x-ss-general.featureFlags advertises
++// LI_FF_DYNAMIC_BITRATE. bitrateKbps must be in the range 1..800000, matching
++// the compatible host implementation.
++int LiChangeBitrate(int bitrateKbps);
++
+ // This function queues a relative mouse move event to be sent to the remote server.
+ int LiSendMouseMoveEvent(short deltaX, short deltaY);
+ 
+@@ -1002,6 +1013,10 @@ void LiRequestIdrFrame(void);
+ // This function returns any extended feature flags supported by the host.
+ #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
+ #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
++// Provisional BetterParsec/Foundation extension. Hosts advertising this bit
++// accept the 0x5506 dynamic bitrate control message. Foundation currently uses
++// 0x01 through 0x20; this next free bit must be coordinated before upstreaming.
++#define LI_FF_DYNAMIC_BITRATE         0x40
+ uint32_t LiGetHostFeatureFlags(void);
+ 
+ #ifdef __cplusplus

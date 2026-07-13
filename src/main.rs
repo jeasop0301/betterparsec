@@ -43,8 +43,33 @@ mod web;
 mod cli;
 mod human_json;
 
+fn ensure_rustls_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("failed to install the rustls ring crypto provider");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_rustls_crypto_provider;
+    use moonlight_common::http::client::{
+        async_client::RequestClient, tokio_hyper::TokioHyperClient,
+    };
+
+    #[test]
+    fn moonlight_https_client_can_be_constructed() {
+        ensure_rustls_crypto_provider();
+        TokioHyperClient::with_defaults()
+            .expect("Moonlight HTTPS client construction must not panic");
+    }
+}
+
 #[actix_web::main]
 async fn main() {
+    ensure_rustls_crypto_provider();
+
     let cli = Cli::load();
 
     // Load Config

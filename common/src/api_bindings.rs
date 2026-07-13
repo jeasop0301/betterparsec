@@ -591,6 +591,14 @@ pub struct StatsHostProcessingLatency {
 
 #[derive(Serialize, Deserialize, Debug, TS)]
 #[ts(export, export_to = EXPORT_PATH)]
+pub enum RuntimeBitrateControlState {
+    SentUnacknowledged,
+    Unsupported,
+    SendFailed,
+}
+
+#[derive(Serialize, Deserialize, Debug, TS)]
+#[ts(export, export_to = EXPORT_PATH)]
 pub enum StreamerStatsUpdate {
     Rtt {
         /// The host to the streamer
@@ -604,10 +612,57 @@ pub enum StreamerStatsUpdate {
         max_streamer_processing_time_ms: f64,
         avg_streamer_processing_time_ms: f64,
     },
+    /// Interval counters from the streamer's WebRTC video queue and track-write
+    /// boundary. Write success means the WebRTC track accepted the RTP packet;
+    /// payload bytes still exclude RTP/SRTP/UDP overhead and retransmissions.
+    VideoTransport {
+        interval_ms: f64,
+        queue_capacity_frames: u32,
+        queue_depth_frames: u32,
+        queue_max_depth_frames: u32,
+        in_flight_frames: u32,
+        in_flight_max_frames: u32,
+        encoded_frames_received: u32,
+        encoded_payload_bytes_received: u32,
+        frames_accepted: u32,
+        frames_rejected: u32,
+        frames_replaced: u32,
+        frames_cleared: u32,
+        frames_dropped: u32,
+        frames_dequeued: u32,
+        idr_frames_received: u32,
+        idr_encoded_payload_bytes_received: u32,
+        idr_frames_accepted: u32,
+        idr_rtp_payload_bytes_accepted: u32,
+        rtp_packets_dequeued: u32,
+        rtp_payload_bytes_dequeued: u32,
+        rtp_packets_write_succeeded: u32,
+        rtp_payload_bytes_write_succeeded: u32,
+        rtp_packets_write_failed: u32,
+        rtp_payload_bytes_write_failed: u32,
+        rtp_packets_write_skipped: u32,
+        rtp_payload_bytes_write_skipped: u32,
+        queue_wait_samples: u32,
+        queue_wait_min_ms: f64,
+        queue_wait_max_ms: f64,
+        queue_wait_avg_ms: f64,
+        rtp_write_latency_samples: u32,
+        rtp_write_latency_min_ms: f64,
+        rtp_write_latency_max_ms: f64,
+        rtp_write_latency_avg_ms: f64,
+    },
     BrowserRtt {
         /// The browser to the streamer
         /// Used with ws protocol to know backlog
         rtt_ms: f64,
+    },
+    /// Runtime host bitrate request telemetry. `SentUnacknowledged` confirms
+    /// only that the reliable control message was queued, not encoder apply.
+    RuntimeBitrateControl {
+        target_kbps: u32,
+        requested_kbps: u32,
+        state: RuntimeBitrateControlState,
+        attempts: u32,
     },
 }
 

@@ -27,6 +27,7 @@ export const frFr: Translations = {
         hideKeyboard: "Masquer le clavier",
         fullscreen: "Plein écran",
         stats: "Stats",
+        exportBenchmark: "Exporter le benchmark",
         exit: "Quitter",
         mouseMode: "Mode souris",
         touchMode: "Mode tactile",

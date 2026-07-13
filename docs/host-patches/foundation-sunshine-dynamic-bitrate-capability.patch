@@ -1,0 +1,18 @@
+diff --git a/src/platform/common.h b/src/platform/common.h
+--- a/src/platform/common.h
++++ b/src/platform/common.h
+@@ -304,3 +304,5 @@ namespace platform_caps {
+     constexpr caps_t touchpad = 0x10;  // Native precision touchpad events
+     constexpr caps_t touchpad_frame = 0x20;  // Native precision touchpad frame events
++    // Provisional BetterParsec capability: accepts 0x5506 BITRATE messages.
++    constexpr caps_t dynamic_bitrate = 0x40;
+   };  // namespace platform_caps
+diff --git a/src/rtsp.cpp b/src/rtsp.cpp
+--- a/src/rtsp.cpp
++++ b/src/rtsp.cpp
+@@ -1060,2 +1060,5 @@
+       auto caps = (uint32_t) platf::get_capabilities();
++      // The encoder path already handles 0x5506; advertise it explicitly so
++      // clients never infer support from the Sunshine version or ENet alone.
++      caps |= platf::platform_caps::dynamic_bitrate;
+       // Advertise clipboard sync only when the user opted in AND a user-session

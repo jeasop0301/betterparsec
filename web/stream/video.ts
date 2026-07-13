@@ -72,8 +72,11 @@ export function allVideoCodecs(): VideoCodecSupport {
         H265_REXT10_444: true,
         AV1_MAIN8: true,
         AV1_MAIN10: true,
-        AV1_HIGH8_444: true,
-        AV1_HIGH10_444: true
+        // Sunshine's hardware AV1 path is Main profile (4:2:0). Keep the High
+        // profile fields for protocol compatibility, but never advertise them
+        // until an encoder path can prove end-to-end 4:4:4 support.
+        AV1_HIGH8_444: false,
+        AV1_HIGH10_444: false
     }
 }
 

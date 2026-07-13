@@ -5,15 +5,15 @@ use std::{
     process::exit,
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use common::{
     api_bindings::{
-        GeneralClientMessage, GeneralServerMessage, LogMessageType, StreamClientMessage,
-        StreamPermissions, StreamSettings, TransportType,
+        GeneralClientMessage, GeneralServerMessage, LogMessageType, RuntimeBitrateControlState,
+        StreamClientMessage, StreamPermissions, StreamSettings, StreamerStatsUpdate, TransportType,
     },
     apply_permissions_to_settings,
     ipc::{
@@ -48,8 +48,8 @@ use tokio::{
     runtime::Handle,
     spawn,
     sync::{Mutex, Notify, RwLock},
-    task::spawn_blocking,
-    time::sleep,
+    task::{JoinHandle, spawn_blocking},
+    time::{MissedTickBehavior, interval, sleep},
 };
 use tracing::{Level, level_filters::LevelFilter, span};
 use tracing::{debug, error, info, trace, warn};
@@ -59,6 +59,7 @@ use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::S
 
 use crate::{
     audio::StreamAudioDecoder,
+    bitrate_apply::{BitrateApplyMachine, BitrateApplyStatus, HostBitrateControl},
     dynamic_ice_servers::load_dynamic_ice_servers,
     transport::{
         InboundPacket, OutboundPacket, TransportError, TransportEvent, TransportEvents,
@@ -72,7 +73,9 @@ pub type RequestClient = TokioHyperClient;
 
 pub const TIMEOUT_DURATION: Duration = Duration::from_secs(10);
 
+mod abr;
 mod audio;
+mod bitrate_apply;
 mod buffer;
 mod convert;
 mod dynamic_ice_servers;
@@ -267,6 +270,7 @@ struct StreamConnection {
     pub stream: RwLock<Option<MoonlightStream>>,
     pub active_gamepads: RwLock<ActiveGamepads>,
     pub transport_sender: Mutex<Option<Box<dyn TransportSender + Send + Sync + 'static>>>,
+    runtime_bitrate_task: Mutex<Option<JoinHandle<()>>>,
     // Timeout / Terminate
     pub timeout_terminate_request: Mutex<Option<Instant>>,
     pub terminate: Notify,
@@ -300,6 +304,7 @@ impl StreamConnection {
             stream: RwLock::new(None),
             active_gamepads: RwLock::new(ActiveGamepads::empty()),
             transport_sender: Mutex::new(None),
+            runtime_bitrate_task: Mutex::new(None),
             timeout_terminate_request: Default::default(),
             terminate: Notify::default(),
             is_terminating: AtomicBool::new(false),
@@ -875,21 +880,145 @@ impl StreamConnection {
 
         let mut stream_guard = self.stream.write().await;
         stream_guard.replace(stream);
+        drop(stream_guard);
 
-        {
+        let runtime_bitrate_target = {
             let mut sender = self.transport_sender.lock().await;
             match sender.as_mut() {
                 Some(sender) => {
                     sender.on_setup_complete().await;
+                    sender.runtime_bitrate_target_kbps()
                 }
                 None => {
                     warn!("No transport found after starting stream. Requesting Termination");
                     self.request_terminate().await;
+                    None
                 }
             }
+        };
+
+        if let Some(target) = runtime_bitrate_target {
+            self.start_runtime_bitrate_task(target, settings.bitrate)
+                .await;
         }
 
         Ok(())
+    }
+
+    async fn start_runtime_bitrate_task(
+        self: &Arc<Self>,
+        target_kbps: Arc<AtomicU32>,
+        initial_bitrate_kbps: u32,
+    ) {
+        let mut task_guard = self.runtime_bitrate_task.lock().await;
+        if let Some(old_task) = task_guard.take() {
+            old_task.abort();
+        }
+
+        let connection = Arc::downgrade(self);
+        let task = spawn(async move {
+            let started = Instant::now();
+            let mut ticker = interval(Duration::from_millis(500));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let mut machine = BitrateApplyMachine::new(initial_bitrate_kbps);
+            let mut attempts = 0u32;
+
+            loop {
+                ticker.tick().await;
+                let Some(connection) = connection.upgrade() else {
+                    return;
+                };
+
+                let target = target_kbps.load(Ordering::Acquire);
+                let now_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                let status = {
+                    let stream_guard = connection.stream.read().await;
+                    let Some(stream) = stream_guard.as_ref() else {
+                        return;
+                    };
+                    machine.poll(target, now_ms, |candidate| {
+                        stream.apply_bitrate_kbps(candidate)
+                    })
+                };
+
+                let Some(status) = status else {
+                    continue;
+                };
+                attempts = attempts.saturating_add(1);
+                let (requested_kbps, state) = match &status {
+                    BitrateApplyStatus::SentUnacknowledged { kbps } => {
+                        (*kbps, RuntimeBitrateControlState::SentUnacknowledged)
+                    }
+                    BitrateApplyStatus::Unsupported { requested_kbps, .. } => {
+                        (*requested_kbps, RuntimeBitrateControlState::Unsupported)
+                    }
+                    BitrateApplyStatus::Failed { requested_kbps, .. } => {
+                        (*requested_kbps, RuntimeBitrateControlState::SendFailed)
+                    }
+                    BitrateApplyStatus::Idle => continue,
+                };
+                connection
+                    .try_send_packet(
+                        OutboundPacket::Stats(StreamerStatsUpdate::RuntimeBitrateControl {
+                            target_kbps: target,
+                            requested_kbps,
+                            state,
+                            attempts,
+                        }),
+                        "runtime bitrate control telemetry",
+                        false,
+                    )
+                    .await;
+                match status {
+                    BitrateApplyStatus::SentUnacknowledged { kbps } => {
+                        info!(
+                            target_kbps = target,
+                            sent_kbps = kbps,
+                            status = "sent_unacknowledged",
+                            "runtime bitrate control message queued; host application is unverified"
+                        );
+                    }
+                    BitrateApplyStatus::Unsupported {
+                        requested_kbps,
+                        reason,
+                    } => {
+                        warn!(
+                            target_kbps = target,
+                            requested_kbps,
+                            status = "unsupported",
+                            reason,
+                            "runtime bitrate apply result; encoder bitrate remains unchanged"
+                        );
+                        let mut ipc_sender = connection.ipc_sender.clone();
+                        ipc_sender
+                            .send(StreamerIpcMessage::WebSocket(
+                                StreamServerMessage::DebugLog {
+                                    message: format!(
+                                        "Adaptive bitrate target is active, but runtime host bitrate application is unsupported ({reason}); encoder bitrate remains fixed"
+                                    ),
+                                    ty: None,
+                                },
+                            ))
+                            .await;
+                        return;
+                    }
+                    BitrateApplyStatus::Failed {
+                        requested_kbps,
+                        error,
+                    } => {
+                        warn!(
+                            target_kbps = target,
+                            requested_kbps,
+                            status = "failed",
+                            error,
+                            "runtime bitrate control send failed; host application state is unknown"
+                        );
+                    }
+                    BitrateApplyStatus::Idle => {}
+                }
+            }
+        });
+        task_guard.replace(task);
     }
 
     // -- Termination
@@ -936,6 +1065,10 @@ impl StreamConnection {
         }
 
         debug!("[Stream]: Stopping...");
+
+        if let Some(task) = self.runtime_bitrate_task.lock().await.take() {
+            task.abort();
+        }
 
         {
             let mut stream = self.stream.write().await;

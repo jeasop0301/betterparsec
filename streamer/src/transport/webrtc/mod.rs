@@ -1,7 +1,7 @@
 use std::{
     future::ready,
     pin::Pin,
-    sync::{Arc, Weak},
+    sync::{Arc, Weak, atomic::AtomicU32},
     time::{Duration, Instant},
 };
 
@@ -60,6 +60,7 @@ use crate::{
     transport::{
         InboundPacket, OutboundPacket, TransportChannel, TransportError, TransportEvent,
         TransportEvents, TransportSender,
+        metrics::{VideoTransportMetrics, VideoTransportStats},
         webrtc::{
             audio::{WebRtcAudio, register_audio_codecs},
             sender::register_header_extensions,
@@ -79,6 +80,8 @@ struct WebRtcInner {
     stats_channel: Arc<RTCDataChannel>,
     input_channels: Mutex<Vec<Arc<RTCDataChannel>>>,
     video: Mutex<WebRtcVideo>,
+    target_bitrate_kbps: Arc<AtomicU32>,
+    video_metrics: Arc<VideoTransportMetrics>,
     audio: Mutex<WebRtcAudio>,
     // Timeout / Terminate
     pub timeout_terminate_request: Mutex<Option<Instant>>,
@@ -156,6 +159,8 @@ pub async fn new(
     let stats_channel = peer.create_data_channel("stats", None).await?;
 
     let runtime = Handle::current();
+    let video_metrics = Arc::new(VideoTransportMetrics::new(video_frame_queue_size));
+    let target_bitrate_kbps = Arc::new(AtomicU32::new(0));
     let this_owned = Arc::new(WebRtcInner {
         peer: peer.clone(),
         event_sender,
@@ -166,7 +171,11 @@ pub async fn new(
             runtime.clone(),
             Arc::downgrade(&peer),
             video_frame_queue_size,
+            video_metrics.clone(),
+            target_bitrate_kbps.clone(),
         )),
+        target_bitrate_kbps,
+        video_metrics,
         audio: Mutex::new(WebRtcAudio::new(
             runtime,
             Arc::downgrade(&peer),
@@ -398,6 +407,8 @@ impl WebRtcInner {
                 {
                     let mut video = self.video.lock().await;
                     video.set_codecs(video_supported_formats).await;
+                    // Feature #1: seed the ABR ceiling from the initial bitrate.
+                    video.set_configured_bitrate_kbps(settings.bitrate_kbps);
                 }
 
                 // TODO: check peer for supported formats via sdp
@@ -612,6 +623,14 @@ impl TransportSender for WebRTCTransportSender {
     ) -> Result<DecodeResult, TransportError> {
         let mut video = self.inner.video.lock().await;
         Ok(video.send_decode_unit(&unit).await)
+    }
+
+    fn take_video_transport_stats(&self) -> Option<VideoTransportStats> {
+        Some(self.inner.video_metrics.take_snapshot())
+    }
+
+    fn runtime_bitrate_target_kbps(&self) -> Option<Arc<AtomicU32>> {
+        Some(self.inner.target_bitrate_kbps.clone())
     }
 
     async fn setup_audio(

@@ -1,5 +1,6 @@
 # Rust
 /target
+/vendor
 finalOutput
 ignore
 
@@ -14,5 +15,8 @@ web/api_bindings.ts
 
 # Server
 server
+
+# Benchmark run outputs (scripts and profiles live under tools/benchmark)
+/benchmark-results
 
 /.idea

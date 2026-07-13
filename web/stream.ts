@@ -14,6 +14,7 @@ import { FormModal } from "./component/modal/form.js";
 import { streamStatsToText } from "./stream/stats.js";
 import { adoptRoleDefaultLanguage, getCurrentLanguage, getTranslations, Language, normalizeLanguage} from "./i18n.js";
 import { requestKeyboardLock } from "./iframe.js";
+import { download } from "./util.js";
 
 let I = getTranslations(getCurrentLanguage())
 
@@ -1017,6 +1018,7 @@ class ViewerSidebar implements Component, Sidebar {
     private fullscreenButton = document.createElement("button")
 
     private statsButton = document.createElement("button")
+    private exportBenchmarkButton = document.createElement("button")
     private exitStreamButton = document.createElement("button")
 
     private mouseMode: SelectComponent
@@ -1099,6 +1101,19 @@ class ViewerSidebar implements Component, Sidebar {
             }
         })
         this.buttonDiv.appendChild(this.statsButton)
+
+        this.exportBenchmarkButton.innerText = I.stream.exportBenchmark
+        this.exportBenchmarkButton.addEventListener("click", () => {
+            const report = this.app.getStream()?.getStats().getBenchmarkReport()
+            if (!report) {
+                return
+            }
+
+            const timestamp = report.exportedAt.replace(/:/g, "-")
+            const data = new TextEncoder().encode(JSON.stringify(report, null, 2))
+            download(data, `betterparsec-benchmark-${timestamp}.json`, "application/json")
+        })
+        this.buttonDiv.appendChild(this.exportBenchmarkButton)
 
         // Close stream
         this.exitStreamButton.innerText = I.stream.exit

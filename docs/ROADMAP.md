@@ -86,8 +86,12 @@ U5/M6 스파이크, f1-ack 소스 확인+0x5509 호스트 패치.
    합성 타일 인젝터로 테스트).
 4. ~~M6 W1~~ — **완주** (2026-07-14): ct-probe 라이브 검증 `CT-PROBE-OK` —
    브라우저 없이 로그인→시그널링→WebRTC answer→video_fec 구독→FEC
-   디코드로 699프레임/15s(~58fps) 수신. 다음: W2 셸 글루 또는 통합
-   양방향 앱 아키텍처 설계 (owner 방향에 따라 후자 우선 검토).
+   디코드로 699프레임/15s(~58fps) 수신. **후속 설계 완료**:
+   docs/design/unified-app-architecture.md — 통합 양방향 앱 D1–D10 결정
+   (단일 바이너리 역할 스위치, Sunshine 서브프로세스 유지, web-server
+   임베드, raw D3D11 프레젠트, 포크 W2 보류). 다음 실행 = **A0 클라
+   first light** (app-native: 창+egui+client-transport+FFmpeg
+   D3D11VA+FLIP_DISCARD, ~1.5–2k LOC).
 5. Gate B 2-machine 첫 신뢰 run — 이후 U1 CC 신호 판정, U2 P2 손실 복구
    실측·비율 튜닝, U3/U5 지연 계측이 전부 이 위에서 순차 판정된다.
 

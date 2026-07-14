@@ -46,10 +46,13 @@ Tetrys FEC · 서브프레임 슬라이스 · QU · 네이티브 클라이언트
    **immersive 모드**(전체화면 + pointer lock + Keyboard Lock
    Win/Alt-Tab 캡처 일괄 토글) 요구 — cursor P1과 같은 클라 상태머신에
    함께 배선.
-3. **UDP-only 접속 — TCP fallback 부재** — 현재 UDP가 막힌 망에서는
+3. **UDP-only 접속 — TCP fallback 미동작** — 현재 UDP가 막힌 망에서는
    접속 자체가 안 되고 WARP(1.1.1.1)로만 우회 가능. 목표는 UDP 기본 +
-   실패 시 TURN-over-TCP(443) 자동 fallback = **M1 그 자체**. coturn
-   배포·ICE policy 자동 강등·"UDP 차단 + 443만 허용" 재현 환경이 잔여.
+   실패 시 자동 fallback = **M1 그 자체**. 소스 확인(2026-07-14):
+   WebSocket 전송 자체는 구현돼 있음(`SetTransport(WebSocket)`,
+   `permissions.allow_transport_websockets` 게이트, stream/index.ts 전송
+   폴백 체인) — WebRTC 실패 → WS 자동 강등이 실동작하는지·권한 기본값이
+   막는지부터 진단. TURN-over-TCP(443) coturn 배포는 별도 잔여.
 
 ### ultra 성능 코어 트랙 (must-do)
 

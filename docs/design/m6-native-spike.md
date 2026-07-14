@@ -272,3 +272,47 @@ Qt 미설치 확인. Rust toolchain(cargo)은 프로젝트 빌드 이력상 존�
 moonlight-qt:        c0c4d60
 moonlight-common-c:  2ea4775 (enet + nanors 서브모듈 포함)
 ```
+
+## F. W1 구현 계약 — client-transport 접속 프로토콜 (2026-07-14 소스 핀)
+
+W1 잔여(WebRTC/signaling 클라)를 위해 웹 클라 소스에서 확정한 사실.
+구현은 이 계약에 맞추고, 변경 발견 시 이 절을 갱신한다.
+
+### F-1. 접속 순서 (web/stream/index.ts · transport/webrtc.ts 기준)
+
+1. **인증**: `POST /login` (PostLoginRequest JSON, web/api.ts) → 세션 쿠키.
+2. **Signaling WS**: `ws(s)://{host}/host/stream` (쿠키 인증).
+3. WS open → 클라 `StreamClientMessage::Init { host_id, app_id,
+   video_frame_queue_size, audio_sample_queue_size }`.
+4. 서버 `StreamServerMessage::Setup { ice_servers }` → 클라 peer 생성.
+5. **스트리머가 offerer** — 서버 `WebRtc(Description(offer))` 수신 →
+   클라 `setRemoteDescription` + answer 생성 →
+   `WebRtc(Description(answer))` 회신. ICE candidate는
+   `WebRtc(AddIceCandidate(...))`로 양방향 (peer 생성 전 도착분은 버퍼링).
+6. 클라 `StartStream { settings: StreamSettings }` → 서버
+   `ConnectionComplete { format, width, height, fps, audio_sample_rate,
+   audio_channel_count, audio_streams, audio_coupled_streams,
+   audio_samples_per_frame, audio_mapping }` — 네이티브 디코더/DECODE_UNIT
+   셋업 파라미터는 전부 여기서 나온다. 종료는
+   `ConnectionTerminated { error_code }`.
+
+### F-2. DataChannel/FEC 계약
+
+- DataChannel은 전부 **offerer(스트리머)가 개설**, 클라는 `datachannel`
+  이벤트(webrtc-rs: `on_data_channel`)로 라벨 매칭: `video_fec`,
+  `video_fec_ack`, `video_qu` + TransportChannelId 컨트롤 채널들.
+- FEC 구독: 클라가 `video_fec_ack`에 `[0x01]` 송신 → 호스트 FEC 송신 활성.
+  이후 수신 메시지를 `ct_receiver_on_message`로, `ct_receiver_poll_ack`
+  결과(u32 LE)와 `ct_receiver_poll_needs_idr`(`[0x00]`)를 `video_fec_ack`로
+  회신 (fec-framing.md §8, transport-core::fec_wire 인코딩 재사용).
+- 타이머: `ct_receiver_tick`을 ~50 ms 주기로 (ACK cadence, 인코더 윈도 유지).
+
+### F-3. 구현 메모
+
+- 크레이트 의존: tokio + webrtc-rs(워크스페이스 핀 c9675e2) +
+  `common`(StreamClientMessage 등 타입 재사용, 수동 JSON 미러 금지) +
+  WS/HTTP 클라(tokio-tungstenite 또는 reqwest — cargo-shear 게이트 유의).
+- TLS: web-server는 자가서명(server/tls) — 네이티브 클라는 인증서 핀
+  옵션(`ct_start` 파라미터로 cert fingerprint) 기본, dev 플래그로만 무검증.
+- C ABI 확장: `ct_start(base_url, user, pass, host_id, app_id, …)` /
+  `ct_stop` — 기존 CtReceiver poll/wait 계약은 불변.

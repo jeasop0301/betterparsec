@@ -150,11 +150,26 @@ U5/M6 스파이크, f1-ack 소스 확인+0x5509 호스트 패치.
    임베디드 서버가 exe 옆에서 해석·스폰(기존 경로 규약 그대로,
    betterparsec.exe와 co-locate). 검증 = web-server 44 tests(스레드
    임베더 sync HTTP 왕복·바인드 충돌) + app-native 3/18 tests(host 롤
-   부팅→HTTP→stop, config 폴백/오류), clippy 클린. 잔여 = **라이브
-   스모크**(owner: ①클라 5분 — 슬라이스 2–4+A2 픽셀·소리·조작,
-   ②host 롤 — 웹 클라가 betterparsec.exe 호스트로 paired 접속) →
-   A1 슬라이스 3: Foundation Sunshine 서브프로세스 관리(stage/identity
-   스크립트→Rust) · 상대 마우스+immersive는 M4 `session-ux`(Phase B).
+   부팅→HTTP→stop, config 폴백/오류), clippy 클린. **A1 슬라이스 3
+   완료** (2026-07-14, 헤드리스 검증): Foundation Sunshine 관리형
+   서브프로세스 — Start-FoundationPaired.ps1의 라이브 검증된 기동
+   계약(스테이지 exe + per-run live config에 identity 복사 +
+   conf/port/pkey/cert/state/apps/log 오버라이드 9-인자)을 Rust로
+   이식(`app-native/src/sunshine.rs`). `BP_SUNSHINE_STAGE`(+선택
+   `BP_SUNSHINE_IDENTITY`)로 활성, 포트는 서버 config의
+   `moonlight.default_http_port`와 자동 일치, 포트 선점/exe 부재
+   조기 실패, 기동 중 사망은 stderr tail과 함께 표면화 → host는
+   web/pairing-only로 강등(실패해도 서버 유지), UI에 pid/생존/사망
+   상태 표시, Stop host = Sunshine→서버 순 종료. 스톡
+   SunshineService 스왑·해시 검증·워치독은 의도적으로 벤치 스크립트
+   잔류(테스트 전용 보호 기계). 검증 = app-native 7/22 tests(인자
+   계약 정확 일치, identity 복사, 스텁 exe 사망 경로, 포트/exe 조기
+   실패), clippy 클린. **A0+A1 헤드리스 기계 전부 완성.** 잔여 =
+   **라이브 스모크**(owner: ①클라 5분 — 픽셀·소리·조작, ②host 롤 —
+   `BP_SUNSHINE_STAGE` 설정 후 Start host, 웹/네이티브 클라 paired
+   접속) → 다음 헤드리스 대형 항목: M4 `session-ux` 상태머신(커서
+   P1·스톨 워치독·immersive, Rust+TS 미러) · U3 per-slice DU
+   depacketizer 패치. 이후는 전부 라이브 게이트(Gate B/C).
 5. Gate B 2-machine 첫 신뢰 run — 이후 U1 CC 신호 판정, U2 P2 손실 복구
    실측·비율 튜닝, U3/U5 지연 계측이 전부 이 위에서 순차 판정된다.
 

@@ -12,6 +12,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod host;
+mod sunshine;
 #[cfg(all(windows, feature = "video"))]
 mod audio;
 #[cfg(all(windows, feature = "video"))]
@@ -401,15 +402,26 @@ impl App {
     fn host_section(&mut self, ui: &mut eframe::egui::Ui) {
         let mut start_clicked = false;
         let mut stop_clicked = false;
-        ui.horizontal(|ui| match &self.host {
+        ui.horizontal(|ui| match &mut self.host {
             None => {
                 start_clicked = ui.button("Start host").clicked();
                 ui.small("embedded web-server (accounts/pairing/signaling)");
             }
             Some(h) => {
                 stop_clicked = ui.button("Stop host").clicked();
+                let sunshine = match (&mut h.sunshine, &h.sunshine_error) {
+                    (Some(s), _) => {
+                        if s.is_running() {
+                            format!("sunshine pid {} port {}", s.pid(), s.port)
+                        } else {
+                            "sunshine EXITED — stop/start host".into()
+                        }
+                    }
+                    (None, Some(_)) => "sunshine FAILED (see below)".into(),
+                    (None, None) => "no sunshine (set BP_SUNSHINE_STAGE)".into(),
+                };
                 ui.label(format!(
-                    "hosting on {} ({})",
+                    "hosting on {} ({}) — {}",
                     h.server
                         .addrs()
                         .iter()
@@ -421,9 +433,15 @@ impl App {
                             format!("config: {}", h.config_path.display()),
                         host::ConfigSource::BuiltinDefault => "default config".into(),
                     },
+                    sunshine,
                 ));
             }
         });
+        if let Some(h) = &self.host
+            && let Some(e) = &h.sunshine_error
+        {
+            ui.colored_label(eframe::egui::Color32::YELLOW, format!("sunshine: {e}"));
+        }
         if start_clicked {
             match host::start(std::path::Path::new(host::DEFAULT_CONFIG_PATH)) {
                 Ok(h) => {
@@ -437,7 +455,7 @@ impl App {
             }
         }
         if stop_clicked && let Some(h) = self.host.take() {
-            h.server.stop();
+            h.stop();
         }
         if let Some(e) = &self.host_error {
             ui.colored_label(eframe::egui::Color32::RED, format!("host: {e}"));

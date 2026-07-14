@@ -106,6 +106,10 @@ impl VideoDecoder for StreamVideoDecoder {
     }
 
     fn capabilities(&self) -> VideoCapabilities {
+        // Default: slices_per_frame = None → maps to 0 in bits 24-31 of
+        // CAPABILITY_SLICES_PER_FRAME, which Sunshine treats as 1 slice.
+        // Activation and tuning are gated in the ROADMAP; when that config
+        // surface is added, set slices_per_frame here instead of None.
         VideoCapabilities::default()
     }
 }
@@ -360,5 +364,91 @@ mod tests {
     fn public_metric_counts_saturate_instead_of_wrapping() {
         assert_eq!(saturating_u32(42), 42);
         assert_eq!(saturating_u32(u64::from(u32::MAX) + 1), u32::MAX);
+    }
+}
+
+/// Tests for CAPABILITY_SLICES_PER_FRAME packing (Limelight.h line 282).
+/// The function under test lives in moonlight_common::stream::c::video and is
+/// the single source of truth for translating VideoCapabilities.slices_per_frame
+/// into C-layer capability bits 24-31.
+#[cfg(test)]
+mod slice_caps_tests {
+    use moonlight_common::stream::{c::video::slices_per_frame_capability_bits, video::VideoCapabilities};
+
+    // Domain: None/0/1 → top byte 0 (same as today, no slices advertised)
+    #[test]
+    fn none_yields_top_byte_zero() {
+        assert_eq!(slices_per_frame_capability_bits(None), 0);
+    }
+
+    #[test]
+    fn zero_treated_as_one_yields_top_byte_zero() {
+        assert_eq!(slices_per_frame_capability_bits(Some(0)), 0);
+    }
+
+    #[test]
+    fn one_yields_top_byte_zero() {
+        assert_eq!(slices_per_frame_capability_bits(Some(1)), 0);
+    }
+
+    // Domain: 2..=255 → packed into bits 24-31
+    #[test]
+    fn two_packed_into_top_byte() {
+        assert_eq!(slices_per_frame_capability_bits(Some(2)), 0x02000000);
+    }
+
+    #[test]
+    fn four_packed_into_top_byte() {
+        // CAPABILITY_SLICES_PER_FRAME(4) = ((4 as u8) << 24) = 0x04000000
+        assert_eq!(slices_per_frame_capability_bits(Some(4)), 0x04000000);
+        assert_eq!(
+            slices_per_frame_capability_bits(Some(4)) & 0xFF000000,
+            0x04000000
+        );
+    }
+
+    #[test]
+    fn max_u8_255_packed_into_top_byte() {
+        assert_eq!(slices_per_frame_capability_bits(Some(255)), 0xFF000000);
+    }
+
+    // Domain: > 255 → clamped to 255
+    #[test]
+    fn oversized_256_clamped_to_255() {
+        assert_eq!(slices_per_frame_capability_bits(Some(256)), 0xFF000000);
+    }
+
+    #[test]
+    fn oversized_u32_max_clamped_to_255() {
+        assert_eq!(slices_per_frame_capability_bits(Some(u32::MAX)), 0xFF000000);
+    }
+
+    #[test]
+    fn slice_bits_disjoint_from_low_capability_bits() {
+        // All known capability flags live in bits 0-6 (0x7F).
+        // Slice bits are in bits 24-31. Verify no overlap.
+        let all_low_bits: u32 = 0x7F;
+        for slices in [2u32, 4, 255] {
+            let slice_bits = slices_per_frame_capability_bits(Some(slices));
+            assert_eq!(
+                slice_bits & all_low_bits,
+                0,
+                "slice_bits for {slices} must not overlap low capability bits"
+            );
+        }
+    }
+
+    /// Regression pin: the shipped default path (StreamVideoDecoder returns
+    /// VideoCapabilities::default() with slices_per_frame = None) must produce
+    /// 0 in bits 24-31 — bit-identical to behavior before this change.
+    #[test]
+    fn default_videocapabilities_produces_zero_slice_bits() {
+        let caps = VideoCapabilities::default();
+        assert!(caps.slices_per_frame.is_none(), "default must have no slice preference");
+        assert_eq!(
+            slices_per_frame_capability_bits(caps.slices_per_frame),
+            0,
+            "default capabilities must yield 0 in CAPABILITY_SLICES_PER_FRAME bits"
+        );
     }
 }

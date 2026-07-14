@@ -1,4 +1,4 @@
-diff --git a/src/crypto/openssl.rs b/src/crypto/openssl.rs
+﻿diff --git a/src/crypto/openssl.rs b/src/crypto/openssl.rs
 index c025a60..29c0cdc 100644
 --- a/src/crypto/openssl.rs
 +++ b/src/crypto/openssl.rs
@@ -170,15 +170,10 @@ index 40e2f0c..1da9334 100644
          match error {
              0 => None,
 diff --git a/src/stream/c/video.rs b/src/stream/c/video.rs
-index e147a73..f8e61d8 100644
+index e147a73..8284023 100644
 --- a/src/stream/c/video.rs
 +++ b/src/stream/c/video.rs
-@@ -80,12 +80,25 @@ unsafe extern "C" fn start() {
-     })
- }
- 
- unsafe extern "C" fn submit_decode_unit(decode_unit: PDECODE_UNIT) -> c_int {
-     let unit = unsafe { convert_decode_unit(decode_unit) };
+@@ -85,6 +85,47 @@ unsafe extern "C" fn submit_decode_unit(decode_unit: PDECODE_UNIT) -> c_int {
  
      global_decoder(|decoder| decoder.submit_decode_unit(unit) as i32)
  }
@@ -195,11 +190,38 @@ index e147a73..f8e61d8 100644
 +    }
 +}
 +
++/// Translates `VideoCapabilities.slices_per_frame` into the bits used by
++/// `CAPABILITY_SLICES_PER_FRAME(x)` (Limelight.h line 282):
++///     `((unsigned char)(x)) << 24`
++///
++/// Domain:
++///   `None` / `Some(0)` / `Some(1)` → 0 (top byte clear; same as shipped default)
++///   `Some(2..=255)` → packed into bits 24-31
++///   `Some(n > 255)` → clamped to 255 with a warning (field is u32, u8 max is 255)
++///
++/// The host (Sunshine / SdpGenerator.c) extracts bits 24-31 and configures NVENC
++/// with that many encoder slices.  Tune via `VideoCapabilities.slices_per_frame`;
++/// do NOT add a config surface here — activation is gated in the ROADMAP
++/// (future config hook goes in the caller that populates `VideoCapabilities`).
++pub fn slices_per_frame_capability_bits(slices_per_frame: Option<u32>) -> u32 {
++    let count: u8 = match slices_per_frame {
++        None | Some(0) | Some(1) => 0,
++        Some(n) if n <= 255 => n as u8,
++        Some(n) => {
++            tracing::warn!(
++                n,
++                "slices_per_frame exceeds u8 max (255); clamping to 255 for CAPABILITY_SLICES_PER_FRAME"
++            );
++            255
++        }
++    };
++    (count as u32) << 24
++}
++
  /// Converts the cpp decode unit into the rust one
  unsafe fn convert_decode_unit<'a>(decode_unit: PDECODE_UNIT) -> VideoDecodeUnit<&'a [u8]> {
      let raw = unsafe { *decode_unit };
- 
-@@ -111,18 +124,35 @@ unsafe fn convert_decode_unit<'a>(decode_unit: PDECODE_UNIT) -> VideoDecodeUnit<
+@@ -111,19 +152,36 @@ unsafe fn convert_decode_unit<'a>(decode_unit: PDECODE_UNIT) -> VideoDecodeUnit<
      VideoDecodeUnit {
          frame_number: FrameIndex(raw.frameNumber as u32),
          frame_type: FrameType::from_i32(raw.frameType).expect("valid frame type"),
@@ -217,7 +239,7 @@ index e147a73..f8e61d8 100644
          buffers,
      }
  }
-+
+ 
 +#[cfg(test)]
 +mod time_conversion_tests {
 +    use super::{host_processing_latency, presentation_time_from_micros};
@@ -240,9 +262,28 @@ index e147a73..f8e61d8 100644
 +        assert_eq!(host_processing_latency(0), None);
 +    }
 +}
- 
++
  unsafe extern "C" fn stop() {
      global_decoder(|decoder| {
+         decoder.stop();
+@@ -151,6 +209,8 @@ pub(crate) unsafe fn raw_callbacks() -> _DECODER_RENDERER_CALLBACKS {
+         capabilities |= Capabilities::REFERENCE_FRAME_INVALIDATION_AV1;
+     }
+ 
++    let slice_bits = slices_per_frame_capability_bits(video_capabilities.slices_per_frame);
++
+     _DECODER_RENDERER_CALLBACKS {
+         setup: Some(setup),
+         start: Some(start),
+@@ -161,7 +221,7 @@ pub(crate) unsafe fn raw_callbacks() -> _DECODER_RENDERER_CALLBACKS {
+         } else {
+             Some(submit_decode_unit)
+         },
+-        capabilities: capabilities.bits() as i32,
++        capabilities: (capabilities.bits() | slice_bits) as i32,
+     }
+ }
+ 
 diff --git a/src/stream/video.rs b/src/stream/video.rs
 index 6dcc2e2..1e08a7f 100644
 --- a/src/stream/video.rs

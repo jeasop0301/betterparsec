@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><title>pointer lock 맨몸 테스트</title></head>
+<body style="margin:0;background:#111;color:#fff;font-family:monospace">
+  <div id="box" style="width:100vw;height:100vh;display:flex;align-items:center;justify-content:center;cursor:crosshair;font-size:20px">
+    여기(회면)를 한 번 클릭 — 커서가 사라지면 pointer lock 성공
+  </div>
+  <pre id="log" style="position:fixed;top:0;left:0;margin:0;padding:8px;background:#000a;font-size:13px;max-width:100vw;white-space:pre-wrap"></pre>
+  <script>
+    const logEl = document.getElementById("log");
+    const log = (m) => { logEl.textContent += m + "\n"; };
+    log("UA: " + navigator.userAgent);
+    log("secure: " + window.isSecureContext + " | frame?: " + (window.top !== window.self));
+    const box = document.getElementById("box");
+    document.addEventListener("pointerlockchange", () =>
+      log("LOCKCHANGE locked=" + (document.pointerLockElement ? document.pointerLockElement.id : "null")));
+    document.addEventListener("pointerlockerror", () => log("LOCKERROR fired"));
+    let n = 0;
+    document.addEventListener("mousemove", (e) => {
+      if (document.pointerLockElement && n++ < 12) log("mv " + e.movementX + "," + e.movementY);
+    });
+    box.addEventListener("click", async () => {
+      log("클릭 → requestPointerLock 호출");
+      try { await box.requestPointerLock(); log("요청 반환(에러 없음)"); }
+      catch (e) { log("throw " + e.name + ": " + e.message); }
+      setTimeout(() => log("200ms후 locked=" + (document.pointerLockElement ? document.pointerLockElement.id : "null")), 200);
+    });
+  </script>
+</body>
+</html>

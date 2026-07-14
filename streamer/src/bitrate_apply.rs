@@ -15,9 +15,9 @@ pub(crate) enum BitrateApplyOutcome {
     Failed { error: String },
 }
 
-/// `0x5507` ACK status (u32 LE on the wire). See docs/design/f1-ack.md §2.
+/// `0x5509` ACK status (u32 LE on the wire). See docs/design/f1-ack.md §2.
 /// A Tier A host emits only `Dispatched` or `ValidationFailed`.
-// Constructed only by the (not yet wired) 0x5507 receive path and tests —
+// Constructed only by the (not yet wired) 0x5509 receive path and tests —
 // production stays on the legacy path until f1-ack.md R-1/R-2 are verified.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +38,7 @@ impl AckStatus {
     /// Decode the wire value. Unknown values (5..=u32::MAX) are rejected —
     /// a forward-compatible host emitting a new status must not be
     /// misinterpreted as one of the known outcomes.
-    // Caller will be the 0x5507 receive path (not yet wired; f1-ack.md R-2).
+    // Caller will be the 0x5509 receive path (not yet wired; f1-ack.md R-2).
     #[allow(dead_code)]
     pub(crate) fn from_wire(raw: u32) -> Option<Self> {
         match raw {
@@ -69,22 +69,22 @@ pub(crate) const ACK_TIMEOUT_MS: u64 = 3_000;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BitrateApplyStatus {
     Idle,
-    /// Legacy path: host does not advertise the 0x5507 ACK capability.
+    /// Legacy path: host does not advertise the 0x5509 ACK capability.
     SentUnacknowledged {
         kbps: u32,
     },
-    /// ACK-capable host: request queued, awaiting 0x5507.
+    /// ACK-capable host: request queued, awaiting 0x5509.
     PendingAck {
         kbps: u32,
         sent_at_ms: u64,
     },
-    /// 0x5507 confirmed the request (strength per [`AckTier`]).
+    /// 0x5509 confirmed the request (strength per [`AckTier`]).
     Applied {
         requested_kbps: u32,
         applied_kbps: u32,
         tier: AckTier,
     },
-    /// 0x5507 reported a host-side failure.
+    /// 0x5509 reported a host-side failure.
     ApplyFailed {
         requested_kbps: u32,
         status: AckStatus,
@@ -136,7 +136,7 @@ pub(crate) struct BitrateApplyMachine {
     gate: ApplyGate,
     status: BitrateApplyStatus,
     last_attempt_ms: Option<u64>,
-    /// True only after the host advertises the 0x5507 ACK capability
+    /// True only after the host advertises the 0x5509 ACK capability
     /// (LI_FF_DYNAMIC_BITRATE_ACK, 0x80). MUST stay false until Foundation
     /// R-1/R-2 are verified (docs/design/f1-ack.md): with 0x40-only hosts,
     /// entering PendingAck would wait forever and retry-loop every 3 s.
@@ -162,7 +162,7 @@ impl BitrateApplyMachine {
         }
     }
 
-    /// Arm 0x5507 ACK tracking. Call only after capability negotiation
+    /// Arm 0x5509 ACK tracking. Call only after capability negotiation
     /// confirms the host sends ACK replies (0x80 bit) — see field docs.
     // Inactive until the Foundation host side is verified (f1-ack.md R-1/R-2);
     // exercised by unit tests only.
@@ -176,11 +176,11 @@ impl BitrateApplyMachine {
         &self.status
     }
 
-    /// Deliver a parsed 0x5507 ACK. Transitions `PendingAck` to `Applied` /
+    /// Deliver a parsed 0x5509 ACK. Transitions `PendingAck` to `Applied` /
     /// `ApplyFailed` and returns the new status; an ACK arriving in any other
     /// state (late ACK after timeout, duplicate, unexpected delivery) is
     /// discarded and returns `None` with the state unchanged.
-    // Inactive until the 0x5507 receive path exists (f1-ack.md R-2);
+    // Inactive until the 0x5509 receive path exists (f1-ack.md R-2);
     // exercised by unit tests only.
     #[allow(dead_code)]
     pub(crate) fn handle_ack(
@@ -366,7 +366,8 @@ mod tests {
         assert_impl::<MoonlightStream>();
     }
 
-    // ── f1-ack 0x5507 state machine (inactive in production until R-1/R-2) ──
+    // ── f1-ack 0x5509 state machine (R-1/R-2 source-confirmed 2026-07-14;
+    //    stays inactive until the moonlight-common 0x5509 receive path lands) ──
 
     // A01 — shipped default: without enable_ack_tracking a queued send stays
     // SentUnacknowledged and never enters PendingAck.

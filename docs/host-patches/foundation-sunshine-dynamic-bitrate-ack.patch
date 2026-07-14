@@ -1,0 +1,122 @@
+diff --git a/src/platform/common.h b/src/platform/common.h
+--- a/src/platform/common.h
++++ b/src/platform/common.h
+@@ -305,6 +305,9 @@ namespace platf {
+     constexpr caps_t touchpad_frame = 0x20;  // Native precision touchpad frame events
+     // Provisional BetterParsec capability: accepts 0x5506 BITRATE messages.
+     constexpr caps_t dynamic_bitrate = 0x40;
++    // Provisional BetterParsec capability: replies to 0x5506 BITRATE requests
++    // with a 0x5509 bitrate ACK. Requires dynamic_bitrate (0x40) to be set.
++    constexpr caps_t dynamic_bitrate_ack = 0x80;
+   };  // namespace platform_caps
+ 
+   struct gamepad_state_t {
+diff --git a/src/rtsp.cpp b/src/rtsp.cpp
+--- a/src/rtsp.cpp
++++ b/src/rtsp.cpp
+@@ -1061,6 +1061,10 @@ namespace rtsp_stream {
+       // The encoder path already handles 0x5506; advertise it explicitly so
+       // clients never infer support from the Sunshine version or ENet alone.
+       caps |= platf::platform_caps::dynamic_bitrate;
++      // This build also replies with 0x5509 bitrate ACKs (stream.cpp
++      // send_bitrate_ack). Clients must key ACK tracking on this bit, never
++      // on dynamic_bitrate alone — pre-ACK builds advertise 0x40 only.
++      caps |= platf::platform_caps::dynamic_bitrate_ack;
+       // Advertise clipboard sync only when the user opted in AND a user-session
+       // GUI agent is currently subscribed; otherwise the client would attempt
+       // sync into a black hole.
+diff --git a/src/stream.cpp b/src/stream.cpp
+--- a/src/stream.cpp
++++ b/src/stream.cpp
+@@ -73,6 +73,7 @@ extern "C" {
+ #define IDX_DYNAMIC_PARAM_CHANGE 18  // 统一动态参数调整消息类型（支持码率、分辨率等）
+ #define IDX_RESOLUTION_CHANGE 19  // 分辨率变化通知
+ #define IDX_CLIPBOARD 20  // Clipboard sync (Sunshine protocol extension; payload forwarded to user-session GUI agent)
++#define IDX_BITRATE_ACK 21  // Bitrate ACK (BetterParsec protocol extension; host->client reply to 0x5506 BITRATE)
+ 
+ static const short packetTypes[] = {
+   0x0305,  // Start A
+@@ -96,6 +97,7 @@ static const short packetTypes[] = {
+   0x5506,  // Dynamic parameter change (Sunshine protocol extension) - 统一动态参数调整
+   0x5507,  // Resolution change (Sunshine protocol extension) - 分辨率变化通知
+   0x5508,  // Clipboard sync (Sunshine protocol extension) - opaque payload forwarded to user-session GUI agent
++  0x5509,  // Bitrate ACK (BetterParsec protocol extension; 0x5507/0x5508 already taken by resolution/clipboard)
+ };
+ 
+ namespace asio = boost::asio;
+@@ -251,6 +253,20 @@ namespace stream {
+     std::uint32_t height;
+   };
+ 
++  // BetterParsec extension: host->client ACK for a 0x5506 BITRATE request.
++  // Layout per betterparsec docs/design/f1-ack.md (all fields LE, 16-byte payload).
++  struct control_bitrate_ack_t {
++    control_header_v2 header;
++
++    std::uint32_t parameter_type;  // always 2 (dynamic_param_type_e::BITRATE)
++    std::uint32_t request_seq;  // reserved, always 0 in this revision
++    std::uint32_t applied_kbps;  // Tier A: echoes the validated/capped request
++    std::uint32_t status;  // 0 = DISPATCHED, 1 = VALIDATION_FAILED
++  };
++
++  constexpr std::uint32_t BITRATE_ACK_DISPATCHED = 0;
++  constexpr std::uint32_t BITRATE_ACK_VALIDATION_FAILED = 1;
++
+   typedef struct control_encrypted_t {
+     std::uint16_t encryptedHeaderType;  // Always LE 0x0001
+     std::uint16_t length;  // sizeof(seq) + 16 byte tag + secondary header and data
+@@ -1238,6 +1254,42 @@ namespace stream {
+     return 0;
+   }
+ 
++  // BetterParsec extension: Tier A bitrate ACK (see control_bitrate_ack_t).
++  // Mirrors send_resolution_change; called from the IDX_DYNAMIC_PARAM_CHANGE
++  // handler, which runs on the control thread with session->control.peer live.
++  int
++  send_bitrate_ack(session_t *session, std::uint32_t applied_kbps, std::uint32_t status) {
++    if (!session->control.peer) {
++      BOOST_LOG(warning) << "Couldn't send bitrate ACK, still waiting for PING from Moonlight"sv;
++      // Still waiting for PING from Moonlight
++      return -1;
++    }
++
++    control_bitrate_ack_t plaintext {};
++    plaintext.header.type = packetTypes[IDX_BITRATE_ACK];
++    plaintext.header.payloadLength = sizeof(control_bitrate_ack_t) - sizeof(control_header_v2);
++
++    plaintext.parameter_type = util::endian::little((std::uint32_t) 2);  // BITRATE
++    plaintext.request_seq = 0;  // reserved, always 0 in this revision
++    plaintext.applied_kbps = util::endian::little(applied_kbps);
++    plaintext.status = util::endian::little(status);
++
++    std::array<std::uint8_t,
++      sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
++      encrypted_payload;
++
++    auto payload = encode_control(session, util::view(plaintext), encrypted_payload);
++    if (session->broadcast_ref->control_server.send(payload, session->control.peer)) {
++      TUPLE_2D(port, addr, platf::from_sockaddr_ex((sockaddr *) &session->control.peer->address.address));
++      BOOST_LOG(warning) << "Couldn't send bitrate ACK to ["sv << addr << ':' << port << ']';
++
++      return -1;
++    }
++
++    BOOST_LOG(debug) << "Sent bitrate ACK: " << applied_kbps << " Kbps, status " << status;
++    return 0;
++  }
++
+   /**
+    * Variable-length sibling of encode_control(). Encrypts an arbitrary-sized
+    * plaintext into the caller-provided output buffer. The output buffer must be
+@@ -1568,6 +1620,11 @@ namespace stream {
+           const auto capped_bitrate = valid_bitrate ? clamp_total_bitrate_to_host_cap(param_value, session->client_name) : param_value;
+           if (validate_and_raise(valid_bitrate, capped_bitrate, "bitrate", " Kbps")) {
+             session->current_total_bitrate = capped_bitrate;
++            // BetterParsec Tier A ACK: the encoder event is queued, not yet applied.
++            send_bitrate_ack(session, (std::uint32_t) capped_bitrate, BITRATE_ACK_DISPATCHED);
++          }
++          else {
++            send_bitrate_ack(session, 0, BITRATE_ACK_VALIDATION_FAILED);
+           }
+           break;
+         }

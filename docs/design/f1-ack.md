@@ -1,4 +1,15 @@
-# `0x5507` ACK protocol design
+# `0x5509` ACK protocol design
+
+> **2026-07-14 source-confirmation update.** The original revision of this
+> design assigned opcode `0x5507`. Foundation Sunshine source inspection at
+> `e110872d` shows **`0x5507` is already taken** (host→client resolution-change
+> notification, `send_resolution_change`, `stream.cpp`) and `0x5508` is taken
+> by clipboard sync; the Foundation extension range `0x5500–0x5508` is fully
+> allocated. **The bitrate ACK therefore uses `0x5509`.** R-1/R-2/R-5/R-6 in §6
+> are now resolved from source, and the host patch exists at
+> `docs/host-patches/foundation-sunshine-dynamic-bitrate-ack.patch`
+> (apply-verified on `e110872d` on top of the capability patch; not yet
+> compile-verified — that requires the Foundation build environment).
 
 ## Background
 
@@ -16,10 +27,12 @@ correlation."
 
 This document specifies the minimum protocol to close that gap.
 
-**Implementation is deferred until Foundation Sunshine source access confirms
-R-1 and R-2 (sections 4 and 5 below).** No host patch is written. Client-side
-state machine stubs and the capability bit constant may be added speculatively,
-but the `PendingAck` path must stay inactive until the host side is verified.
+**R-1 and R-2 are now confirmed from source (2026-07-14, §6).** The host patch
+is written and apply-verified. The client-side state machine (step 2) is
+committed and disarmed; the remaining work is the moonlight-common-c receive
+hook (§6 R-2 resolution), the Rust wrapper binding, arming the state machine
+behind the `0x80` capability bit, and a live paired build to compile-verify
+the host patch and measure `ack_latency_ms`.
 
 ---
 
@@ -44,10 +57,11 @@ success. UI labels and benchmark schema entries must reflect this distinction.
 
 ---
 
-## 2. `0x5507` packet layout
+## 2. `0x5509` packet layout
 
 **Direction**: host → client, ENet reliable, same encrypted control channel
-(`CTRL_CHANNEL_GENERIC`).
+(`CTRL_CHANNEL_GENERIC`). Opcode `0x5509` — see the header note for why not
+`0x5507`/`0x5508`.
 
 **The `0x5506` request payload stays 8 bytes, unchanged.** Adding a
 `request_seq` field to the outbound payload would require changes to
@@ -97,7 +111,7 @@ A Tier A host emits only `DISPATCHED` or `VALIDATION_FAILED`.
 
 ```c
 // Provisional BetterParsec/Foundation extension.
-// Host advertises this bit when it will send 0x5507 ACK replies to 0x5506
+// Host advertises this bit when it will send 0x5509 ACK replies to 0x5506
 // requests.  Requires LI_FF_DYNAMIC_BITRATE (0x40) to also be set.
 #define LI_FF_DYNAMIC_BITRATE_ACK  0x80
 ```
@@ -105,7 +119,7 @@ A Tier A host emits only `DISPATCHED` or `VALIDATION_FAILED`.
 ### Why 0x40 alone is unsafe for ACK detection
 
 Foundation `e110872d` already ships in paired deployments advertising 0x40. That
-build does not send `0x5507`. If a patched client inferred ACK support from 0x40
+build does not send `0x5509`. If a patched client inferred ACK support from 0x40
 alone, it would enter `PendingAck` state and wait forever, producing
 `AckTimeout` → retry loops every 3 seconds. A separate bit is required so that
 the pre-ACK Foundation build remains safe.
@@ -114,9 +128,9 @@ the pre-ACK Foundation build remains safe.
 
 | Client | Host | Behaviour |
 |--------|------|-----------|
-| Patched (understands 0x40 + 0x80) | Advertises 0x40 only, no 0x5507 | Client uses `SentUnacknowledged` fallback path; ACK tracking inactive; identical to existing behaviour |
-| Patched | Advertises 0x40 + 0x80, sends 0x5507 | `PendingAck` → `Applied` / `ApplyFailed` path active |
-| Unpatched client | Advertises 0x40 + 0x80 | Unpatched client ignores 0x80; receives 0x5507 via ENet reliable but its parser treats it as an unknown opcode; no stream corruption |
+| Patched (understands 0x40 + 0x80) | Advertises 0x40 only, no 0x5509 | Client uses `SentUnacknowledged` fallback path; ACK tracking inactive; identical to existing behaviour |
+| Patched | Advertises 0x40 + 0x80, sends 0x5509 | `PendingAck` → `Applied` / `ApplyFailed` path active |
+| Unpatched client | Advertises 0x40 + 0x80 | Unpatched client ignores 0x80; receives 0x5509 via ENet reliable but moonlight-common-c's receive loop silently frees unknown control types (`ControlStream.c` fallthrough, confirmed §6 R-2); no stream corruption |
 | Patched | Stock Sunshine (no 0x40) | 0x5506 is not sent at all; falls through to existing `Unsupported` state |
 
 ---
@@ -140,7 +154,7 @@ pub(crate) enum BitrateApplyStatus {
     SentUnacknowledged { kbps: u32 },            // legacy path: host does not
                                                   // advertise 0x80
     PendingAck { kbps: u32, sent_at_ms: u64 },   // ACK-capable host: waiting
-                                                  // for 0x5507
+                                                  // for 0x5509
     Applied { requested_kbps: u32, applied_kbps: u32, tier: AckTier },
     ApplyFailed { requested_kbps: u32, status: AckStatus },
     AckTimeout { kbps: u32 },                     // ACK-capable host did not
@@ -154,7 +168,7 @@ pub(crate) enum BitrateApplyStatus {
 
 ### ACK receive path
 
-When `0x5507` arrives on the control channel the existing `control_rx` task
+When `0x5509` arrives on the control channel the existing `control_rx` task
 parses it and delivers it to the apply machine via
 `Arc<Mutex<BitrateApplyStatus>>` or an mpsc channel.
 
@@ -202,80 +216,81 @@ response time without host-log correlation.
 
 ---
 
-## 5. Host patch sketch (Foundation Sunshine)
+## 5. Host patch (Foundation Sunshine) — WRITTEN, apply-verified
 
-The existing `foundation-sunshine-dynamic-bitrate-capability.patch` modifies two
-files:
+The patch exists: `docs/host-patches/foundation-sunshine-dynamic-bitrate-ack.patch`.
+It applies on top of `foundation-sunshine-dynamic-bitrate-capability.patch`
+(sequence verified with `git apply --check` on a pristine `e110872d` checkout,
+2026-07-14). It is **not compile-verified** — that requires the Foundation
+build environment (fork-build session).
 
-1. `src/platform/common.h` — adds `platform_caps::dynamic_bitrate = 0x40`.
-2. `src/rtsp.cpp` — sets `caps |= platf::platform_caps::dynamic_bitrate`.
+Confirmed source facts it is built on (all `AlkaidLab/foundation-sunshine@e110872d`):
 
-A patch adding `0x5507` ACK support would modify three files:
+- The `0x5506` handler is a lambda in `controlBroadcastThread()`
+  (`src/stream.cpp`, registered via
+  `server->map(packetTypes[IDX_DYNAMIC_PARAM_CHANGE], ...)`). It has `session`
+  and the control server in scope.
+- The host→client send path is `encode_control(session, ...)` +
+  `session->broadcast_ref->control_server.send(payload, session->control.peer)`
+  — the exact pattern used by `send_hdr_mode`, `send_resolution_change`, and
+  `send_clipboard` in the same file. AES-GCM encryption is applied by
+  `encode_control`; the wire packet is the standard encrypted control envelope.
+- `packetTypes[]` is append-only; the patch adds `IDX_BITRATE_ACK 21` /
+  `0x5509`.
 
-**`src/platform/common.h`** (~3 LOC)
-```diff
-+    constexpr caps_t dynamic_bitrate_ack = 0x80;
-```
+What the patch changes:
 
-**`src/rtsp.cpp`** (~3 LOC)
-```diff
-+    caps |= platf::platform_caps::dynamic_bitrate_ack;
-```
+| File | Change |
+|------|--------|
+| `src/platform/common.h` | `platform_caps::dynamic_bitrate_ack = 0x80` |
+| `src/rtsp.cpp` | `caps \|= platf::platform_caps::dynamic_bitrate_ack` |
+| `src/stream.cpp` | `IDX_BITRATE_ACK` + `0x5509` table entry; `control_bitrate_ack_t` (16-byte LE payload per §2); `send_bitrate_ack()` mirroring `send_resolution_change`; BITRATE case calls it with `DISPATCHED` (echoing the **capped** bitrate — note the handler caps via `clamp_total_bitrate_to_host_cap`, so `applied_kbps` can be lower than requested) or `VALIDATION_FAILED` |
 
-**0x5506 handler file** (~30–50 LOC, file path UNVERIFIED — see R-1 below)
-```cpp
-// After validation passes and encoder event is queued:
-if (caps_advertised_dynamic_bitrate_ack()) {
-    uint32_t ack_payload[4] = {
-        LE32(2),                      // parameter_type = BITRATE
-        LE32(0),                      // request_seq: reserved, always 0
-        LE32((uint32_t)bitrateKbps),  // applied_kbps (Tier A: = requested)
-        LE32(0),                      // status = DISPATCHED
-    };
-    sendControlReply(0x5507, sizeof(ack_payload), ack_payload);
-}
-// On validation failure:
-uint32_t fail_payload[4] = { LE32(2), LE32(0), LE32(0), LE32(1) };
-sendControlReply(0x5507, sizeof(fail_payload), fail_payload);
-```
-
-**Estimated change size**
+Client-side remaining work (unchanged estimates):
 
 | File | Expected delta |
 |------|----------------|
-| `src/platform/common.h` | +3 LOC |
-| `src/rtsp.cpp` | +3 LOC |
-| 0x5506 handler (path UNVERIFIED) | +30–50 LOC |
-| `moonlight-common-c.patch` | no change (0x5506 payload stays 8 bytes) |
-| `moonlight-common-rust` (0x5507 parser) | +60–80 LOC |
-| `streamer/src/bitrate_apply.rs` (state extension) | +80–120 LOC |
+| `patches/moonlight-common-c.patch` | +~30 LOC: `LI_FF_DYNAMIC_BITRATE_ACK 0x80`; `0x5509` branch in `controlReceiveThreadFunc` before the unknown-type `free()` fallthrough; callback registration (see R-2) |
+| `patches/moonlight-common-rust.patch` (`0x5509` parser + binding) | +60–80 LOC |
+| `streamer/src/bitrate_apply.rs` (state machine) | **done** (commit `3774524`, disarmed) — arming + receive wiring remains |
 | New tests | +100–150 LOC |
+
+One semantic addition over the original sketch: because the Foundation handler
+clamps the requested bitrate to a host cap before dispatching, Tier A
+`applied_kbps` echoes the **clamped** value, not the raw request. The client
+`Applied { requested_kbps, applied_kbps }` state already carries both, so a
+clamp is directly observable client-side — an improvement over the original
+"echoes requested" assumption in §2, which remains the layout but not always
+the value.
 
 ---
 
-## 6. Unverifiable risks (without live Foundation source access)
+## 6. Risks — resolution status (2026-07-14 source inspection, `e110872d`)
 
-The following items cannot be confirmed from the patched binaries and commit
-diffs available to this project. The design is believed to be correct, but each
-risk must be resolved before the host patch is written.
+**[R-1] host→client control packet delivery — RESOLVED: CONFIRMED-SAFE**
+The `0x5506` handler lives in `src/stream.cpp` inside `controlBroadcastThread()`
+(lambda registered via `server->map(packetTypes[IDX_DYNAMIC_PARAM_CHANGE], …)`).
+The handler has `session_t *session` in scope; `session->control.peer` and
+`session->broadcast_ref->control_server.send(...)` are exactly how the three
+existing host→client senders (`send_hdr_mode`, `send_resolution_change`,
+`send_clipboard`) transmit, all via `encode_control` AES-GCM framing. No
+separate reply channel is needed. **Consequence discovered during
+confirmation: `0x5507` and `0x5508` are already allocated (resolution change,
+clipboard) — the ACK opcode moved to `0x5509`.**
 
-**[R-1] host→client control packet delivery (HIGH)**
-The file containing Foundation `e110872d`'s `0x5506` handler is not known.
-Whether the handler context has access to the ENet peer handle — and whether a
-`sendReply` or equivalent function exists for sending host→client control
-replies — is unconfirmed. If the control channel is implemented as client→host
-only and the ENet peer handle is not accessible inside the handler, a separate
-reply channel design is required. This is the primary blocker for the host
-patch.
+**[R-2] `sendMessageAndDiscardReply` semantics — RESOLVED: CONFIRMED-SAFE, hook required as designed**
+On the ENet path (`AppVersionQuad[0] >= 5`, always true for Sunshine),
+`sendMessageAndDiscardReply` (`ControlStream.c`) calls `sendMessageEnet` and
+returns — it reads no reply; "discard reply" applies only to the legacy TCP
+path. Incoming control packets are dispatched in `controlReceiveThreadFunc`:
+six known async-callback types, the termination type, and **an unconditional
+`free(ctlHdr)` fallthrough for everything else — an arriving `0x5509` is
+silently discarded with no log and no corruption**. So: no interference from
+the send helper, but the client cannot see the ACK until
+`patches/moonlight-common-c.patch` adds a `0x5509` branch before that
+fallthrough (plus a callback registration surfaced to the Rust wrapper).
 
-**[R-2] `sendMessageAndDiscardReply` semantics (MEDIUM)**
-`patches/moonlight-common-c.patch` uses `sendMessageAndDiscardReply` for
-`LiChangeBitrate`. If this function drops incoming replies at the
-moonlight-common-c layer, an arriving `0x5507` would be silently discarded
-before BetterParsec can process it. A separate receive hook or callback
-registration would then be required in the moonlight-common-c patch.
-
-**[R-3] Synchronous/asynchronous boundary in the Foundation handler (MEDIUM)**
+**[R-3] Synchronous/asynchronous boundary in the Foundation handler (MEDIUM — unchanged, inherent to Tier A)**
 `f1-apply-path.md` states "dispatches an asynchronous encoder event." If the
 handler returns before any encoder work is done, Tier A ACK reflects only that
 the event was queued — not that NVENC accepted or processed it. This is
@@ -289,38 +304,51 @@ means the event was queued regardless of codec. However, benchmark collection
 must correlate `applied_dispatched` events with measured wire-bitrate changes to
 confirm NVENC honoured the request for each codec.
 
-**[R-5] Capability bit collision (LOW)**
-`moonlight-common-c.patch` comments indicate Foundation `e110872d` uses bits
-`0x01` through `0x20`. Whether `0x40` and `0x80` are free in the full
-Foundation `platform_caps` list must be confirmed from source.
+**[R-5] Capability bit collision — RESOLVED: CONFIRMED-SAFE**
+`src/platform/common.h` `platform_caps` at `e110872d` allocates `0x01`–`0x20`
+(pen_touch, controller_touch, clipboard_text, clipboard_image, touchpad,
+touchpad_frame). `0x40` (used by the existing capability patch) and `0x80` are
+free.
 
-**[R-6] ENet message ordering (LOW)**
-ENet reliable guarantees delivery but not global ordering across channels. With
-a 900 ms `ApplyGate` interval limiting the client to one in-flight request,
-interleaving is unlikely. The state machine's "discard if not in `PendingAck`"
-defence covers the remaining edge case.
+**[R-6] ENet message ordering — RESOLVED: CONFIRMED-SAFE**
+Both directions use ENet channel 0 (`CTRL_CHANNEL_GENERIC`): `LiChangeBitrate`
+sends `0x5506` on it, and `control_server_t::send` transmits host→client
+replies with `enet_peer_send(peer, 0, …)`. Reliable + same channel = ordered
+within the connection; with the 900 ms `ApplyGate` single-in-flight rule, no
+interleaving is possible. The "discard if not in `PendingAck`" defence remains
+for the residual multi-request edge.
 
 ---
 
-## Implementation order (post-source-access)
+## Implementation order — status (2026-07-14)
 
-1. Define `LI_FF_DYNAMIC_BITRATE_ACK = 0x80` in `moonlight-common-c.patch`
-   (capability bit only; no handler yet).
-2. Add client-side `0x5507` parser and `BitrateApplyStatus` extension with full
-   unit tests (no live host required).
-3. Obtain Foundation source access; confirm R-1 (host→client reply path) and
-   R-2 (`sendMessageAndDiscardReply` receive behaviour).
-4. Write and apply the host patch; build a paired local Foundation host.
-5. Measure `ack_latency_ms` in the benchmark runner; correlate with host-log
-   NVENC apply records.
-6. Decide whether Tier B is required based on step 5 correlation quality.
+1. [ ] Define `LI_FF_DYNAMIC_BITRATE_ACK = 0x80` in `moonlight-common-c.patch`
+   **plus** the `0x5509` receive branch in `controlReceiveThreadFunc` and a
+   callback registration (R-2 resolution showed the bit alone is not enough —
+   without the branch the ACK is freed before any client code sees it).
+2. [x] Client-side `BitrateApplyStatus` extension with unit tests — commit
+   `3774524` (disarmed). The `0x5509` parser in `moonlight-common-rust` remains
+   with step 1's callback.
+3. [x] Foundation source access; R-1/R-2/R-5/R-6 confirmed (§6). Opcode moved
+   to `0x5509`.
+4. [~] Host patch **written and apply-verified**
+   (`docs/host-patches/foundation-sunshine-dynamic-bitrate-ack.patch`);
+   compile + paired local Foundation build remains (fork-build session, user
+   present).
+5. [ ] Measure `ack_latency_ms` in the benchmark runner; correlate with
+   host-log NVENC apply records.
+6. [ ] Decide whether Tier B is required based on step 5 correlation quality.
 
 ---
 
 ## Source references
 
-- `AlkaidLab/foundation-sunshine@e110872d` — `0x5506` handler, async encoder
+- `AlkaidLab/foundation-sunshine@e110872d` — `0x5506` handler
+  (`src/stream.cpp` `controlBroadcastThread`), `control_server_t::send`,
+  `encode_control`, `packetTypes[]` (0x5500–0x5508 allocated), async encoder
   event dispatch
+- `docs/host-patches/foundation-sunshine-dynamic-bitrate-ack.patch` — the
+  0x5509 Tier A host patch (this design, host side)
 - `docs/design/f1-apply-path.md` — ACK absence documented, live validation
   status
 - `docs/host-patches/foundation-sunshine-dynamic-bitrate-capability.patch` —

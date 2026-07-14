@@ -67,10 +67,8 @@ pub struct FlowConfig {
 enum Phase {
     /// Init sent, waiting for Setup.
     AwaitSetup,
-    /// SetTransport(WebRTC) sent, negotiating.
+    /// SetTransport(WebRTC) + StartStream sent, negotiating.
     Negotiating,
-    /// StartStream sent, waiting for ConnectionComplete.
-    Starting,
     /// ConnectionComplete received.
     Streaming,
     /// ConnectionTerminated received.
@@ -108,9 +106,27 @@ impl SignalingFlow {
                     return Vec::new(); // duplicate Setup: ignore
                 }
                 self.phase = Phase::Negotiating;
+                // Web-client parity (index.ts tryWebRTCTransport →
+                // startStream): StartStream goes out immediately after
+                // SetTransport — the streamer starts the moonlight session
+                // and WebRTC negotiation in parallel, and only produces the
+                // SDP offer once StartStream has arrived. Waiting for
+                // peer-connected before StartStream deadlocks (live probe,
+                // 2026-07-14).
                 vec![
                     FlowAction::CreatePeer(ice_servers),
                     FlowAction::Send(StreamClientMessage::SetTransport(TransportType::WebRTC)),
+                    FlowAction::Send(StreamClientMessage::StartStream {
+                        settings: StreamSettings {
+                            bitrate_kbps: self.config.bitrate_kbps,
+                            width: self.config.width,
+                            height: self.config.height,
+                            fps: self.config.fps,
+                            play_audio_local: false,
+                            supported_codecs: self.config.supported_codecs,
+                            hdr: false,
+                        },
+                    }),
                 ]
             }
             StreamServerMessage::WebRtc(StreamSignalingMessage::Description(desc)) => {
@@ -171,25 +187,9 @@ impl SignalingFlow {
         ))
     }
 
-    /// Peer transitioned to connected. Emits `StartStream` exactly once
-    /// (reconnect/re-fire must not restart the moonlight session).
-    pub fn on_peer_connected(&mut self) -> Option<FlowAction> {
-        if self.phase != Phase::Negotiating {
-            return None;
-        }
-        self.phase = Phase::Starting;
-        Some(FlowAction::Send(StreamClientMessage::StartStream {
-            settings: StreamSettings {
-                bitrate_kbps: self.config.bitrate_kbps,
-                width: self.config.width,
-                height: self.config.height,
-                fps: self.config.fps,
-                play_audio_local: false,
-                supported_codecs: self.config.supported_codecs,
-                hdr: false,
-            },
-        }))
-    }
+    /// Peer transitioned to connected. Pure state notification — the
+    /// StartStream message is already out (sent with Setup handling).
+    pub fn on_peer_connected(&mut self) {}
 
     pub fn is_terminated(&self) -> bool {
         self.phase == Phase::Terminated
@@ -240,38 +240,26 @@ mod tests {
     }
 
     #[test]
-    fn setup_creates_peer_then_selects_webrtc_transport() {
+    fn setup_creates_peer_selects_transport_and_starts_stream() {
         let mut flow = SignalingFlow::new(config());
         let actions = flow.on_server_message(setup_msg());
-        assert_eq!(actions.len(), 2);
+        assert_eq!(actions.len(), 3);
         assert!(matches!(actions[0], FlowAction::CreatePeer(_)));
         assert!(matches!(
             actions[1],
             FlowAction::Send(StreamClientMessage::SetTransport(TransportType::WebRTC))
         ));
+        // Web-client parity: StartStream immediately after SetTransport —
+        // the streamer only produces the SDP offer once StartStream arrived
+        // (deadlock pin, live probe 2026-07-14).
+        let FlowAction::Send(StreamClientMessage::StartStream { settings }) = &actions[2] else {
+            panic!("expected StartStream third, got {actions:?}");
+        };
+        assert_eq!(settings.bitrate_kbps, 8000);
+        assert_eq!(settings.supported_codecs, 0x1);
 
-        // Duplicate Setup is ignored (no second peer, no second SetTransport).
+        // Duplicate Setup is ignored (no second peer/transport/stream).
         assert!(flow.on_server_message(setup_msg()).is_empty());
-    }
-
-    #[test]
-    fn start_stream_fires_exactly_once_and_only_after_setup() {
-        let mut flow = SignalingFlow::new(config());
-        assert!(
-            flow.on_peer_connected().is_none(),
-            "connected before Setup must not start the stream"
-        );
-
-        flow.on_server_message(setup_msg());
-        let action = flow.on_peer_connected().expect("first connect starts");
-        assert!(matches!(
-            action,
-            FlowAction::Send(StreamClientMessage::StartStream { .. })
-        ));
-        assert!(
-            flow.on_peer_connected().is_none(),
-            "reconnect must not restart the moonlight session"
-        );
     }
 
     #[test]

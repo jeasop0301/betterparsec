@@ -171,8 +171,25 @@ enum LocalEvent {
     FecAckOpen(Arc<RTCDataChannel>),
 }
 
+/// Progress states only upgrade (Connecting → PeerConnected → Streaming):
+/// `ConnectionComplete` can arrive on the WS *before* the peer-connected
+/// callback fires (observed live 2026-07-14 — 130 ms inversion), and the
+/// late PeerConnected must not demote Streaming. Terminal states
+/// (Failed/Stopped) always win.
 fn set_state(state: &AtomicU8, s: SessionState) {
-    state.store(s as u8, Ordering::Release);
+    let new = s as u8;
+    if matches!(s, SessionState::Failed | SessionState::Stopped) {
+        state.store(new, Ordering::Release);
+        return;
+    }
+    // Upgrade-only among progress states (0..=2).
+    let _ = state.fetch_update(Ordering::Release, Ordering::Acquire, |cur| {
+        if cur < new && cur <= SessionState::Streaming as u8 {
+            Some(new)
+        } else {
+            None
+        }
+    });
 }
 
 async fn run_session(
@@ -308,10 +325,7 @@ async fn run_session(
                         match s {
                             RTCPeerConnectionState::Connected => {
                                 set_state(&state, SessionState::PeerConnected);
-                                if let Some(FlowAction::Send(msg)) = flow.on_peer_connected() {
-                                    send_ws(&ws_tx, &msg).await?;
-                                    info!("StartStream sent");
-                                }
+                                flow.on_peer_connected();
                             }
                             RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
                                 bail!("peer connection {s}");

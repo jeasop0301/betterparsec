@@ -62,7 +62,7 @@ Tetrys FEC · 서브프레임 슬라이스 · QU · 네이티브 클라이언트
 | U2. Tetrys 슬라이딩윈도우 FEC | [x] fec.rs 47 tests (GF(256), MDS sweep) + u32 wrap/윈도캡 가드 3핀 | [x] 프레이밍 설계(video_fec DataChannel) + **P1 배선 완료** + **P2-lite 라이브 손실 검증 통과** (2026-07-14, 루프백+clumsy 5%/20%: FEC-only 렌더 라이브, 20%에서도 화면 깨짐 0, needs-IDR 복구 루프 39+36회 순환, 손실 중 재접속 ~1.1 s — fec-framing.md §8-A) | Gate B/D — P2 정량화(복구율 vs 비율, 재정렬 ACK 윈도), P3 적응 비율 A/B·기본 경로 판정 |
 | U3. 서브프레임 슬라이스 | [x] 제약 인벤토리 + [x] 콜백 granularity 조사(1콜백=1프레임 확정, slice-qu-constraints.md §5) | [x] **소형 레버**: `slices_per_frame` C-경로 래퍼 갭 수정 — capability bits 24-31 패킹, 기본 1 비트-동일 핀(2026-07-14, streamer 261 tests). 잔여: [ ] 활성값 튜닝(P0 RTX 4070 슬라이스 지연 실측 선행) · [ ] per-slice DU 전달(depacketizer 패치, 중규모) · [ ] 호스트 슬라이스 모드+per-slice 송신(포크) | Gate C에서 인코드→프레젠트 겹침 이득 실측 |
 | U4. QU build-to-lossless | [x] 채널·타일 프로토콜 설계 (2026-07-14, docs/design/qu-protocol.md — `video_qu` 단일 reliable 채널, PNG 타일+CRC 자가검증, epoch/invalidate, 오버레이 캔버스 합성 결정, localhost 릴레이 인터페이스) | [x] **P1 완료** (2026-07-14): 스트리머 릴레이(qu_relay, subscribe 게이트·세대 가드·4 MiB 바운드·재접속 replay) + 클라 오버레이(순수 상태/DOM 분리, CRC 자가검증, 디코드-중-invalidate 레이스 가드) — sonnet 리뷰 8건 전부 수정·핀, streamer 251·웹 103 그린. 잔여: [ ] 호스트 무손실 타일 경로(포크 P2, 릴레이 포트 config 플러밍 포함) | Gate E — 데스크톱 모드 픽셀-퍼펙트 |
-| U5. 네이티브 클라이언트 (ultra 티어) | [x] 리서치 05 §3 아키텍처 | [x] moonlight-qt 포크 스파이크 완료 (2026-07-14, docs/design/m6-native-spike.md — "2–4주" 판정 OPTIMISTIC → 실측 3–5주, 접합 = Rust cdylib 사이드카(Option-3), ALLOW_TEARING/FLIP_DISCARD는 기존재·waitable만 부재, CUVID 경로 존재하나 Windows pass-1) → [~] **W1 진행** (2026-07-14): fec/fec_wire를 공유 `transport-core` 크레이트로 추출 + 순수 `VideoReceiver`(TS fec_decode_pipe 미러, 15 tests) + `client-transport` cdylib 스켈레톤(C ABI ct_receiver_*/FrameQueue/include 헤더, 11 tests). 잔여: WebRTC/signaling 클라 → ct_receiver_on_message 연결, Qt측 W2 글루 | Gate C 외부 계측으로 지연 왕좌 판정 |
+| U5. 네이티브 클라이언트 (ultra 티어) | [x] 리서치 05 §3 아키텍처 | [x] moonlight-qt 포크 스파이크 완료 (m6-native-spike.md, 접합 = Rust cdylib 사이드카 Option-3) → [x] **W1 완주** (2026-07-14): `transport-core` 추출 + 순수 `VideoReceiver`(TS 미러, 15 tests) + `client-transport` cdylib(C ABI ct_receiver_*/ct_start/FrameQueue, 헤더) + **WebRTC/signaling 클라 라이브 검증** — ct-probe가 브라우저 없이 699프레임/15s 수신, `CT-PROBE-OK` (StartStream 타이밍 교착·상태 역전 130ms 두 함정 해소, 스파이크 §F 갱신). 잔여: W2 셸 글루(Qt 6 빌드 환경 ~2–3h) 또는 통합 앱 셸 직행 | Gate C 외부 계측으로 지연 왕좌 판정 |
 
 - **착수 조건 변경**: 리서치 04 §5의 "M6는 웹 클라 gate 통과 후"는 **owner 티어
   판정(리서치 05 결정 0, 2026-07-14)이 대체한다** — 네이티브는 ultra 티어 제품
@@ -84,8 +84,10 @@ U5/M6 스파이크, f1-ack 소스 확인+0x5509 호스트 패치.
    상태머신 arming (헤드리스 가능; vendor 재생성 필요).
 3. U4 P1 — `video_qu` 채널 + localhost 릴레이 + 클라 오버레이(스트리머 단독,
    합성 타일 인젝터로 테스트).
-4. M6 W1 잔여 — `client-transport`에 WebRTC/signaling 클라이언트 연결
-   (수신 파이프라인·C ABI·FrameQueue는 완료). Qt 빌드 환경(~2–3h)은 W2 착수 시.
+4. ~~M6 W1~~ — **완주** (2026-07-14): ct-probe 라이브 검증 `CT-PROBE-OK` —
+   브라우저 없이 로그인→시그널링→WebRTC answer→video_fec 구독→FEC
+   디코드로 699프레임/15s(~58fps) 수신. 다음: W2 셸 글루 또는 통합
+   양방향 앱 아키텍처 설계 (owner 방향에 따라 후자 우선 검토).
 5. Gate B 2-machine 첫 신뢰 run — 이후 U1 CC 신호 판정, U2 P2 손실 복구
    실측·비율 튜닝, U3/U5 지연 계측이 전부 이 위에서 순차 판정된다.
 

@@ -278,23 +278,28 @@ moonlight-common-c:  2ea4775 (enet + nanors 서브모듈 포함)
 W1 잔여(WebRTC/signaling 클라)를 위해 웹 클라 소스에서 확정한 사실.
 구현은 이 계약에 맞추고, 변경 발견 시 이 절을 갱신한다.
 
-### F-1. 접속 순서 (web/stream/index.ts · transport/webrtc.ts 기준)
+### F-1. 접속 순서 (라이브 검증 완료, 2026-07-14 ct-probe)
 
-1. **인증**: `POST /login` (PostLoginRequest JSON, web/api.ts) → 세션 쿠키.
-2. **Signaling WS**: `ws(s)://{host}/host/stream` (쿠키 인증).
+1. **인증**: `POST /api/login` (PostLoginRequest JSON) → 세션 쿠키.
+2. **Signaling WS**: `ws(s)://{host}/api/host/stream` (쿠키 인증).
 3. WS open → 클라 `StreamClientMessage::Init { host_id, app_id,
-   video_frame_queue_size, audio_sample_queue_size }`.
-4. 서버 `StreamServerMessage::Setup { ice_servers }` → 클라 peer 생성.
-5. **스트리머가 offerer** — 서버 `WebRtc(Description(offer))` 수신 →
-   클라 `setRemoteDescription` + answer 생성 →
-   `WebRtc(Description(answer))` 회신. ICE candidate는
-   `WebRtc(AddIceCandidate(...))`로 양방향 (peer 생성 전 도착분은 버퍼링).
-6. 클라 `StartStream { settings: StreamSettings }` → 서버
-   `ConnectionComplete { format, width, height, fps, audio_sample_rate,
-   audio_channel_count, audio_streams, audio_coupled_streams,
-   audio_samples_per_frame, audio_mapping }` — 네이티브 디코더/DECODE_UNIT
-   셋업 파라미터는 전부 여기서 나온다. 종료는
-   `ConnectionTerminated { error_code }`.
+   video_frame_queue_size, audio_sample_queue_size }`. app_id는
+   `GET /api/apps?host_id=…`의 실제 Sunshine 앱 ID(예: Desktop
+   881448767) — 임의 값이면 "app was not found"로 종료.
+4. 서버 `Setup { ice_servers }` → 클라는 **연달아** peer 생성 +
+   `SetTransport(WebRTC)` + `StartStream { settings }` 송신.
+   ⚠ **StartStream은 협상 완료를 기다리면 안 된다** — 스트리머는
+   StartStream 수신 후에야 moonlight 세션과 offer 생성을 진행하므로
+   peer-connected를 기다리면 상호 대기 교착 (라이브 프로브로 확인,
+   웹 클라도 동일 순서: index.ts tryWebRTCTransport → startStream).
+5. **스트리머가 offerer** — `WebRtc(Description(offer))` 수신 →
+   answer 회신. ICE candidate 양방향 (peer/remote-description 전
+   도착분은 버퍼링).
+6. 서버 `ConnectionComplete { format, width, height, fps, audio_* }` —
+   디코더/DECODE_UNIT 셋업 파라미터 전부 여기서. ⚠ WS의
+   ConnectionComplete가 peer-connected 콜백보다 **먼저** 올 수 있다
+   (실측 130 ms 역전) — 상태머신은 업그레이드 전용이어야 한다.
+   종료는 `ConnectionTerminated { error_code }`.
 
 ### F-2. DataChannel/FEC 계약
 

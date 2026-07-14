@@ -771,6 +771,7 @@ fn gaussian_elim(
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -1856,15 +1857,15 @@ mod tests {
         // The key test: no panic, and the decoder did not silently emit a wrong
         // Recovered event for u32::MAX from an empty coefficient row.
         for e in &all_events {
-            if let DecoderEvent::Recovered { seq: s, payload } = e {
-                if *s == u32::MAX {
-                    // Recovery succeeded — verify payload correctness.
-                    assert_eq!(
-                        payload.as_slice(),
-                        b"before_wrap",
-                        "recovered payload must match original"
-                    );
-                }
+            if let DecoderEvent::Recovered { seq: s, payload } = e
+                && *s == u32::MAX
+            {
+                // Recovery succeeded — verify payload correctness.
+                assert_eq!(
+                    payload.as_slice(),
+                    b"before_wrap",
+                    "recovered payload must match original"
+                );
             }
         }
 

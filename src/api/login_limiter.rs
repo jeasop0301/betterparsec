@@ -113,14 +113,13 @@ fn record_failure(map: &mut HashMap<IpAddr, Entry>, ip: IpAddr, now: Instant) {
 /// Step 2: if still at capacity, remove the single entry with the oldest window_start.
 fn evict(map: &mut HashMap<IpAddr, Entry>, now: Instant) {
     map.retain(|_, e| now.saturating_duration_since(e.window_start) < WINDOW);
-    if map.len() >= MAP_LIMIT {
-        if let Some(oldest_ip) = map
+    if map.len() >= MAP_LIMIT
+        && let Some(oldest_ip) = map
             .iter()
             .min_by_key(|(_, e)| e.window_start)
             .map(|(ip, _)| *ip)
-        {
-            map.remove(&oldest_ip);
-        }
+    {
+        map.remove(&oldest_ip);
     }
 }
 

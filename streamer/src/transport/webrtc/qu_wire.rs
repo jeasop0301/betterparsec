@@ -261,6 +261,7 @@ pub fn peek(buf: &[u8]) -> Option<(u8, Option<u32>)> {
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -412,7 +413,7 @@ mod tests {
     #[test]
     fn tile_header_minus_1_is_none() {
         // 19 bytes needed; feed 18
-        assert!(parse_msg(&vec![KIND_QU_TILE; 18]).is_none());
+        assert!(parse_msg(&[KIND_QU_TILE; 18]).is_none());
     }
 
     /// payload_len field claims more bytes than are present → None
@@ -443,7 +444,7 @@ mod tests {
     #[test]
     fn invalidate_header_minus_1_is_none() {
         // 7 bytes needed; feed 6
-        assert!(parse_msg(&vec![KIND_QU_INVALIDATE; 6]).is_none());
+        assert!(parse_msg(&[KIND_QU_INVALIDATE; 6]).is_none());
     }
 
     /// count claims 1 tile entry but zero pair bytes follow → None

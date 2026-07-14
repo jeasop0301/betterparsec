@@ -426,6 +426,7 @@ async fn run_connection<R, W>(
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::transport::webrtc::qu_wire;

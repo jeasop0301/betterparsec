@@ -693,13 +693,13 @@ mod cross_vector_tests {
             }
             let sym = parse_symbol_msg(msg).expect("all test messages must be valid");
             for ev in dec.push_symbol(sym) {
-                if let DecoderEvent::Recovered { payload, .. } = ev {
-                    if let Some((hdr, frag)) = parse_chunk_header(&payload) {
-                        chunks
-                            .entry(hdr.frame_id)
-                            .or_default()
-                            .push((hdr.chunk_index, frag.to_vec()));
-                    }
+                if let DecoderEvent::Recovered { payload, .. } = ev
+                    && let Some((hdr, frag)) = parse_chunk_header(&payload)
+                {
+                    chunks
+                        .entry(hdr.frame_id)
+                        .or_default()
+                        .push((hdr.chunk_index, frag.to_vec()));
                 }
             }
         }

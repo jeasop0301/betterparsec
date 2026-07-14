@@ -10,12 +10,19 @@ use actix_web::{
 };
 use common::api_bindings::PostLoginRequest;
 use futures::future::{Ready, ready};
-use std::{pin::Pin, time::Duration};
+use std::{
+    net::IpAddr,
+    pin::Pin,
+    time::{Duration, Instant},
+};
 
-use crate::app::{
-    App, AppError,
-    auth::{SessionToken, UserAuth},
-    user::{Admin, AuthenticatedUser},
+use crate::{
+    api::login_limiter::{LimitCheck, LoginLimiter},
+    app::{
+        App, AppError,
+        auth::{SessionToken, UserAuth},
+        user::{Admin, AuthenticatedUser},
+    },
 };
 
 pub const COOKIE_SESSION_TOKEN_NAME: &str = "mlSession";
@@ -160,29 +167,64 @@ impl FromRequest for Admin {
 #[post("/login")]
 async fn login(
     app: Data<App>,
+    limiter: Data<LoginLimiter>,
+    req: HttpRequest,
     Json(request): Json<PostLoginRequest>,
 ) -> Result<HttpResponse, Error> {
-    let user = if app.config().web_server.first_login_create_admin {
+    // Rate-limit key: real socket peer address, not spoofable forwarded headers.
+    // Falls back to the unspecified address when the transport exposes no peer.
+    let peer_ip = req
+        .peer_addr()
+        .map(|s| s.ip())
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+
+    // Check BEFORE password verification — blocked IPs must not reach PBKDF2 work.
+    if let LimitCheck::Deny { retry_after_secs } = limiter.check(peer_ip, Instant::now()) {
+        return Ok(HttpResponse::TooManyRequests()
+            .insert_header(("Retry-After", retry_after_secs.to_string()))
+            .finish());
+    }
+
+    let auth_result = if app.config().web_server.first_login_create_admin {
         match app
             .try_add_first_login(request.name.clone(), request.password.clone())
             .await
         {
-            Ok(user) => user,
+            Ok(user) => Ok(user),
             Err(AppError::FirstUserAlreadyExists) => {
                 app.user_by_auth(UserAuth::UserPassword {
                     username: request.name,
                     password: request.password,
                 })
-                .await?
+                .await
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => Err(err),
         }
     } else {
         app.user_by_auth(UserAuth::UserPassword {
             username: request.name,
             password: request.password,
         })
-        .await?
+        .await
+    };
+
+    let user = match auth_result {
+        Ok(user) => {
+            // Successful authentication: reset the failure counter for this IP.
+            limiter.clear(peer_ip);
+            user
+        }
+        Err(err) => {
+            // Count authentication failures (wrong credentials / unknown user).
+            // Do not count internal errors: those do not indicate a guessing attempt.
+            if matches!(
+                err,
+                AppError::CredentialsWrong | AppError::UserNotFound | AppError::Unauthorized
+            ) {
+                limiter.record_failure(peer_ip, Instant::now());
+            }
+            return Err(err.into());
+        }
     };
 
     let session_expiration = app.config().web_server.session_cookie_expiration;

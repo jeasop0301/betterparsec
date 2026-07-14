@@ -17,6 +17,7 @@ use crate::api::{
 pub mod app;
 pub mod auth;
 pub mod host;
+pub mod login_limiter;
 pub mod role;
 pub mod settings;
 pub mod stream;

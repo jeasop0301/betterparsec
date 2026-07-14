@@ -30,6 +30,7 @@ use webrtc::{
     },
 };
 
+use crate::cc::{CcController, CcShared, CcVerdict};
 use crate::transport::metrics::{DurationAccumulator, VideoTransportMetrics};
 
 const PLAYOUT_DELAY_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay";
@@ -78,6 +79,31 @@ where
     new_samples_notify: Arc<Notify>,
     queue: Arc<Mutex<VecDeque<FrameSamples<Track>>>>,
     metrics: Option<Arc<VideoTransportMetrics>>,
+    /// Frame-delay congestion controller, installed by the video setup path
+    /// only (audio senders never set it). Moved into the sample-sender task
+    /// at `create_track`, which owns it for the track's lifetime.
+    cc: Option<CcContext>,
+}
+
+/// The congestion controller plus its cross-task mailbox, owned by the
+/// sample-sender loop. See `crate::cc` for the control law and the shared
+/// state contract. `generation` tags every CcShared write so a superseded
+/// sender task (stream re-setup spawns a new one without stopping the old)
+/// cannot publish into the current stream's composition.
+pub struct CcContext {
+    controller: CcController,
+    shared: Arc<CcShared>,
+    generation: u32,
+}
+
+impl CcContext {
+    pub fn new(controller: CcController, shared: Arc<CcShared>, generation: u32) -> Self {
+        Self {
+            controller,
+            shared,
+            generation,
+        }
+    }
 }
 
 struct FrameSamples<Track>
@@ -101,6 +127,7 @@ where
             new_samples_notify: Default::default(),
             queue: Default::default(),
             metrics: None,
+            cc: None,
         }
     }
 
@@ -117,11 +144,19 @@ where
             new_samples_notify: Default::default(),
             queue: Default::default(),
             metrics: Some(metrics),
+            cc: None,
         }
     }
 
     pub fn metrics(&self) -> Option<&VideoTransportMetrics> {
         self.metrics.as_deref()
+    }
+
+    /// Install the frame-delay congestion controller for the next
+    /// `create_track` call. Video-only; called at stream setup when a bitrate
+    /// ceiling is configured (the same gate that enables ABR).
+    pub fn set_congestion_controller(&mut self, cc: CcContext) {
+        self.cc = Some(cc);
     }
 
     pub async fn create_track(
@@ -140,10 +175,11 @@ where
         let new_samples_notify = self.new_samples_notify.clone();
         let queue = Arc::downgrade(&self.queue);
         let metrics = self.metrics.clone();
+        let cc = self.cc.take();
         self.runtime.spawn({
             let track = track.clone();
             async move {
-                sample_sender(track, &new_samples_notify, queue, metrics).await;
+                sample_sender(track, &new_samples_notify, queue, metrics, cc).await;
             }
         });
 
@@ -267,9 +303,13 @@ async fn sample_sender<Track>(
     new_samples_notify: &Notify,
     queue: Weak<Mutex<VecDeque<FrameSamples<Track>>>>,
     metrics: Option<Arc<VideoTransportMetrics>>,
+    mut cc: Option<CcContext>,
 ) where
     Track: TrackLike,
 {
+    // Monotonic epoch for CC timestamps. Created before any frame is
+    // processed, so `saturating_duration_since(epoch)` never truncates.
+    let cc_epoch = Instant::now();
     loop {
         let frame = {
             let Some(queue) = queue.upgrade() else {
@@ -310,6 +350,13 @@ async fn sample_sender<Track>(
         let now_secs = now.as_secs() as f64 + now.subsec_nanos() as f64 * 1e-9;
         let abs_send_time: u64 = (now_secs * 262_144.0) as u64;
 
+        let send_started = Instant::now();
+        // Frame payload bytes whose track write was actually attempted
+        // (written or failed). Stays 0 for fully-skipped frames (track not
+        // ready / paused): their near-zero "service time" is not congestion
+        // evidence and must not feed the controller as deflate signal.
+        let mut cc_attempted_bytes: u64 = 0;
+
         for sample in frame.samples {
             let rtp_payload_bytes = Track::sample_payload_len(&sample);
             let write_started = Instant::now();
@@ -331,6 +378,7 @@ async fn sample_sender<Track>(
                         metrics.record_write_succeeded(rtp_payload_bytes);
                     }
                     in_flight_frame.record_write_latency(write_latency);
+                    cc_attempted_bytes += rtp_payload_bytes as u64;
                 }
                 Ok(TrackWriteOutcome::Skipped) => {
                     if let Some(metrics) = metrics.as_ref() {
@@ -343,7 +391,38 @@ async fn sample_sender<Track>(
                     }
                     in_flight_frame.record_write_latency(write_latency);
                     warn!("[Stream]: track.write_sample failed: {err}");
+                    cc_attempted_bytes += rtp_payload_bytes as u64;
                 }
+            }
+        }
+
+        if let Some(cc) = cc.as_mut()
+            && cc_attempted_bytes > 0
+        {
+            // RR loss reacts immediately (bypasses inflate accumulation);
+            // apply the pending report before this frame's delay sample. The
+            // resulting target is published once below: `on_frame` always
+            // returns the current target (loss decrease included), even on
+            // a Skipped verdict.
+            if let Some(loss) = cc.shared.take_loss_for(cc.generation) {
+                cc.controller.on_loss_report(loss);
+            }
+
+            let send_start_us = send_started
+                .saturating_duration_since(cc_epoch)
+                .as_micros() as u64;
+            let send_done_us = Instant::now()
+                .saturating_duration_since(cc_epoch)
+                .as_micros() as u64;
+            let (target, verdict) = cc.controller.on_frame(
+                send_start_us,
+                send_done_us,
+                cc_attempted_bytes,
+                cc.shared.frame_interval_us(),
+            );
+            cc.shared.publish_target_for(cc.generation, target);
+            if matches!(verdict, CcVerdict::Decrease | CcVerdict::Increase) {
+                debug!("[CC] {verdict:?} -> target {target} kbps");
             }
         }
     }
@@ -584,7 +663,7 @@ mod tests {
             let queue = Arc::downgrade(&queue);
             let metrics = metrics.clone();
             async move {
-                sample_sender(track, &sender_notify, queue, Some(metrics)).await;
+                sample_sender(track, &sender_notify, queue, Some(metrics), None).await;
             }
         });
 

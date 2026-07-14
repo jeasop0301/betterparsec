@@ -77,8 +77,10 @@ mod abr;
 mod audio;
 mod bitrate_apply;
 mod buffer;
+mod cc;
 mod convert;
 mod dynamic_ice_servers;
+mod fec;
 mod transport;
 mod video;
 
@@ -882,23 +884,26 @@ impl StreamConnection {
         stream_guard.replace(stream);
         drop(stream_guard);
 
-        let runtime_bitrate_target = {
+        let (runtime_bitrate_target, runtime_cc_shared) = {
             let mut sender = self.transport_sender.lock().await;
             match sender.as_mut() {
                 Some(sender) => {
                     sender.on_setup_complete().await;
-                    sender.runtime_bitrate_target_kbps()
+                    (
+                        sender.runtime_bitrate_target_kbps(),
+                        sender.runtime_cc_shared(),
+                    )
                 }
                 None => {
                     warn!("No transport found after starting stream. Requesting Termination");
                     self.request_terminate().await;
-                    None
+                    (None, None)
                 }
             }
         };
 
         if let Some(target) = runtime_bitrate_target {
-            self.start_runtime_bitrate_task(target, settings.bitrate)
+            self.start_runtime_bitrate_task(target, runtime_cc_shared, settings.bitrate)
                 .await;
         }
 
@@ -908,6 +913,7 @@ impl StreamConnection {
     async fn start_runtime_bitrate_task(
         self: &Arc<Self>,
         target_kbps: Arc<AtomicU32>,
+        cc_shared: Option<Arc<cc::CcShared>>,
         initial_bitrate_kbps: u32,
     ) {
         let mut task_guard = self.runtime_bitrate_task.lock().await;
@@ -929,7 +935,12 @@ impl StreamConnection {
                     return;
                 };
 
-                let target = target_kbps.load(Ordering::Acquire);
+                // Compose the ABR (RTCP-driven) and frame-delay CC (sender-loop
+                // driven) targets; 0 = "no signal" on either side. See
+                // crate::cc::effective_target_kbps for the composition contract.
+                let abr_target = target_kbps.load(Ordering::Acquire);
+                let cc_target = cc_shared.as_ref().map(|s| s.target_kbps()).unwrap_or(0);
+                let target = cc::effective_target_kbps(abr_target, cc_target);
                 let now_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                 let status = {
                     let stream_guard = connection.stream.read().await;
@@ -973,6 +984,8 @@ impl StreamConnection {
                     BitrateApplyStatus::SentUnacknowledged { kbps } => {
                         info!(
                             target_kbps = target,
+                            abr_target_kbps = abr_target,
+                            cc_target_kbps = cc_target,
                             sent_kbps = kbps,
                             status = "sent_unacknowledged",
                             "runtime bitrate control message queued; host application is unverified"

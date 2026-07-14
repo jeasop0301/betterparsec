@@ -41,12 +41,13 @@ use webrtc::{
 };
 
 use crate::abr::{AbrConfig, AbrController};
+use crate::cc::{self, CcConfig, CcController, CcShared};
 use crate::transport::{
     TransportEvent,
     metrics::VideoTransportMetrics,
     webrtc::{
         WebRtcInner,
-        sender::{SequencedTrackLocalStaticRTP, TrackLocalSender},
+        sender::{CcContext, SequencedTrackLocalStaticRTP, TrackLocalSender},
         video::{
             h264::{payloader::H264Payloader, reader::H264Reader},
             h265::{payloader::H265Payloader, reader::H265Reader},
@@ -88,6 +89,10 @@ pub struct WebRtcVideo {
     /// Live adaptive-bitrate target (kbps), driven by REMB in the RTCP loop.
     /// Consumed by the encoder-apply path (feature #1 path A, pending Sunshine).
     target_bitrate_kbps: Arc<AtomicU32>,
+    /// Frame-delay CC cross-task state: target published by the sender loop,
+    /// RR loss mailbox, frame interval. Composed with the ABR target by the
+    /// runtime bitrate task (see `crate::cc::effective_target_kbps`).
+    cc_shared: Arc<CcShared>,
 }
 
 impl WebRtcVideo {
@@ -97,6 +102,7 @@ impl WebRtcVideo {
         frame_queue_size: usize,
         metrics: Arc<VideoTransportMetrics>,
         target_bitrate_kbps: Arc<AtomicU32>,
+        cc_shared: Arc<CcShared>,
     ) -> Self {
         Self {
             clock_rate: 0,
@@ -107,6 +113,7 @@ impl WebRtcVideo {
             samples: Default::default(),
             configured_bitrate_kbps: 0,
             target_bitrate_kbps,
+            cc_shared,
         }
     }
 
@@ -166,9 +173,27 @@ impl WebRtcVideo {
             return false;
         };
 
+        // Frame-delay CC shares ABR's enable gate (a configured ceiling) and
+        // its ceiling. begin_generation() runs unconditionally: it resets the
+        // published target, discards unread loss, and — critically — turns
+        // any still-running sender task from a previous setup into a ghost
+        // whose CcShared writes read as inactive (create_track spawns a new
+        // sample_sender without stopping the old one).
+        self.cc_shared
+            .set_frame_interval_us(cc::interval_us_from_fps(redraw_rate));
+        let cc_generation = self.cc_shared.begin_generation();
+        if self.configured_bitrate_kbps > 0 {
+            self.sender.set_congestion_controller(CcContext::new(
+                CcController::new(CcConfig::from_ceiling(self.configured_bitrate_kbps)),
+                self.cc_shared.clone(),
+                cc_generation,
+            ));
+        }
+
         let needs_idr = self.needs_idr.clone();
         let target_bitrate_kbps = self.target_bitrate_kbps.clone();
         let configured_bitrate_kbps = self.configured_bitrate_kbps;
+        let cc_shared = self.cc_shared.clone();
         if let Err(err) = self
             .sender
             .create_track(
@@ -224,6 +249,12 @@ impl WebRtcVideo {
                                 && let Some(max_lost) =
                                     rr.reports.iter().map(|r| r.fraction_lost).max()
                             {
+                                // Mirror the loss into the CC mailbox; the video
+                                // sender loop drains it before its next frame's
+                                // delay sample (same enable gate as ABR). Tagged
+                                // with this setup's generation so a ghost RTCP
+                                // reader from a replaced stream cannot post.
+                                cc_shared.post_loss_for(cc_generation, max_lost);
                                 let loss = max_lost as f64 / 256.0;
                                 let target = abr.observe_loss(loss);
                                 target_bitrate_kbps.store(target, Ordering::Release);

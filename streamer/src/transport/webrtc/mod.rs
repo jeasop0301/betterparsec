@@ -54,6 +54,7 @@ use webrtc::{
 
 use crate::{
     TIMEOUT_DURATION,
+    cc::CcShared,
     convert::{
         from_webrtc_sdp, into_webrtc_ice, into_webrtc_ice_candidate, into_webrtc_network_type,
     },
@@ -81,6 +82,7 @@ struct WebRtcInner {
     input_channels: Mutex<Vec<Arc<RTCDataChannel>>>,
     video: Mutex<WebRtcVideo>,
     target_bitrate_kbps: Arc<AtomicU32>,
+    cc_shared: Arc<CcShared>,
     video_metrics: Arc<VideoTransportMetrics>,
     audio: Mutex<WebRtcAudio>,
     // Timeout / Terminate
@@ -161,6 +163,7 @@ pub async fn new(
     let runtime = Handle::current();
     let video_metrics = Arc::new(VideoTransportMetrics::new(video_frame_queue_size));
     let target_bitrate_kbps = Arc::new(AtomicU32::new(0));
+    let cc_shared = Arc::new(CcShared::new());
     let this_owned = Arc::new(WebRtcInner {
         peer: peer.clone(),
         event_sender,
@@ -173,8 +176,10 @@ pub async fn new(
             video_frame_queue_size,
             video_metrics.clone(),
             target_bitrate_kbps.clone(),
+            cc_shared.clone(),
         )),
         target_bitrate_kbps,
+        cc_shared,
         video_metrics,
         audio: Mutex::new(WebRtcAudio::new(
             runtime,
@@ -631,6 +636,10 @@ impl TransportSender for WebRTCTransportSender {
 
     fn runtime_bitrate_target_kbps(&self) -> Option<Arc<AtomicU32>> {
         Some(self.inner.target_bitrate_kbps.clone())
+    }
+
+    fn runtime_cc_shared(&self) -> Option<Arc<CcShared>> {
+        Some(self.inner.cc_shared.clone())
     }
 
     async fn setup_audio(

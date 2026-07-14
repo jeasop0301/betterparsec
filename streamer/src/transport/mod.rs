@@ -24,6 +24,7 @@ use num::FromPrimitive;
 use thiserror::Error;
 
 use crate::buffer::ByteBuffer;
+use crate::cc::CcShared;
 
 use self::metrics::VideoTransportStats;
 
@@ -644,6 +645,13 @@ pub trait TransportSender {
     /// Returns the live ABR target when this transport produces one.
     /// This is a target signal, not proof that the host encoder applied it.
     fn runtime_bitrate_target_kbps(&self) -> Option<Arc<AtomicU32>> {
+        None
+    }
+
+    /// Returns the frame-delay CC shared state when this transport runs a
+    /// congestion controller. The apply path composes its published target
+    /// with the ABR target via [`crate::cc::effective_target_kbps`].
+    fn runtime_cc_shared(&self) -> Option<Arc<CcShared>> {
         None
     }
 

@@ -373,7 +373,9 @@ mod tests {
 /// into C-layer capability bits 24-31.
 #[cfg(test)]
 mod slice_caps_tests {
-    use moonlight_common::stream::{c::video::slices_per_frame_capability_bits, video::VideoCapabilities};
+    use moonlight_common::stream::{
+        c::video::slices_per_frame_capability_bits, video::VideoCapabilities,
+    };
 
     // Domain: None/0/1 → top byte 0 (same as today, no slices advertised)
     #[test]
@@ -444,7 +446,10 @@ mod slice_caps_tests {
     #[test]
     fn default_videocapabilities_produces_zero_slice_bits() {
         let caps = VideoCapabilities::default();
-        assert!(caps.slices_per_frame.is_none(), "default must have no slice preference");
+        assert!(
+            caps.slices_per_frame.is_none(),
+            "default must have no slice preference"
+        );
         assert_eq!(
             slices_per_frame_capability_bits(caps.slices_per_frame),
             0,

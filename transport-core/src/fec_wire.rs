@@ -51,7 +51,14 @@ pub fn chunk_frame(
 ) -> Vec<Vec<u8>> {
     if data.is_empty() {
         // Spec: "Empty frame data -> exactly one chunk with empty fragment."
-        return vec![encode_chunk(frame_id, 0, 1, frame_type_key, timestamp_us, &[])];
+        return vec![encode_chunk(
+            frame_id,
+            0,
+            1,
+            frame_type_key,
+            timestamp_us,
+            &[],
+        )];
     }
 
     let chunk_count = data.len().div_ceil(CHUNK_FRAGMENT_MAX);
@@ -96,12 +103,12 @@ fn encode_chunk(
     fragment: &[u8],
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(CHUNK_HEADER_LEN + fragment.len());
-    buf.extend_from_slice(&frame_id.to_le_bytes());        // [0..4]
-    buf.extend_from_slice(&chunk_index.to_le_bytes());     // [4..6]
-    buf.extend_from_slice(&chunk_count.to_le_bytes());     // [6..8]
-    buf.push(if frame_type_key { 1u8 } else { 0u8 });     // [8]
-    buf.extend_from_slice(&timestamp_us.to_le_bytes());    // [9..13]
-    buf.extend_from_slice(fragment);                       // [13..]
+    buf.extend_from_slice(&frame_id.to_le_bytes()); // [0..4]
+    buf.extend_from_slice(&chunk_index.to_le_bytes()); // [4..6]
+    buf.extend_from_slice(&chunk_count.to_le_bytes()); // [6..8]
+    buf.push(if frame_type_key { 1u8 } else { 0u8 }); // [8]
+    buf.extend_from_slice(&timestamp_us.to_le_bytes()); // [9..13]
+    buf.extend_from_slice(fragment); // [13..]
     buf
 }
 
@@ -117,7 +124,13 @@ pub fn parse_chunk_header(buf: &[u8]) -> Option<(ChunkHeader, &[u8])> {
     let chunk_count = u16::from_le_bytes(buf[6..8].try_into().ok()?);
     let frame_type_key = buf[8] != 0;
     let timestamp_us = u32::from_le_bytes(buf[9..13].try_into().ok()?);
-    let header = ChunkHeader { frame_id, chunk_index, chunk_count, frame_type_key, timestamp_us };
+    let header = ChunkHeader {
+        frame_id,
+        chunk_index,
+        chunk_count,
+        frame_type_key,
+        timestamp_us,
+    };
     Some((header, &buf[CHUNK_HEADER_LEN..]))
 }
 
@@ -131,18 +144,23 @@ pub fn encode_symbol_msg(sym: &fec::Symbol) -> Vec<u8> {
     match sym {
         fec::Symbol::Source { seq, payload } => {
             let mut buf = Vec::with_capacity(1 + 4 + payload.len());
-            buf.push(0u8);                                  // kind = 0
-            buf.extend_from_slice(&seq.to_le_bytes());      // seq (4 LE)
-            buf.extend_from_slice(payload);                 // chunk payload
+            buf.push(0u8); // kind = 0
+            buf.extend_from_slice(&seq.to_le_bytes()); // seq (4 LE)
+            buf.extend_from_slice(payload); // chunk payload
             buf
         }
-        fec::Symbol::Repair { repair_seq, window_base, window_end, payload } => {
+        fec::Symbol::Repair {
+            repair_seq,
+            window_base,
+            window_end,
+            payload,
+        } => {
             let mut buf = Vec::with_capacity(1 + 2 + 4 + 4 + payload.len());
-            buf.push(1u8);                                       // kind = 1
-            buf.extend_from_slice(&repair_seq.to_le_bytes());    // repair_seq (2 LE)
-            buf.extend_from_slice(&window_base.to_le_bytes());   // window_base (4 LE)
-            buf.extend_from_slice(&window_end.to_le_bytes());    // window_end (4 LE)
-            buf.extend_from_slice(payload);                      // combination payload
+            buf.push(1u8); // kind = 1
+            buf.extend_from_slice(&repair_seq.to_le_bytes()); // repair_seq (2 LE)
+            buf.extend_from_slice(&window_base.to_le_bytes()); // window_base (4 LE)
+            buf.extend_from_slice(&window_end.to_le_bytes()); // window_end (4 LE)
+            buf.extend_from_slice(payload); // combination payload
             buf
         }
     }
@@ -172,7 +190,12 @@ pub fn parse_symbol_msg(buf: &[u8]) -> Option<fec::Symbol> {
             let window_base = u32::from_le_bytes(buf[3..7].try_into().ok()?);
             let window_end = u32::from_le_bytes(buf[7..11].try_into().ok()?);
             let payload = buf[11..].to_vec();
-            Some(fec::Symbol::Repair { repair_seq, window_base, window_end, payload })
+            Some(fec::Symbol::Repair {
+                repair_seq,
+                window_base,
+                window_end,
+                payload,
+            })
         }
         _ => None,
     }
@@ -207,7 +230,7 @@ pub fn parse_ack_msg(buf: &[u8]) -> Option<AckMsg> {
         1 => match buf[0] {
             0x00 => Some(AckMsg::NeedsIdr),
             0x01 => Some(AckMsg::Subscribe),
-            _    => None,
+            _ => None,
         },
         4 => {
             let seq = u32::from_le_bytes(buf[0..4].try_into().ok()?);
@@ -222,8 +245,8 @@ pub fn parse_ack_msg(buf: &[u8]) -> Option<AckMsg> {
 pub fn encode_ack_msg(msg: &AckMsg) -> Vec<u8> {
     match msg {
         AckMsg::Subscribe => vec![0x01],
-        AckMsg::NeedsIdr  => vec![0x00],
-        AckMsg::Ack(seq)  => seq.to_le_bytes().to_vec(),
+        AckMsg::NeedsIdr => vec![0x00],
+        AckMsg::Ack(seq) => seq.to_le_bytes().to_vec(),
     }
 }
 
@@ -238,7 +261,10 @@ mod tests {
 
     #[test]
     fn source_symbol_roundtrip() {
-        let sym = Symbol::Source { seq: 42, payload: vec![0xDE, 0xAD, 0xBE, 0xEF] };
+        let sym = Symbol::Source {
+            seq: 42,
+            payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
         let wire = encode_symbol_msg(&sym);
         let parsed = parse_symbol_msg(&wire).expect("parse failed");
         assert_eq!(sym, parsed);
@@ -259,7 +285,10 @@ mod tests {
 
     #[test]
     fn source_symbol_empty_payload_roundtrip() {
-        let sym = Symbol::Source { seq: 0, payload: vec![] };
+        let sym = Symbol::Source {
+            seq: 0,
+            payload: vec![],
+        };
         let wire = encode_symbol_msg(&sym);
         let parsed = parse_symbol_msg(&wire).expect("parse failed");
         assert_eq!(sym, parsed);
@@ -271,10 +300,17 @@ mod tests {
     // Expected: [0x00, 0x01,0x00,0x00,0x00, 0x42,0x43]
     #[test]
     fn source_symbol_byte_pin() {
-        let sym = Symbol::Source { seq: 1, payload: vec![0x42, 0x43] };
+        let sym = Symbol::Source {
+            seq: 1,
+            payload: vec![0x42, 0x43],
+        };
         let wire = encode_symbol_msg(&sym);
         let expected: &[u8] = &[0x00, 0x01, 0x00, 0x00, 0x00, 0x42, 0x43];
-        assert_eq!(wire.as_slice(), expected, "source symbol byte layout mismatch");
+        assert_eq!(
+            wire.as_slice(),
+            expected,
+            "source symbol byte layout mismatch"
+        );
     }
 
     // ── Byte-level pin: repair symbol ─────────────────────────────────────
@@ -291,13 +327,17 @@ mod tests {
         };
         let wire = encode_symbol_msg(&sym);
         let expected: &[u8] = &[
-            0x01,                         // kind=1
-            0x02, 0x00,                   // repair_seq=2 LE
-            0x00, 0x00, 0x00, 0x00,       // window_base=0 LE
-            0x01, 0x00, 0x00, 0x00,       // window_end=1 LE
-            0xAB, 0xCD,                   // payload
+            0x01, // kind=1
+            0x02, 0x00, // repair_seq=2 LE
+            0x00, 0x00, 0x00, 0x00, // window_base=0 LE
+            0x01, 0x00, 0x00, 0x00, // window_end=1 LE
+            0xAB, 0xCD, // payload
         ];
-        assert_eq!(wire.as_slice(), expected, "repair symbol byte layout mismatch");
+        assert_eq!(
+            wire.as_slice(),
+            expected,
+            "repair symbol byte layout mismatch"
+        );
     }
 
     // ── parse_symbol_msg: truncated / unknown kind → None ─────────────────
@@ -321,7 +361,10 @@ mod tests {
     #[test]
     fn parse_symbol_msg_repair_truncated_is_none() {
         // Only 10 bytes: kind + 2 + 4 + 3 (need 11)
-        assert!(parse_symbol_msg(&[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).is_none());
+        assert!(
+            parse_symbol_msg(&[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                .is_none()
+        );
     }
 
     // ── Chunk header byte-level pin ───────────────────────────────────────
@@ -334,10 +377,10 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         let hdr = &chunks[0][..CHUNK_HEADER_LEN];
         let expected: &[u8] = &[
-            0x01, 0x00, 0x00, 0x00,  // frame_id=1 LE
-            0x00, 0x00,              // chunk_index=0 LE
-            0x01, 0x00,              // chunk_count=1 LE
-            0x01,                    // frame_type=key
+            0x01, 0x00, 0x00, 0x00, // frame_id=1 LE
+            0x00, 0x00, // chunk_index=0 LE
+            0x01, 0x00, // chunk_count=1 LE
+            0x01, // frame_type=key
             0x44, 0x33, 0x22, 0x11, // timestamp_us LE
         ];
         assert_eq!(hdr, expected, "chunk header byte layout mismatch");
@@ -349,7 +392,8 @@ mod tests {
         let data: Vec<u8> = (0..data_size).map(|i| i as u8).collect();
         let chunks = chunk_frame(0, false, 0, &data);
         assert_eq!(
-            chunks.len(), expected_count,
+            chunks.len(),
+            expected_count,
             "data_size={data_size}: expected {expected_count} chunks, got {}",
             chunks.len()
         );
@@ -366,12 +410,14 @@ mod tests {
             );
             if i == chunks.len() - 1 {
                 assert_eq!(
-                    frag.len(), expected_last_frag,
+                    frag.len(),
+                    expected_last_frag,
                     "data_size={data_size}: last fragment size mismatch"
                 );
             } else {
                 assert_eq!(
-                    frag.len(), CHUNK_FRAGMENT_MAX,
+                    frag.len(),
+                    CHUNK_FRAGMENT_MAX,
                     "data_size={data_size} chunk[{i}]: non-last fragment should be CHUNK_FRAGMENT_MAX"
                 );
             }
@@ -429,7 +475,10 @@ mod tests {
                 repairs.push(r);
             }
         }
-        assert!(!repairs.is_empty(), "expected at least one repair from 1/8 ratio over 8 sources");
+        assert!(
+            !repairs.is_empty(),
+            "expected at least one repair from 1/8 ratio over 8 sources"
+        );
         for repair in &repairs {
             let wire = encode_symbol_msg(repair);
             let parsed = parse_symbol_msg(&wire).expect("repair parse failed");
@@ -564,10 +613,30 @@ mod cross_vector_tests {
 
     fn frame_specs() -> Vec<FrameSpec> {
         vec![
-            FrameSpec { id: 0, size: 500,  key: true,  ts: 1_000  },
-            FrameSpec { id: 1, size: 2500, key: false, ts: 17_666 },
-            FrameSpec { id: 2, size: 1183, key: false, ts: 34_333 },
-            FrameSpec { id: 3, size: 0,    key: false, ts: 51_000 },
+            FrameSpec {
+                id: 0,
+                size: 500,
+                key: true,
+                ts: 1_000,
+            },
+            FrameSpec {
+                id: 1,
+                size: 2500,
+                key: false,
+                ts: 17_666,
+            },
+            FrameSpec {
+                id: 2,
+                size: 1183,
+                key: false,
+                ts: 34_333,
+            },
+            FrameSpec {
+                id: 3,
+                size: 0,
+                key: false,
+                ts: 51_000,
+            },
         ]
     }
 
@@ -579,8 +648,10 @@ mod cross_vector_tests {
         const SEED: u32 = 0x00C0_FFEE;
         let mut state = SEED;
         let specs = frame_specs();
-        let frame_data: Vec<Vec<u8>> =
-            specs.iter().map(|sp| gen_frame(sp.size, &mut state)).collect();
+        let frame_data: Vec<Vec<u8>> = specs
+            .iter()
+            .map(|sp| gen_frame(sp.size, &mut state))
+            .collect();
 
         let mut enc = FecEncoder::new(cross_config());
         let mut messages: Vec<Vec<u8>> = Vec::new();
@@ -634,23 +705,30 @@ mod cross_vector_tests {
         }
 
         let specs = frame_specs();
-        specs.iter().zip(frame_data.iter()).map(|(sp, orig)| {
-            let cvec = chunks
-                .get(&sp.id)
-                .unwrap_or_else(|| panic!("frame {} not recovered", sp.id));
-            let mut sorted = cvec.clone();
-            sorted.sort_by_key(|(idx, _)| *idx);
-            let reassembled: Vec<u8> =
-                sorted.into_iter().flat_map(|(_, f)| f).collect();
-            assert_eq!(&reassembled, orig, "frame {} byte mismatch after FEC recovery", sp.id);
+        specs
+            .iter()
+            .zip(frame_data.iter())
+            .map(|(sp, orig)| {
+                let cvec = chunks
+                    .get(&sp.id)
+                    .unwrap_or_else(|| panic!("frame {} not recovered", sp.id));
+                let mut sorted = cvec.clone();
+                sorted.sort_by_key(|(idx, _)| *idx);
+                let reassembled: Vec<u8> = sorted.into_iter().flat_map(|(_, f)| f).collect();
+                assert_eq!(
+                    &reassembled, orig,
+                    "frame {} byte mismatch after FEC recovery",
+                    sp.id
+                );
 
-            serde_json::json!({
-                "data_hex":    to_hex(orig),
-                "frame_id":    sp.id,
-                "frame_type":  if sp.key { "key" } else { "delta" },
-                "timestamp_us": sp.ts,
+                serde_json::json!({
+                    "data_hex":    to_hex(orig),
+                    "frame_id":    sp.id,
+                    "frame_type":  if sp.key { "key" } else { "delta" },
+                    "timestamp_us": sp.ts,
+                })
             })
-        }).collect()
+            .collect()
     }
 
     // ── Fixture builder ───────────────────────────────────────────────────

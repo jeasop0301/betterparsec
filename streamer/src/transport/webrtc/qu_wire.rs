@@ -6,20 +6,20 @@
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
-pub const KIND_QU_CONFIG: u8    = 0x01;
-pub const KIND_QU_TILE: u8      = 0x02;
+pub const KIND_QU_CONFIG: u8 = 0x01;
+pub const KIND_QU_TILE: u8 = 0x02;
 pub const KIND_QU_INVALIDATE: u8 = 0x03;
-pub const KIND_QU_EPOCH: u8     = 0x04;
+pub const KIND_QU_EPOCH: u8 = 0x04;
 pub const KIND_QU_SUBSCRIBE: u8 = 0x81;
-pub const KIND_QU_BUDGET: u8    = 0x82;
+pub const KIND_QU_BUDGET: u8 = 0x82;
 
 /// Fixed byte lengths (header only, before any variable payload).
-const CONFIG_LEN: usize      = 13; // 1 + 2+2+2+2 + 4
-const TILE_HDR: usize        = 19; // 1 + 4 + 2+2 + 1+1 + 4 + 4
-const INVALIDATE_HDR: usize  = 7;  // 1 + 4 + 2
-const EPOCH_LEN: usize       = 5;  // 1 + 4
-const SUBSCRIBE_LEN: usize   = 2;  // 1 + 1
-const BUDGET_LEN: usize      = 5;  // 1 + 4
+const CONFIG_LEN: usize = 13; // 1 + 2+2+2+2 + 4
+const TILE_HDR: usize = 19; // 1 + 4 + 2+2 + 1+1 + 4 + 4
+const INVALIDATE_HDR: usize = 7; // 1 + 4 + 2
+const EPOCH_LEN: usize = 5; // 1 + 4
+const SUBSCRIBE_LEN: usize = 2; // 1 + 1
+const BUDGET_LEN: usize = 5; // 1 + 4
 
 // ── Message enum ──────────────────────────────────────────────────────────
 
@@ -27,20 +27,20 @@ const BUDGET_LEN: usize      = 5;  // 1 + 4
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuMsg {
     Config {
-        tile_w:    u16,
-        tile_h:    u16,
+        tile_w: u16,
+        tile_h: u16,
         grid_cols: u16,
         grid_rows: u16,
-        epoch:     u32,
+        epoch: u32,
     },
     Tile {
-        epoch:       u32,
-        col:         u16,
-        row:         u16,
-        format:      u8,
-        flags:       u8,
-        crc32_bgra:  u32,
-        payload:     Vec<u8>,
+        epoch: u32,
+        col: u16,
+        row: u16,
+        format: u8,
+        flags: u8,
+        crc32_bgra: u32,
+        payload: Vec<u8>,
     },
     Invalidate {
         epoch: u32,
@@ -84,13 +84,13 @@ pub fn encode_config(
 // Wire API: used by in-module tests and the M6 native client / TS injector.
 #[allow(dead_code)]
 pub fn encode_tile(
-    epoch:      u32,
-    col:        u16,
-    row:        u16,
-    format:     u8,
-    flags:      u8,
+    epoch: u32,
+    col: u16,
+    row: u16,
+    format: u8,
+    flags: u8,
     crc32_bgra: u32,
-    payload:    &[u8],
+    payload: &[u8],
 ) -> Vec<u8> {
     let payload_len = payload.len() as u32;
     let mut buf = Vec::with_capacity(TILE_HDR + payload.len());
@@ -161,36 +161,45 @@ pub fn parse_msg(buf: &[u8]) -> Option<QuMsg> {
     let kind = *buf.first()?;
     match kind {
         KIND_QU_CONFIG => {
-            if buf.len() < CONFIG_LEN { return None; }
+            if buf.len() < CONFIG_LEN {
+                return None;
+            }
             Some(QuMsg::Config {
-                tile_w:    u16::from_le_bytes(buf[1..3].try_into().ok()?),
-                tile_h:    u16::from_le_bytes(buf[3..5].try_into().ok()?),
+                tile_w: u16::from_le_bytes(buf[1..3].try_into().ok()?),
+                tile_h: u16::from_le_bytes(buf[3..5].try_into().ok()?),
                 grid_cols: u16::from_le_bytes(buf[5..7].try_into().ok()?),
                 grid_rows: u16::from_le_bytes(buf[7..9].try_into().ok()?),
-                epoch:     u32::from_le_bytes(buf[9..13].try_into().ok()?),
+                epoch: u32::from_le_bytes(buf[9..13].try_into().ok()?),
             })
         }
         KIND_QU_TILE => {
-            if buf.len() < TILE_HDR { return None; }
-            let payload_len =
-                u32::from_le_bytes(buf[15..19].try_into().ok()?) as usize;
-            if buf.len() < TILE_HDR + payload_len { return None; }
+            if buf.len() < TILE_HDR {
+                return None;
+            }
+            let payload_len = u32::from_le_bytes(buf[15..19].try_into().ok()?) as usize;
+            if buf.len() < TILE_HDR + payload_len {
+                return None;
+            }
             Some(QuMsg::Tile {
-                epoch:      u32::from_le_bytes(buf[1..5].try_into().ok()?),
-                col:        u16::from_le_bytes(buf[5..7].try_into().ok()?),
-                row:        u16::from_le_bytes(buf[7..9].try_into().ok()?),
-                format:     buf[9],
-                flags:      buf[10],
+                epoch: u32::from_le_bytes(buf[1..5].try_into().ok()?),
+                col: u16::from_le_bytes(buf[5..7].try_into().ok()?),
+                row: u16::from_le_bytes(buf[7..9].try_into().ok()?),
+                format: buf[9],
+                flags: buf[10],
                 crc32_bgra: u32::from_le_bytes(buf[11..15].try_into().ok()?),
-                payload:    buf[19..19 + payload_len].to_vec(),
+                payload: buf[19..19 + payload_len].to_vec(),
             })
         }
         KIND_QU_INVALIDATE => {
-            if buf.len() < INVALIDATE_HDR { return None; }
+            if buf.len() < INVALIDATE_HDR {
+                return None;
+            }
             let epoch = u32::from_le_bytes(buf[1..5].try_into().ok()?);
             let count = u16::from_le_bytes(buf[5..7].try_into().ok()?) as usize;
             let expected = INVALIDATE_HDR + count * 4;
-            if buf.len() < expected { return None; }
+            if buf.len() < expected {
+                return None;
+            }
             let mut tiles = Vec::with_capacity(count);
             for i in 0..count {
                 let off = INVALIDATE_HDR + i * 4;
@@ -202,17 +211,23 @@ pub fn parse_msg(buf: &[u8]) -> Option<QuMsg> {
             Some(QuMsg::Invalidate { epoch, tiles })
         }
         KIND_QU_EPOCH => {
-            if buf.len() < EPOCH_LEN { return None; }
+            if buf.len() < EPOCH_LEN {
+                return None;
+            }
             Some(QuMsg::Epoch {
                 new_epoch: u32::from_le_bytes(buf[1..5].try_into().ok()?),
             })
         }
         KIND_QU_SUBSCRIBE => {
-            if buf.len() < SUBSCRIBE_LEN { return None; }
+            if buf.len() < SUBSCRIBE_LEN {
+                return None;
+            }
             Some(QuMsg::Subscribe { version: buf[1] })
         }
         KIND_QU_BUDGET => {
-            if buf.len() < BUDGET_LEN { return None; }
+            if buf.len() < BUDGET_LEN {
+                return None;
+            }
             Some(QuMsg::Budget {
                 kbps: u32::from_le_bytes(buf[1..5].try_into().ok()?),
             })
@@ -253,7 +268,13 @@ mod tests {
 
     #[test]
     fn config_roundtrip() {
-        let orig = QuMsg::Config { tile_w: 128, tile_h: 128, grid_cols: 15, grid_rows: 9, epoch: 7 };
+        let orig = QuMsg::Config {
+            tile_w: 128,
+            tile_h: 128,
+            grid_cols: 15,
+            grid_rows: 9,
+            epoch: 7,
+        };
         let wire = encode_config(128, 128, 15, 9, 7);
         assert_eq!(parse_msg(&wire), Some(orig));
     }
@@ -262,8 +283,13 @@ mod tests {
     fn tile_roundtrip() {
         let payload = vec![0xAA, 0xBB];
         let orig = QuMsg::Tile {
-            epoch: 7, col: 3, row: 2, format: 0, flags: 0,
-            crc32_bgra: 0xDEAD_BEEF, payload: payload.clone(),
+            epoch: 7,
+            col: 3,
+            row: 2,
+            format: 0,
+            flags: 0,
+            crc32_bgra: 0xDEAD_BEEF,
+            payload: payload.clone(),
         };
         let wire = encode_tile(7, 3, 2, 0, 0, 0xDEAD_BEEF, &payload);
         assert_eq!(parse_msg(&wire), Some(orig));
@@ -272,7 +298,10 @@ mod tests {
     #[test]
     fn invalidate_roundtrip() {
         let tiles = vec![(1u16, 2u16), (3u16, 4u16)];
-        let orig = QuMsg::Invalidate { epoch: 5, tiles: tiles.clone() };
+        let orig = QuMsg::Invalidate {
+            epoch: 5,
+            tiles: tiles.clone(),
+        };
         let wire = encode_invalidate(5, &tiles);
         assert_eq!(parse_msg(&wire), Some(orig));
     }
@@ -305,12 +334,11 @@ mod tests {
     fn byte_pin_config() {
         let wire = encode_config(128, 128, 15, 9, 7);
         let expected: &[u8] = &[
-            0x01,
-            0x80, 0x00,  // tile_w = 128
-            0x80, 0x00,  // tile_h = 128
-            0x0F, 0x00,  // grid_cols = 15
-            0x09, 0x00,  // grid_rows = 9
-            0x07, 0x00, 0x00, 0x00,  // epoch = 7
+            0x01, 0x80, 0x00, // tile_w = 128
+            0x80, 0x00, // tile_h = 128
+            0x0F, 0x00, // grid_cols = 15
+            0x09, 0x00, // grid_rows = 9
+            0x07, 0x00, 0x00, 0x00, // epoch = 7
         ];
         assert_eq!(wire.as_slice(), expected, "QU_CONFIG byte pin mismatch");
     }
@@ -320,15 +348,14 @@ mod tests {
     fn byte_pin_tile() {
         let wire = encode_tile(7, 3, 2, 0, 0, 0xDEAD_BEEF, &[0xAA, 0xBB]);
         let expected: &[u8] = &[
-            0x02,
-            0x07, 0x00, 0x00, 0x00,  // epoch = 7
-            0x03, 0x00,              // col = 3
-            0x02, 0x00,              // row = 2
-            0x00,                    // format = 0
-            0x00,                    // flags = 0
+            0x02, 0x07, 0x00, 0x00, 0x00, // epoch = 7
+            0x03, 0x00, // col = 3
+            0x02, 0x00, // row = 2
+            0x00, // format = 0
+            0x00, // flags = 0
             0xEF, 0xBE, 0xAD, 0xDE, // crc32_bgra = 0xDEADBEEF LE
             0x02, 0x00, 0x00, 0x00, // payload_len = 2
-            0xAA, 0xBB,             // payload
+            0xAA, 0xBB, // payload
         ];
         assert_eq!(wire.as_slice(), expected, "QU_TILE byte pin mismatch");
     }
@@ -337,7 +364,11 @@ mod tests {
     #[test]
     fn byte_pin_subscribe() {
         let wire = encode_subscribe(1);
-        assert_eq!(wire.as_slice(), &[0x81, 0x01], "QU_SUBSCRIBE byte pin mismatch");
+        assert_eq!(
+            wire.as_slice(),
+            &[0x81, 0x01],
+            "QU_SUBSCRIBE byte pin mismatch"
+        );
     }
 
     /// QU_BUDGET 4000 kbps
@@ -351,10 +382,14 @@ mod tests {
     // ── Truncation domain: QU_CONFIG ─────────────────────────────────────
 
     #[test]
-    fn config_empty_is_none() { assert!(parse_msg(&[]).is_none()); }
+    fn config_empty_is_none() {
+        assert!(parse_msg(&[]).is_none());
+    }
 
     #[test]
-    fn config_one_byte_is_none() { assert!(parse_msg(&[KIND_QU_CONFIG]).is_none()); }
+    fn config_one_byte_is_none() {
+        assert!(parse_msg(&[KIND_QU_CONFIG]).is_none());
+    }
 
     #[test]
     fn config_header_minus_1_is_none() {
@@ -365,10 +400,14 @@ mod tests {
     // ── Truncation domain: QU_TILE ────────────────────────────────────────
 
     #[test]
-    fn tile_empty_is_none() { assert!(parse_msg(&[]).is_none()); }
+    fn tile_empty_is_none() {
+        assert!(parse_msg(&[]).is_none());
+    }
 
     #[test]
-    fn tile_one_byte_is_none() { assert!(parse_msg(&[KIND_QU_TILE]).is_none()); }
+    fn tile_one_byte_is_none() {
+        assert!(parse_msg(&[KIND_QU_TILE]).is_none());
+    }
 
     #[test]
     fn tile_header_minus_1_is_none() {
@@ -383,16 +422,23 @@ mod tests {
         // Overwrite payload_len to claim 100 bytes; actual payload is 2
         let len_off = 15;
         wire[len_off..len_off + 4].copy_from_slice(&100u32.to_le_bytes());
-        assert!(parse_msg(&wire).is_none(), "payload_len mismatch must be rejected");
+        assert!(
+            parse_msg(&wire).is_none(),
+            "payload_len mismatch must be rejected"
+        );
     }
 
     // ── Truncation domain: QU_INVALIDATE ─────────────────────────────────
 
     #[test]
-    fn invalidate_empty_is_none() { assert!(parse_msg(&[]).is_none()); }
+    fn invalidate_empty_is_none() {
+        assert!(parse_msg(&[]).is_none());
+    }
 
     #[test]
-    fn invalidate_one_byte_is_none() { assert!(parse_msg(&[KIND_QU_INVALIDATE]).is_none()); }
+    fn invalidate_one_byte_is_none() {
+        assert!(parse_msg(&[KIND_QU_INVALIDATE]).is_none());
+    }
 
     #[test]
     fn invalidate_header_minus_1_is_none() {
@@ -406,16 +452,23 @@ mod tests {
         let mut wire = encode_invalidate(3, &[(0, 0)]);
         // Raise count to 2, but only 1 tile's bytes are present
         wire[5..7].copy_from_slice(&2u16.to_le_bytes());
-        assert!(parse_msg(&wire).is_none(), "count mismatch must be rejected");
+        assert!(
+            parse_msg(&wire).is_none(),
+            "count mismatch must be rejected"
+        );
     }
 
     // ── Truncation domain: QU_EPOCH ───────────────────────────────────────
 
     #[test]
-    fn epoch_empty_is_none() { assert!(parse_msg(&[]).is_none()); }
+    fn epoch_empty_is_none() {
+        assert!(parse_msg(&[]).is_none());
+    }
 
     #[test]
-    fn epoch_one_byte_is_none() { assert!(parse_msg(&[KIND_QU_EPOCH]).is_none()); }
+    fn epoch_one_byte_is_none() {
+        assert!(parse_msg(&[KIND_QU_EPOCH]).is_none());
+    }
 
     #[test]
     fn epoch_header_minus_1_is_none() {
@@ -426,18 +479,26 @@ mod tests {
     // ── Truncation domain: QU_SUBSCRIBE ──────────────────────────────────
 
     #[test]
-    fn subscribe_empty_is_none() { assert!(parse_msg(&[]).is_none()); }
+    fn subscribe_empty_is_none() {
+        assert!(parse_msg(&[]).is_none());
+    }
 
     #[test]
-    fn subscribe_one_byte_is_none() { assert!(parse_msg(&[KIND_QU_SUBSCRIBE]).is_none()); }
+    fn subscribe_one_byte_is_none() {
+        assert!(parse_msg(&[KIND_QU_SUBSCRIBE]).is_none());
+    }
 
     // ── Truncation domain: QU_BUDGET ─────────────────────────────────────
 
     #[test]
-    fn budget_empty_is_none() { assert!(parse_msg(&[]).is_none()); }
+    fn budget_empty_is_none() {
+        assert!(parse_msg(&[]).is_none());
+    }
 
     #[test]
-    fn budget_one_byte_is_none() { assert!(parse_msg(&[KIND_QU_BUDGET]).is_none()); }
+    fn budget_one_byte_is_none() {
+        assert!(parse_msg(&[KIND_QU_BUDGET]).is_none());
+    }
 
     #[test]
     fn budget_header_minus_1_is_none() {
@@ -455,7 +516,9 @@ mod tests {
     // ── peek ──────────────────────────────────────────────────────────────
 
     #[test]
-    fn peek_empty_is_none() { assert!(peek(&[]).is_none()); }
+    fn peek_empty_is_none() {
+        assert!(peek(&[]).is_none());
+    }
 
     #[test]
     fn peek_tile_extracts_epoch() {

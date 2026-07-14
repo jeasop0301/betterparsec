@@ -213,8 +213,7 @@ impl WebRtcVideo {
         // FEC sender task: bump the generation counter to retire any still-running
         // task from a previous setup call (ghost-writer guard, mirrors CC pattern).
         {
-            let new_fec_gen =
-                self.fec_generation.fetch_add(1, Ordering::AcqRel) + 1;
+            let new_fec_gen = self.fec_generation.fetch_add(1, Ordering::AcqRel) + 1;
             self.fec_handle = Some(FecSenderHandle::spawn_for_channel(
                 new_fec_gen,
                 Arc::clone(&self.fec_generation),

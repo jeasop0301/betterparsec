@@ -157,7 +157,11 @@ impl FecSenderHandle {
         if !self.active.load(Ordering::Acquire) {
             return;
         }
-        let frame = FecFrame { data, is_key, timestamp_us };
+        let frame = FecFrame {
+            data,
+            is_key,
+            timestamp_us,
+        };
         let mut guard = self.queue.lock().await;
         if is_key {
             // INTENTIONAL TOTAL WIPE: mirrors sender.rs enqueue_frame IDR-supersede.
@@ -355,7 +359,11 @@ mod tests {
     async fn test_queue_capacity_reject() {
         let generation = Arc::new(AtomicU32::new(1));
         let needs_idr = Arc::new(AtomicBool::new(false));
-        let handle = make_handle(VecSink::new(), Arc::clone(&needs_idr), Arc::clone(&generation));
+        let handle = make_handle(
+            VecSink::new(),
+            Arc::clone(&needs_idr),
+            Arc::clone(&generation),
+        );
         // Bypass subscribe so we can inspect the queue directly.
         handle.active.store(true, Ordering::Release);
 
@@ -370,7 +378,9 @@ mod tests {
         );
 
         // At capacity: non-key must be rejected.
-        handle.enqueue(Bytes::from_static(b"extra_delta"), false, 0).await;
+        handle
+            .enqueue(Bytes::from_static(b"extra_delta"), false, 0)
+            .await;
         assert_eq!(
             handle.queue.lock().await.len(),
             QUEUE_CAPACITY,
@@ -383,7 +393,11 @@ mod tests {
     async fn test_key_supersedes_full_queue() {
         let generation = Arc::new(AtomicU32::new(1));
         let needs_idr = Arc::new(AtomicBool::new(false));
-        let handle = make_handle(VecSink::new(), Arc::clone(&needs_idr), Arc::clone(&generation));
+        let handle = make_handle(
+            VecSink::new(),
+            Arc::clone(&needs_idr),
+            Arc::clone(&generation),
+        );
         handle.active.store(true, Ordering::Release);
 
         // Fill queue with non-key frames.
@@ -394,7 +408,9 @@ mod tests {
         assert_eq!(full, QUEUE_CAPACITY);
 
         // IDR must clear all and be the sole entry.
-        handle.enqueue(Bytes::from_static(b"IDR_data"), true, 0).await;
+        handle
+            .enqueue(Bytes::from_static(b"IDR_data"), true, 0)
+            .await;
         let q = handle.queue.lock().await;
         assert_eq!(q.len(), 1, "IDR must replace all queued frames");
         assert!(
@@ -408,7 +424,11 @@ mod tests {
     async fn test_empty_queue_accepts_non_key() {
         let generation = Arc::new(AtomicU32::new(1));
         let needs_idr = Arc::new(AtomicBool::new(false));
-        let handle = make_handle(VecSink::new(), Arc::clone(&needs_idr), Arc::clone(&generation));
+        let handle = make_handle(
+            VecSink::new(),
+            Arc::clone(&needs_idr),
+            Arc::clone(&generation),
+        );
         handle.active.store(true, Ordering::Release);
 
         handle.enqueue(Bytes::from_static(b"first"), false, 0).await;
@@ -420,7 +440,11 @@ mod tests {
     async fn test_key_on_empty_queue_accepted() {
         let generation = Arc::new(AtomicU32::new(1));
         let needs_idr = Arc::new(AtomicBool::new(false));
-        let handle = make_handle(VecSink::new(), Arc::clone(&needs_idr), Arc::clone(&generation));
+        let handle = make_handle(
+            VecSink::new(),
+            Arc::clone(&needs_idr),
+            Arc::clone(&generation),
+        );
         handle.active.store(true, Ordering::Release);
 
         assert_eq!(handle.queue.lock().await.len(), 0, "precondition: empty");
@@ -436,14 +460,20 @@ mod tests {
     async fn test_non_key_at_capacity_silent_drop() {
         let generation = Arc::new(AtomicU32::new(1));
         let needs_idr = Arc::new(AtomicBool::new(false));
-        let handle = make_handle(VecSink::new(), Arc::clone(&needs_idr), Arc::clone(&generation));
+        let handle = make_handle(
+            VecSink::new(),
+            Arc::clone(&needs_idr),
+            Arc::clone(&generation),
+        );
         handle.active.store(true, Ordering::Release);
 
         for _ in 0..QUEUE_CAPACITY {
             handle.enqueue(Bytes::from_static(b"d"), false, 0).await;
         }
         // One more non-key — must be dropped.
-        handle.enqueue(Bytes::from_static(b"overflow"), false, 0).await;
+        handle
+            .enqueue(Bytes::from_static(b"overflow"), false, 0)
+            .await;
         assert_eq!(
             handle.queue.lock().await.len(),
             QUEUE_CAPACITY,
@@ -459,7 +489,11 @@ mod tests {
         let generation = Arc::new(AtomicU32::new(1));
         let needs_idr = Arc::new(AtomicBool::new(false));
         let sink = VecSink::new();
-        let handle = make_handle(sink.clone(), Arc::clone(&needs_idr), Arc::clone(&generation));
+        let handle = make_handle(
+            sink.clone(),
+            Arc::clone(&needs_idr),
+            Arc::clone(&generation),
+        );
         // Do NOT call forward_ack(Subscribe) — active stays false.
 
         handle.enqueue(Bytes::from_static(b"frame"), false, 0).await;
@@ -481,7 +515,11 @@ mod tests {
     async fn test_subscribe_sets_active() {
         let generation = Arc::new(AtomicU32::new(1));
         let needs_idr = Arc::new(AtomicBool::new(false));
-        let handle = make_handle(VecSink::new(), Arc::clone(&needs_idr), Arc::clone(&generation));
+        let handle = make_handle(
+            VecSink::new(),
+            Arc::clone(&needs_idr),
+            Arc::clone(&generation),
+        );
 
         assert!(!handle.is_active(), "initially inactive");
         handle.forward_ack(AckMsg::Subscribe);
@@ -502,28 +540,39 @@ mod tests {
         let generation = Arc::new(AtomicU32::new(1));
         let needs_idr = Arc::new(AtomicBool::new(false));
         let sink = VecSink::new();
-        let handle = make_handle(sink.clone(), Arc::clone(&needs_idr), Arc::clone(&generation));
+        let handle = make_handle(
+            sink.clone(),
+            Arc::clone(&needs_idr),
+            Arc::clone(&generation),
+        );
         handle.forward_ack(AckMsg::Subscribe);
         sleep(Duration::from_millis(5)).await;
 
         // 8 frames one at a time; yield after each so the task drains before the next.
         for i in 0..8u32 {
-            handle.enqueue(Bytes::from(vec![i as u8; 10]), false, i * 1000).await;
+            handle
+                .enqueue(Bytes::from(vec![i as u8; 10]), false, i * 1000)
+                .await;
             sleep(Duration::from_millis(5)).await;
         }
 
         // 8 source + 1 repair at 1/8 ratio = 9 messages.
         let msgs_a = sink.snapshot();
         let src_a = msgs_a.iter().filter(|m| m.first() == Some(&0)).count();
-        let repairs_a: Vec<_> =
-            msgs_a.iter().filter(|m| m.first() == Some(&1)).cloned().collect();
+        let repairs_a: Vec<_> = msgs_a
+            .iter()
+            .filter(|m| m.first() == Some(&1))
+            .cloned()
+            .collect();
         assert_eq!(src_a, 8, "8 sources in first batch");
         assert_eq!(repairs_a.len(), 1, "1 repair after 8 sources at 1/8 ratio");
 
         // Repair wire: [kind=1 (1B)] [repair_seq (2B LE)] [window_base (4B LE)] ...
-        let first_window_base =
-            u32::from_le_bytes(repairs_a[0][3..7].try_into().unwrap());
-        assert_eq!(first_window_base, 0, "first repair window_base before ack must be 0");
+        let first_window_base = u32::from_le_bytes(repairs_a[0][3..7].try_into().unwrap());
+        assert_eq!(
+            first_window_base, 0,
+            "first repair window_base before ack must be 0"
+        );
 
         // ACK seq 7 → FecEncoder evicts seq 0..7 from the window.
         handle.forward_ack(AckMsg::Ack(7));
@@ -532,19 +581,27 @@ mod tests {
         // 8 more frames; ratio_acc (still 0 after repair for seq 7) accumulates to 8
         // → second repair emitted for seq 8..15.
         for i in 8..16u32 {
-            handle.enqueue(Bytes::from(vec![i as u8; 10]), false, i * 1000).await;
+            handle
+                .enqueue(Bytes::from(vec![i as u8; 10]), false, i * 1000)
+                .await;
             sleep(Duration::from_millis(5)).await;
         }
 
         let msgs_b = sink.snapshot();
-        let repairs_b: Vec<_> =
-            msgs_b.iter().filter(|m| m.first() == Some(&1)).cloned().collect();
-        assert_eq!(repairs_b.len(), 2, "second repair expected after second batch");
+        let repairs_b: Vec<_> = msgs_b
+            .iter()
+            .filter(|m| m.first() == Some(&1))
+            .cloned()
+            .collect();
+        assert_eq!(
+            repairs_b.len(),
+            2,
+            "second repair expected after second batch"
+        );
 
         // The second repair's window_base must be 8 (sliding from seq 8 onward),
         // not 0. This confirms ack(7) was processed by the encoder.
-        let second_window_base =
-            u32::from_le_bytes(repairs_b[1][3..7].try_into().unwrap());
+        let second_window_base = u32::from_le_bytes(repairs_b[1][3..7].try_into().unwrap());
         assert_eq!(
             second_window_base, 8,
             "second repair window_base must be 8 after ack(7) slid the encoder window"
@@ -562,8 +619,11 @@ mod tests {
         let needs_idr = Arc::new(AtomicBool::new(false));
         let sink = VecSink::new();
 
-        let old_handle =
-            make_handle(sink.clone(), Arc::clone(&needs_idr), Arc::clone(&generation));
+        let old_handle = make_handle(
+            sink.clone(),
+            Arc::clone(&needs_idr),
+            Arc::clone(&generation),
+        );
         old_handle.forward_ack(AckMsg::Subscribe);
         sleep(Duration::from_millis(5)).await;
 
@@ -610,7 +670,11 @@ mod tests {
         let generation = Arc::new(AtomicU32::new(1));
         let needs_idr = Arc::new(AtomicBool::new(false));
         let sink = VecSink::new();
-        let handle = make_handle(sink.clone(), Arc::clone(&needs_idr), Arc::clone(&generation));
+        let handle = make_handle(
+            sink.clone(),
+            Arc::clone(&needs_idr),
+            Arc::clone(&generation),
+        );
         handle.forward_ack(AckMsg::Subscribe);
         sleep(Duration::from_millis(5)).await;
 
@@ -632,8 +696,14 @@ mod tests {
             }
         }
         // 3000 / 1182 = ceil(2.538) = 3 chunks → 3 source messages.
-        assert_eq!(source_count, 3, "3000-byte frame must produce exactly 3 source symbols");
-        assert_eq!(repair_count, expected_repairs, "repair count must match FecEncoder output");
+        assert_eq!(
+            source_count, 3,
+            "3000-byte frame must produce exactly 3 source symbols"
+        );
+        assert_eq!(
+            repair_count, expected_repairs,
+            "repair count must match FecEncoder output"
+        );
         assert_eq!(messages.len(), 3 + expected_repairs);
     }
 
@@ -643,7 +713,11 @@ mod tests {
     async fn test_needs_idr_sets_atomicbool() {
         let generation = Arc::new(AtomicU32::new(1));
         let needs_idr = Arc::new(AtomicBool::new(false));
-        let handle = make_handle(VecSink::new(), Arc::clone(&needs_idr), Arc::clone(&generation));
+        let handle = make_handle(
+            VecSink::new(),
+            Arc::clone(&needs_idr),
+            Arc::clone(&generation),
+        );
 
         assert!(!needs_idr.load(Ordering::Acquire));
         handle.forward_ack(AckMsg::NeedsIdr);
@@ -678,11 +752,15 @@ mod tests {
         handle.active.store(true, Ordering::Release);
 
         // Enqueue one frame — the task will attempt to send, get false, and exit.
-        handle.enqueue(Bytes::from_static(b"frame_that_fails"), false, 0).await;
+        handle
+            .enqueue(Bytes::from_static(b"frame_that_fails"), false, 0)
+            .await;
         sleep(Duration::from_millis(30)).await;
 
         // Enqueue a second frame after the task should have exited.
-        handle.enqueue(Bytes::from_static(b"no_one_home"), false, 1000).await;
+        handle
+            .enqueue(Bytes::from_static(b"no_one_home"), false, 1000)
+            .await;
         sleep(Duration::from_millis(20)).await;
 
         // The FailSink received 0 bytes (it returns false, not counting sends).

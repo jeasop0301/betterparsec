@@ -75,8 +75,8 @@ mod fec_sender;
 // Wire/framing moved to the shared transport-core crate (M6 W1); re-exported
 // here so `crate::transport::webrtc::fec_wire::*` call sites stay unchanged.
 pub use transport_core::fec_wire;
-pub(crate) mod qu_wire;
 mod qu_relay;
+pub(crate) mod qu_wire;
 mod sender;
 mod video;
 

@@ -39,7 +39,9 @@ pub struct LoginLimiter {
 pub enum LimitCheck {
     Allow,
     /// IP is blocked; respond with 429 and `Retry-After: {retry_after_secs}`.
-    Deny { retry_after_secs: u64 },
+    Deny {
+        retry_after_secs: u64,
+    },
 }
 
 impl LoginLimiter {
@@ -146,7 +148,13 @@ mod tests {
                 ((i >> 8) & 0xFF) as u8,
                 (i & 0xFF) as u8,
             ));
-            map.insert(ip, Entry { window_start: t, failures: 1 });
+            map.insert(
+                ip,
+                Entry {
+                    window_start: t,
+                    failures: 1,
+                },
+            );
         }
         map
     }
@@ -280,7 +288,13 @@ mod tests {
         // One entry at t0 (oldest), the rest at t1 (newer).
         let oldest_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0));
         let mut map = HashMap::new();
-        map.insert(oldest_ip, Entry { window_start: t0, failures: 1 });
+        map.insert(
+            oldest_ip,
+            Entry {
+                window_start: t0,
+                failures: 1,
+            },
+        );
         for i in 1..MAP_LIMIT {
             let ip = IpAddr::V4(Ipv4Addr::new(
                 10,
@@ -288,7 +302,13 @@ mod tests {
                 ((i >> 8) & 0xFF) as u8,
                 (i & 0xFF) as u8,
             ));
-            map.insert(ip, Entry { window_start: t1, failures: 1 });
+            map.insert(
+                ip,
+                Entry {
+                    window_start: t1,
+                    failures: 1,
+                },
+            );
         }
         assert_eq!(map.len(), MAP_LIMIT);
 
@@ -296,7 +316,10 @@ mod tests {
         record_failure(&mut map, new_ip, t1);
 
         assert!(map.contains_key(&new_ip), "new IP must be inserted");
-        assert!(!map.contains_key(&oldest_ip), "oldest-window entry must be evicted");
+        assert!(
+            !map.contains_key(&oldest_ip),
+            "oldest-window entry must be evicted"
+        );
         assert_eq!(
             map.len(),
             MAP_LIMIT,

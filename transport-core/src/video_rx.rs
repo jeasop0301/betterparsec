@@ -474,10 +474,7 @@ mod tests {
         // (TS test makes the same allowance): the contract under test is the
         // latch-then-clear behaviour of the poll.
         let _ = rx.poll_needs_idr();
-        assert!(
-            !rx.poll_needs_idr(),
-            "needs_idr cleared after one poll"
-        );
+        assert!(!rx.poll_needs_idr(), "needs_idr cleared after one poll");
     }
 
     #[test]
@@ -573,8 +570,14 @@ mod tests {
     fn malformed_messages_are_dropped() {
         let mut rx = VideoReceiver::new(0);
         assert!(rx.on_message(&[], 0).is_empty(), "empty message");
-        assert!(rx.on_message(&[0x00, 1, 2], 0).is_empty(), "truncated source");
-        assert!(rx.on_message(&[0x02, 0, 0, 0, 0], 0).is_empty(), "unknown kind");
+        assert!(
+            rx.on_message(&[0x00, 1, 2], 0).is_empty(),
+            "truncated source"
+        );
+        assert!(
+            rx.on_message(&[0x02, 0, 0, 0, 0], 0).is_empty(),
+            "unknown kind"
+        );
 
         // Valid source symbol whose chunk payload is shorter than the header:
         // decoder consumes the seq but no frame state is created.

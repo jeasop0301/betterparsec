@@ -191,7 +191,10 @@ impl FecEncoder {
     }
 
     pub fn push_source(&mut self, seq: u32, payload: &[u8]) -> EncoderOutput {
-        assert!(payload.len() <= 65520, "payload exceeds maximum 65520 bytes");
+        assert!(
+            payload.len() <= 65520,
+            "payload exceeds maximum 65520 bytes"
+        );
 
         let payload_len = payload.len() as u16;
         let mut prefixed = Vec::with_capacity(2 + payload.len());
@@ -206,16 +209,21 @@ impl FecEncoder {
         }
         // byte cap check
         while !self.window.is_empty()
-            && self.window_byte_total.saturating_add(new_bytes)
-                > self.config.window_max_bytes
+            && self.window_byte_total.saturating_add(new_bytes) > self.config.window_max_bytes
         {
             self.evict_oldest();
         }
 
         self.window_byte_total = self.window_byte_total.saturating_add(new_bytes);
-        self.window.push_back(WindowEntry { seq, prefixed_payload: prefixed });
+        self.window.push_back(WindowEntry {
+            seq,
+            prefixed_payload: prefixed,
+        });
 
-        let source = Symbol::Source { seq, payload: payload.to_vec() };
+        let source = Symbol::Source {
+            seq,
+            payload: payload.to_vec(),
+        };
 
         // Ratio counter: accumulate numerator, emit repair when >= denominator
         let mut repairs = Vec::new();
@@ -308,7 +316,12 @@ impl FecEncoder {
             // bytes beyond prefixed_payload.len() are zero → gf_mul(coeff,0)=0, no change
         }
 
-        Symbol::Repair { repair_seq, window_base, window_end, payload }
+        Symbol::Repair {
+            repair_seq,
+            window_base,
+            window_end,
+            payload,
+        }
     }
 }
 
@@ -317,8 +330,14 @@ impl FecEncoder {
 /// 디코더가 방출하는 이벤트.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecoderEvent {
-    Recovered { seq: u32, payload: Vec<u8> },
-    LossSpan { from_seq: u32, to_seq_exclusive: u32 },
+    Recovered {
+        seq: u32,
+        payload: Vec<u8>,
+    },
+    LossSpan {
+        from_seq: u32,
+        to_seq_exclusive: u32,
+    },
 }
 
 #[derive(Debug)]
@@ -382,9 +401,12 @@ impl FecDecoder {
     pub fn push_symbol(&mut self, symbol: Symbol) -> Vec<DecoderEvent> {
         match symbol {
             Symbol::Source { seq, payload } => self.push_source(seq, payload),
-            Symbol::Repair { repair_seq, window_base, window_end, payload } => {
-                self.push_repair(repair_seq, window_base, window_end, payload)
-            }
+            Symbol::Repair {
+                repair_seq,
+                window_base,
+                window_end,
+                payload,
+            } => self.push_repair(repair_seq, window_base, window_end, payload),
         }
     }
 
@@ -401,12 +423,17 @@ impl FecDecoder {
             return Vec::new();
         }
 
-        self.sources.insert(seq, SourceState::Received(payload.clone()));
+        self.sources
+            .insert(seq, SourceState::Received(payload.clone()));
 
         let mut events = vec![DecoderEvent::Recovered { seq, payload }];
         // Try to cascade-recover missing symbols using available repairs
         let recovered = self.try_recover();
-        events.extend(recovered.into_iter().map(|(s, p)| DecoderEvent::Recovered { seq: s, payload: p }));
+        events.extend(
+            recovered
+                .into_iter()
+                .map(|(s, p)| DecoderEvent::Recovered { seq: s, payload: p }),
+        );
         events.extend(self.advance_contiguous());
         events
     }
@@ -447,7 +474,12 @@ impl FecDecoder {
             seq = seq.wrapping_add(1);
         }
 
-        self.repairs.push(ReceivedRepair { repair_seq, window_base, window_end, payload });
+        self.repairs.push(ReceivedRepair {
+            repair_seq,
+            window_base,
+            window_end,
+            payload,
+        });
 
         let recovered = self.try_recover();
         let mut events: Vec<DecoderEvent> = recovered
@@ -468,7 +500,8 @@ impl FecDecoder {
                 break;
             }
             for (seq, payload) in &batch {
-                self.sources.insert(*seq, SourceState::Recovered(payload.clone()));
+                self.sources
+                    .insert(*seq, SourceState::Recovered(payload.clone()));
             }
             all_recovered.extend(batch);
         }
@@ -496,7 +529,12 @@ impl FecDecoder {
         }
 
         // Max effective payload length across all repairs
-        let max_eff_len = self.repairs.iter().map(|r| r.payload.len()).max().unwrap_or(0);
+        let max_eff_len = self
+            .repairs
+            .iter()
+            .map(|r| r.payload.len())
+            .max()
+            .unwrap_or(0);
         if max_eff_len == 0 {
             return Vec::new();
         }
@@ -565,8 +603,7 @@ impl FecDecoder {
             if eff_payload.len() < 2 {
                 continue;
             }
-            let payload_len =
-                u16::from_le_bytes([eff_payload[0], eff_payload[1]]) as usize;
+            let payload_len = u16::from_le_bytes([eff_payload[0], eff_payload[1]]) as usize;
             let end = (2 + payload_len).min(eff_payload.len());
             let payload = eff_payload[2..end].to_vec();
             result.push((seq, payload));
@@ -709,12 +746,17 @@ fn gaussian_elim(
     // Collect results. A pivot column's solution is unique only when all
     // non-pivot columns in its reduced row are zero — i.e., no free variables
     // remain that affect that unknown. Under-determined rows are skipped.
-    let pivot_cols: std::collections::HashSet<usize> =
-        pivot_row.iter().enumerate().filter_map(|(c, r)| r.map(|_| c)).collect();
+    let pivot_cols: std::collections::HashSet<usize> = pivot_row
+        .iter()
+        .enumerate()
+        .filter_map(|(c, r)| r.map(|_| c))
+        .collect();
 
     let mut result = Vec::new();
     for (col, pivot_entry) in pivot_row.iter().enumerate() {
-        let Some(&pr) = pivot_entry.as_ref() else { continue };
+        let Some(&pr) = pivot_entry.as_ref() else {
+            continue;
+        };
         // Check that no non-pivot column in this row has a non-zero coefficient.
         let fully_determined = (0..n_unknowns)
             .filter(|c| !pivot_cols.contains(c))
@@ -781,9 +823,13 @@ mod tests {
         let mut state: u64 = 99;
         let pairs: Vec<(u8, u8)> = (0..200)
             .map(|_| {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let a = (state >> 33) as u8;
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let b = (state >> 33) as u8;
                 (a, b)
             })
@@ -806,11 +852,18 @@ mod tests {
         let out = enc.push_source(0, &[]);
         assert_eq!(
             out.source,
-            Symbol::Source { seq: 0, payload: vec![] }
+            Symbol::Source {
+                seq: 0,
+                payload: vec![]
+            }
         );
         assert_eq!(out.repairs.len(), 1);
         if let Symbol::Repair { payload, .. } = &out.repairs[0] {
-            assert_eq!(payload.len(), 2, "repair payload must be 2 bytes for empty source");
+            assert_eq!(
+                payload.len(),
+                2,
+                "repair payload must be 2 bytes for empty source"
+            );
         } else {
             panic!("expected Repair");
         }
@@ -822,7 +875,10 @@ mod tests {
         let big = vec![0xABu8; 65520];
         let out = enc.push_source(0, &big);
         match out.source {
-            Symbol::Source { seq: 0, ref payload } => assert_eq!(payload.len(), 65520),
+            Symbol::Source {
+                seq: 0,
+                ref payload,
+            } => assert_eq!(payload.len(), 65520),
             _ => panic!("unexpected"),
         }
     }
@@ -835,7 +891,9 @@ mod tests {
             window_max_symbols: 64,
             window_max_bytes: 1 << 20,
         });
-        let total_repairs: usize = (0..100).map(|i| enc.push_source(i, b"x").repairs.len()).sum();
+        let total_repairs: usize = (0..100)
+            .map(|i| enc.push_source(i, b"x").repairs.len())
+            .sum();
         assert_eq!(total_repairs, 0);
     }
 
@@ -847,7 +905,9 @@ mod tests {
             window_max_symbols: 64,
             window_max_bytes: 1 << 20,
         });
-        let total_repairs: usize = (0..10).map(|i| enc.push_source(i, b"x").repairs.len()).sum();
+        let total_repairs: usize = (0..10)
+            .map(|i| enc.push_source(i, b"x").repairs.len())
+            .sum();
         assert_eq!(total_repairs, 10);
     }
 
@@ -859,7 +919,9 @@ mod tests {
             window_max_symbols: 64,
             window_max_bytes: 1 << 20,
         });
-        let total_repairs: usize = (0..16).map(|i| enc.push_source(i, b"x").repairs.len()).sum();
+        let total_repairs: usize = (0..16)
+            .map(|i| enc.push_source(i, b"x").repairs.len())
+            .sum();
         assert_eq!(total_repairs, 2);
     }
 
@@ -949,7 +1011,10 @@ mod tests {
             events.extend(s.push(i, b"hello", drop));
         }
         let recovered = collect_recovered(&events);
-        assert!(recovered.contains(&4), "seq 4 not recovered; got {recovered:?}");
+        assert!(
+            recovered.contains(&4),
+            "seq 4 not recovered; got {recovered:?}"
+        );
     }
 
     #[test]
@@ -962,8 +1027,10 @@ mod tests {
             events.extend(s.push(i, b"burst", drop));
         }
         let recovered = collect_recovered(&events);
-        assert!(recovered.contains(&2) && recovered.contains(&3),
-            "burst not recovered; got {recovered:?}");
+        assert!(
+            recovered.contains(&2) && recovered.contains(&3),
+            "burst not recovered; got {recovered:?}"
+        );
     }
 
     #[test]
@@ -978,7 +1045,10 @@ mod tests {
         let recovered = collect_recovered(&events);
         // seq 2..6 should NOT all be recovered (too many losses vs repairs)
         let loss_count = (2u32..6).filter(|s| !recovered.contains(s)).count();
-        assert!(loss_count > 0, "expected unrecoverable loss, but all recovered: {recovered:?}");
+        assert!(
+            loss_count > 0,
+            "expected unrecoverable loss, but all recovered: {recovered:?}"
+        );
     }
 
     #[test]
@@ -1017,7 +1087,10 @@ mod tests {
     #[test]
     fn rt_duplicate_source() {
         let mut dec = FecDecoder::new(64, 1 << 20);
-        let sym = Symbol::Source { seq: 3, payload: b"hello".to_vec() };
+        let sym = Symbol::Source {
+            seq: 3,
+            payload: b"hello".to_vec(),
+        };
         let e1 = dec.push_symbol(sym.clone());
         let e2 = dec.push_symbol(sym);
         let r1 = collect_recovered(&e1);
@@ -1037,7 +1110,10 @@ mod tests {
         // The source was already received, so neither repair recovers anything;
         // the second, identical repair must additionally be ignored outright.
         let r1 = collect_recovered(&e1);
-        assert!(r1.is_empty(), "repair with no missing sources recovers nothing");
+        assert!(
+            r1.is_empty(),
+            "repair with no missing sources recovers nothing"
+        );
         let r2 = collect_recovered(&e2);
         assert!(r2.is_empty(), "duplicate repair should be ignored");
     }
@@ -1055,7 +1131,10 @@ mod tests {
         let out = s.enc.push_source(16, b"x");
         for repair in out.repairs {
             if let Symbol::Repair { window_base, .. } = repair {
-                assert!(window_base >= 8, "repair window_base {window_base} < 8 after ack(7)");
+                assert!(
+                    window_base >= 8,
+                    "repair window_base {window_base} < 8 after ack(7)"
+                );
             }
         }
     }
@@ -1108,7 +1187,10 @@ mod tests {
         // With 8 independent repairs and 8 unknowns, full recovery should succeed
         // (PRF rank sufficient in practice)
         for i in 0..8u32 {
-            assert!(recovered.contains(&i), "seq {i} not recovered in repair-only scenario; got {recovered:?}");
+            assert!(
+                recovered.contains(&i),
+                "seq {i} not recovered in repair-only scenario; got {recovered:?}"
+            );
         }
     }
 
@@ -1130,10 +1212,14 @@ mod tests {
             events.extend(dec.push_symbol(repair));
         }
         let recovered = collect_recovered(&events);
-        assert!(recovered.contains(&0), "single-symbol window recovery failed");
+        assert!(
+            recovered.contains(&0),
+            "single-symbol window recovery failed"
+        );
         // Also verify payload
-        if let Some(DecoderEvent::Recovered { seq: 0, payload }) =
-            events.iter().find(|e| matches!(e, DecoderEvent::Recovered { seq: 0, .. }))
+        if let Some(DecoderEvent::Recovered { seq: 0, payload }) = events
+            .iter()
+            .find(|e| matches!(e, DecoderEvent::Recovered { seq: 0, .. }))
         {
             assert_eq!(payload, b"secret");
         }
@@ -1169,9 +1255,13 @@ mod tests {
         }
 
         let recovered = collect_recovered(&events);
-        assert!(recovered.contains(&2), "variable-length seq 2 not recovered");
-        if let Some(DecoderEvent::Recovered { seq: 2, payload }) =
-            events.iter().find(|e| matches!(e, DecoderEvent::Recovered { seq: 2, .. }))
+        assert!(
+            recovered.contains(&2),
+            "variable-length seq 2 not recovered"
+        );
+        if let Some(DecoderEvent::Recovered { seq: 2, payload }) = events
+            .iter()
+            .find(|e| matches!(e, DecoderEvent::Recovered { seq: 2, .. }))
         {
             assert_eq!(payload.len(), 1400);
         }
@@ -1205,10 +1295,15 @@ mod tests {
         let recovered = collect_recovered(&events);
         for (i, &expected_len) in lengths.iter().enumerate() {
             assert!(recovered.contains(&(i as u32)), "seq {i} not recovered");
-            if let Some(DecoderEvent::Recovered { payload, .. }) = events.iter().find(
-                |e| matches!(e, DecoderEvent::Recovered { seq, .. } if *seq == i as u32)
-            ) {
-                assert_eq!(payload.len(), expected_len, "seq {i} payload length mismatch");
+            if let Some(DecoderEvent::Recovered { payload, .. }) = events
+                .iter()
+                .find(|e| matches!(e, DecoderEvent::Recovered { seq, .. } if *seq == i as u32))
+            {
+                assert_eq!(
+                    payload.len(),
+                    expected_len,
+                    "seq {i} payload length mismatch"
+                );
             }
         }
     }
@@ -1227,7 +1322,11 @@ mod tests {
             enc.push_source(i, b"x");
         }
         assert_eq!(enc.window_len(), 4, "window should be capped at 4");
-        assert_eq!(enc.window_base(), Some(1), "oldest seq should be 1 after eviction");
+        assert_eq!(
+            enc.window_base(),
+            Some(1),
+            "oldest seq should be 1 after eviction"
+        );
     }
 
     #[test]
@@ -1245,7 +1344,10 @@ mod tests {
         assert_eq!(enc.window_len(), 5);
         // 6th push should evict at least one
         enc.push_source(5, &payload);
-        assert!(enc.window_len() < 6, "byte cap should have triggered eviction");
+        assert!(
+            enc.window_len() < 6,
+            "byte cap should have triggered eviction"
+        );
     }
 
     #[test]
@@ -1253,7 +1355,11 @@ mod tests {
         let mut enc = FecEncoder::new(FecConfig::default_streaming());
         let prev_len = enc.window_len();
         enc.acknowledge(9999);
-        assert_eq!(enc.window_len(), prev_len, "future ack should not change empty window");
+        assert_eq!(
+            enc.window_len(),
+            prev_len,
+            "future ack should not change empty window"
+        );
     }
 
     #[test]
@@ -1265,13 +1371,19 @@ mod tests {
         enc.acknowledge(3);
         let base_after_ack3 = enc.window_base();
         enc.acknowledge(1); // ancient
-        assert_eq!(enc.window_base(), base_after_ack3, "ancient ack should not change window_base");
+        assert_eq!(
+            enc.window_base(),
+            base_after_ack3,
+            "ancient ack should not change window_base"
+        );
     }
 
     // ── 5-E: 결정론적 LCG fuzz ───────────────────────────────────────────
 
     fn lcg_next(state: &mut u64) -> u64 {
-        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *state
     }
 
@@ -1298,7 +1410,10 @@ mod tests {
         }
         let recovered = collect_recovered(&events);
         for i in 0..64u32 {
-            assert!(recovered.contains(&i), "no-loss fuzz: seq {i} not recovered");
+            assert!(
+                recovered.contains(&i),
+                "no-loss fuzz: seq {i} not recovered"
+            );
         }
     }
 
@@ -1328,9 +1443,16 @@ mod tests {
         let mut covered = std::collections::HashSet::new();
         for e in &events {
             match e {
-                DecoderEvent::Recovered { seq, .. } => { covered.insert(*seq); }
-                DecoderEvent::LossSpan { from_seq, to_seq_exclusive } => {
-                    for s in *from_seq..*to_seq_exclusive { covered.insert(s); }
+                DecoderEvent::Recovered { seq, .. } => {
+                    covered.insert(*seq);
+                }
+                DecoderEvent::LossSpan {
+                    from_seq,
+                    to_seq_exclusive,
+                } => {
+                    for s in *from_seq..*to_seq_exclusive {
+                        covered.insert(s);
+                    }
                 }
             }
         }
@@ -1378,7 +1500,9 @@ mod tests {
     #[test]
     fn ack_u32_max_is_noop_on_nonempty_window() {
         let mut enc = FecEncoder::new(FecConfig::default_streaming());
-        for i in 0..4u32 { enc.push_source(i, b"x"); }
+        for i in 0..4u32 {
+            enc.push_source(i, b"x");
+        }
         assert_eq!(enc.window_len(), 4);
         enc.acknowledge(u32::MAX);
         assert_eq!(enc.window_len(), 4, "u32::MAX ack must not wipe window");
@@ -1391,7 +1515,9 @@ mod tests {
     #[test]
     fn ack_back_seq_evicts_all() {
         let mut enc = FecEncoder::new(FecConfig::default_streaming());
-        for i in 0..4u32 { enc.push_source(i, b"x"); }
+        for i in 0..4u32 {
+            enc.push_source(i, b"x");
+        }
         enc.acknowledge(3); // 3 == window.back().seq
         assert_eq!(enc.window_len(), 0, "ack(back_seq) should empty the window");
     }
@@ -1400,7 +1526,9 @@ mod tests {
     #[test]
     fn ack_one_past_back_is_noop() {
         let mut enc = FecEncoder::new(FecConfig::default_streaming());
-        for i in 0..4u32 { enc.push_source(i, b"x"); }
+        for i in 0..4u32 {
+            enc.push_source(i, b"x");
+        }
         enc.acknowledge(4); // window back = 3, so 4 is future
         assert_eq!(enc.window_len(), 4);
         assert_eq!(enc.window_base(), Some(0));
@@ -1410,7 +1538,9 @@ mod tests {
     #[test]
     fn ack_zero_evicts_seq_zero_only() {
         let mut enc = FecEncoder::new(FecConfig::default_streaming());
-        for i in 0..4u32 { enc.push_source(i, b"x"); }
+        for i in 0..4u32 {
+            enc.push_source(i, b"x");
+        }
         enc.acknowledge(0);
         assert_eq!(enc.window_len(), 3);
         assert_eq!(enc.window_base(), Some(1));
@@ -1467,18 +1597,31 @@ mod tests {
         // seqs 0,1,6,7 must be delivered
         let recovered: Vec<u32> = collect_recovered(&all_events);
         for &expect in &[0u32, 1, 6, 7] {
-            assert!(recovered.contains(&expect), "seq {expect} must be Recovered");
+            assert!(
+                recovered.contains(&expect),
+                "seq {expect} must be Recovered"
+            );
         }
         // A LossSpan covering exactly [2,6) must be present
         let has_loss_span = all_events.iter().any(|e| {
-            matches!(e, DecoderEvent::LossSpan { from_seq: 2, to_seq_exclusive: 6 })
+            matches!(
+                e,
+                DecoderEvent::LossSpan {
+                    from_seq: 2,
+                    to_seq_exclusive: 6
+                }
+            )
         });
-        assert!(has_loss_span,
-            "expected LossSpan(2,6) in events; got: {all_events:?}");
+        assert!(
+            has_loss_span,
+            "expected LossSpan(2,6) in events; got: {all_events:?}"
+        );
         // seqs 2..5 must NOT appear as Recovered (they were unrecoverable)
         for seq in 2u32..6 {
-            assert!(!recovered.contains(&seq),
-                "seq {seq} was reported Recovered despite being unrecoverable");
+            assert!(
+                !recovered.contains(&seq),
+                "seq {seq} was reported Recovered despite being unrecoverable"
+            );
         }
     }
 
@@ -1493,7 +1636,10 @@ mod tests {
     fn pin_advance_contiguous_does_not_skip_initial_missing_seqs() {
         let mut dec = FecDecoder::new(64, 1 << 20);
         // Deliver only seq 5 — seqs 0..4 are unknown (no repair, no source).
-        dec.push_symbol(Symbol::Source { seq: 5, payload: b"late".to_vec() });
+        dec.push_symbol(Symbol::Source {
+            seq: 5,
+            payload: b"late".to_vec(),
+        });
         assert_eq!(
             dec.highest_fully_decoded(),
             None,
@@ -1501,7 +1647,10 @@ mod tests {
         );
         // Now deliver seqs 0..4 in order; only then should highest advance.
         for i in 0u32..5 {
-            dec.push_symbol(Symbol::Source { seq: i, payload: b"fill".to_vec() });
+            dec.push_symbol(Symbol::Source {
+                seq: i,
+                payload: b"fill".to_vec(),
+            });
         }
         assert_eq!(
             dec.highest_fully_decoded(),
@@ -1538,7 +1687,13 @@ mod tests {
         let out = enc.push_source(0, b"secret");
         // out.repairs[0] has repair_seq=0, window_base=0, window_end=1.
         let repair0 = out.repairs[0].clone();
-        let Symbol::Repair { window_base, window_end, payload: p0, .. } = &repair0 else {
+        let Symbol::Repair {
+            window_base,
+            window_end,
+            payload: p0,
+            ..
+        } = &repair0
+        else {
             panic!("expected Repair");
         };
         let (wb, we) = (*window_base, *window_end);
@@ -1557,8 +1712,10 @@ mod tests {
         let e0 = dec.push_symbol(repair0);
         // seq 0 recovered via single-source GE.
         let recovered_after_0 = collect_recovered(&e0);
-        assert!(recovered_after_0.contains(&0),
-            "repair_seq=0 should recover seq 0; got {recovered_after_0:?}");
+        assert!(
+            recovered_after_0.contains(&0),
+            "repair_seq=0 should recover seq 0; got {recovered_after_0:?}"
+        );
 
         // Push repair_seq=128 — must NOT be silently dropped as duplicate.
         // With old code (% 128) the second repair is rejected → push returns [].
@@ -1608,8 +1765,10 @@ mod tests {
         };
         let ev = dec2.push_symbol(r128_first);
         let rec2 = collect_recovered(&ev);
-        assert!(rec2.contains(&0),
-            "repair_seq=128 alone should recover seq 0; got {rec2:?}");
+        assert!(
+            rec2.contains(&0),
+            "repair_seq=128 alone should recover seq 0; got {rec2:?}"
+        );
     }
 
     /// Bug-finding-6 pin: when back().seq == u32::MAX the encoder must emit
@@ -1628,11 +1787,19 @@ mod tests {
         // Push source with seq = u32::MAX; repair should have window_end = 0.
         let out = enc.push_source(u32::MAX, b"last_symbol");
         assert_eq!(out.repairs.len(), 1, "1/1 ratio must emit 1 repair");
-        let Symbol::Repair { window_base, window_end, .. } = &out.repairs[0] else {
+        let Symbol::Repair {
+            window_base,
+            window_end,
+            ..
+        } = &out.repairs[0]
+        else {
             panic!("expected Repair");
         };
         assert_eq!(*window_base, u32::MAX);
-        assert_eq!(*window_end, 0u32, "window_end must wrap to 0 at u32::MAX + 1");
+        assert_eq!(
+            *window_end, 0u32,
+            "window_end must wrap to 0 at u32::MAX + 1"
+        );
     }
 
     /// Bug-finding-7 pin: the Rust decoder's `push_repair` and `one_elim_pass`
@@ -1660,9 +1827,18 @@ mod tests {
         let events_zero = dec.push_symbol(out_zero.source);
         let recovered_after_zero: Vec<u32> = events_zero
             .iter()
-            .filter_map(|e| if let DecoderEvent::Recovered { seq, .. } = e { Some(*seq) } else { None })
+            .filter_map(|e| {
+                if let DecoderEvent::Recovered { seq, .. } = e {
+                    Some(*seq)
+                } else {
+                    None
+                }
+            })
             .collect();
-        assert!(recovered_after_zero.contains(&0), "seq 0 must be immediately recovered");
+        assert!(
+            recovered_after_zero.contains(&0),
+            "seq 0 must be immediately recovered"
+        );
 
         // Deliver the repair for seq 0 (window [u32::MAX, 1) = {u32::MAX, 0}).
         // With old code the decoder's push_repair loop is empty → seq u32::MAX
@@ -1683,8 +1859,11 @@ mod tests {
             if let DecoderEvent::Recovered { seq: s, payload } = e {
                 if *s == u32::MAX {
                     // Recovery succeeded — verify payload correctness.
-                    assert_eq!(payload.as_slice(), b"before_wrap",
-                        "recovered payload must match original");
+                    assert_eq!(
+                        payload.as_slice(),
+                        b"before_wrap",
+                        "recovered payload must match original"
+                    );
                 }
             }
         }
@@ -1695,7 +1874,11 @@ mod tests {
         for r in out_max.repairs {
             let events = dec.push_symbol(r);
             for e in &events {
-                if let DecoderEvent::Recovered { seq: u32::MAX, payload } = e {
+                if let DecoderEvent::Recovered {
+                    seq: u32::MAX,
+                    payload,
+                } = e
+                {
                     assert_eq!(payload.as_slice(), b"before_wrap");
                     recovered_max = true;
                 }
@@ -1707,11 +1890,13 @@ mod tests {
         // Note: whether recovery actually fires depends on encoder window at that
         // point; the structural test is that no panic occurs and the loop ran.
         // The earlier wrap repair may already have recovered it in all_events:
-        let already_recovered = all_events.iter().any(|e| {
-            matches!(e, DecoderEvent::Recovered { seq: s, .. } if *s == u32::MAX)
-        });
-        assert!(recovered_max || already_recovered,
-            "seq u32::MAX must be recoverable via the wrap-around repair window");
+        let already_recovered = all_events
+            .iter()
+            .any(|e| matches!(e, DecoderEvent::Recovered { seq: s, .. } if *s == u32::MAX));
+        assert!(
+            recovered_max || already_recovered,
+            "seq u32::MAX must be recoverable via the wrap-around repair window"
+        );
     }
 
     /// Off-spec repair declaring a window wider than the 128-symbol design cap
@@ -1732,7 +1917,11 @@ mod tests {
         assert!(!out.repairs.is_empty(), "1/1 redundancy must emit a repair");
         let real_repair = out.repairs.into_iter().next().unwrap();
         let (repair_seq, window_base) = match &real_repair {
-            Symbol::Repair { repair_seq, window_base, .. } => (*repair_seq, *window_base),
+            Symbol::Repair {
+                repair_seq,
+                window_base,
+                ..
+            } => (*repair_seq, *window_base),
             _ => unreachable!(),
         };
 
@@ -1752,12 +1941,16 @@ mod tests {
         //    had been recorded, this would dedup to nothing and seq 0 could
         //    never be recovered.  It must instead recover seq 0.
         let events = dec.push_symbol(real_repair);
-        let recovered = events.iter().any(|e| matches!(
-            e,
-            DecoderEvent::Recovered { seq: 0, payload } if payload.as_slice() == b"payload_zero"
-        ));
-        assert!(recovered,
-            "in-spec repair sharing the rejected key must still be accepted and recover");
+        let recovered = events.iter().any(|e| {
+            matches!(
+                e,
+                DecoderEvent::Recovered { seq: 0, payload } if payload.as_slice() == b"payload_zero"
+            )
+        });
+        assert!(
+            recovered,
+            "in-spec repair sharing the rejected key must still be accepted and recover"
+        );
     }
 
     /// Exact cap boundary: a 128-symbol repair window (the widest our encoder
@@ -1784,9 +1977,16 @@ mod tests {
         }
         let repair_128 = repair_128.expect("1/128 ratio must emit a repair by push 128");
         match &repair_128 {
-            Symbol::Repair { window_base, window_end, .. } => {
-                assert_eq!(window_end.wrapping_sub(*window_base), 128,
-                    "test premise: repair must span the full 128-symbol window");
+            Symbol::Repair {
+                window_base,
+                window_end,
+                ..
+            } => {
+                assert_eq!(
+                    window_end.wrapping_sub(*window_base),
+                    128,
+                    "test premise: repair must span the full 128-symbol window"
+                );
             }
             _ => unreachable!(),
         }
@@ -1795,14 +1995,22 @@ mod tests {
         // acceptance at the exact cap is proven by the recovery of seq 0.
         let mut dec = FecDecoder::new(128, 1 << 24);
         for seq in 1..128u32 {
-            dec.push_symbol(Symbol::Source { seq, payload: vec![seq as u8] });
+            dec.push_symbol(Symbol::Source {
+                seq,
+                payload: vec![seq as u8],
+            });
         }
         let events = dec.push_symbol(repair_128);
-        let recovered = events.iter().any(|e| matches!(
-            e,
-            DecoderEvent::Recovered { seq: 0, payload } if payload.as_slice() == [0u8]
-        ));
-        assert!(recovered, "128-wide repair window must be accepted at the cap");
+        let recovered = events.iter().any(|e| {
+            matches!(
+                e,
+                DecoderEvent::Recovered { seq: 0, payload } if payload.as_slice() == [0u8]
+            )
+        });
+        assert!(
+            recovered,
+            "128-wide repair window must be accepted at the cap"
+        );
 
         // 129: first rejected width — no events, decoder state untouched.
         let mut dec2 = FecDecoder::new(128, 1 << 24);
@@ -1824,7 +2032,9 @@ mod tests {
             window_max_symbols: u16::MAX,
             window_max_bytes: 1 << 24,
         });
-        for i in 0..130u32 { enc.push_source(i, b"x"); }
+        for i in 0..130u32 {
+            enc.push_source(i, b"x");
+        }
         assert_eq!(enc.window_len(), 128);
     }
 
@@ -1840,7 +2050,11 @@ mod tests {
         });
         enc.push_source(0, &[]);
         enc.push_source(1, &[]);
-        assert_eq!(enc.window_len(), 2, "empty-payload pushes must not trigger byte-cap eviction");
+        assert_eq!(
+            enc.window_len(),
+            2,
+            "empty-payload pushes must not trigger byte-cap eviction"
+        );
     }
 
     // ── mds_guarantee_sweep ───────────────────────────────────────────────

@@ -109,7 +109,11 @@ impl QuRelayHandle {
         let active = Arc::new(AtomicBool::new(false));
         let (client_tx, client_rx) = mpsc::channel::<Bytes>(16);
 
-        let handle = QuRelayHandle { active: active.clone(), client_tx, local_addr };
+        let handle = QuRelayHandle {
+            active: active.clone(),
+            client_tx,
+            local_addr,
+        };
 
         tokio::task::spawn(run_relay(
             own_generation,
@@ -142,7 +146,9 @@ impl QuRelayHandle {
     /// - Unknown client-band (`>= 0x80`): dropped with a debug log.
     /// - Host-band (`< 0x80`): silently ignored (unexpected on this channel).
     pub(crate) fn forward_client_msg(&self, data: Bytes) {
-        let Some(kind) = data.first().copied() else { return; };
+        let Some(kind) = data.first().copied() else {
+            return;
+        };
         match kind {
             qu_wire::KIND_QU_SUBSCRIBE => {
                 self.active.store(true, Ordering::Release);
@@ -152,9 +158,7 @@ impl QuRelayHandle {
                 let _ = self.client_tx.try_send(data);
             }
             _ if kind >= 0x80 => {
-                debug!(
-                    "[QuRelay] dropping unknown client-band kind 0x{kind:02x} from DataChannel"
-                );
+                debug!("[QuRelay] dropping unknown client-band kind 0x{kind:02x} from DataChannel");
             }
             _ => {
                 debug!(
@@ -176,8 +180,7 @@ async fn run_relay(
     sink: Arc<dyn QuSink>,
 ) {
     // Epoch state shared between relay task and the current connection sub-task.
-    let epoch: Arc<std::sync::Mutex<Option<u32>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let epoch: Arc<std::sync::Mutex<Option<u32>>> = Arc::new(std::sync::Mutex::new(None));
     let mut conn_handle: Option<JoinHandle<()>> = None;
     let mut conn_write_tx: Option<mpsc::Sender<Bytes>> = None;
     // Last QU_SUBSCRIBE received from the client, replayed to every new or
@@ -271,9 +274,7 @@ async fn read_frame<R: AsyncRead + Unpin>(read: &mut R) -> std::io::Result<Vec<u
         ));
     }
     if len > MAX_MSG_LEN {
-        warn!(
-            "[QuRelay] oversize frame ({len} > {MAX_MSG_LEN}) — dropping connection (DoS guard)"
-        );
+        warn!("[QuRelay] oversize frame ({len} > {MAX_MSG_LEN}) — dropping connection (DoS guard)");
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "oversize frame",
@@ -296,7 +297,9 @@ async fn handle_socket_frame(
     active: &Arc<AtomicBool>,
     epoch: &Arc<std::sync::Mutex<Option<u32>>>,
 ) {
-    let Some(kind) = msg.first().copied() else { return; };
+    let Some(kind) = msg.first().copied() else {
+        return;
+    };
 
     if kind >= 0x80 {
         // Client-band kind arriving from the socket is a protocol violation.
@@ -352,11 +355,7 @@ async fn handle_socket_frame(
 /// `QU_CONFIG` and `QU_EPOCH` bypass this gate (see `handle_socket_frame`); all
 /// other kinds (tiles, invalidates, unknown host-band) are dropped until the
 /// client sends `QU_SUBSCRIBE`.
-async fn relay_to_sink(
-    sink: &Arc<dyn QuSink>,
-    active: &Arc<AtomicBool>,
-    msg: &[u8],
-) {
+async fn relay_to_sink(sink: &Arc<dyn QuSink>, active: &Arc<AtomicBool>, msg: &[u8]) {
     if !active.load(Ordering::Acquire) {
         return;
     }
@@ -506,8 +505,7 @@ mod tests {
 
         let sink_c = sink.clone();
         let task = tokio::spawn(run_connection(
-            read_half, write_half, write_rx,
-            sink_c, active, epoch, gen_arc, 1,
+            read_half, write_half, write_rx, sink_c, active, epoch, gen_arc, 1,
         ));
 
         // Feed in 3-byte chunks to verify framing reassembly.
@@ -542,8 +540,14 @@ mod tests {
         let gen_arc = make_gen(1);
 
         let task = tokio::spawn(run_connection(
-            read_half, write_half, write_rx,
-            sink.clone(), active, epoch, gen_arc, 1,
+            read_half,
+            write_half,
+            write_rx,
+            sink.clone(),
+            active,
+            epoch,
+            gen_arc,
+            1,
         ));
 
         // Write length = MAX_MSG_LEN + 1.
@@ -569,8 +573,14 @@ mod tests {
         let gen_arc = make_gen(1);
 
         let task = tokio::spawn(run_connection(
-            read_half, write_half, write_rx,
-            sink.clone(), active, epoch, gen_arc, 1,
+            read_half,
+            write_half,
+            write_rx,
+            sink.clone(),
+            active,
+            epoch,
+            gen_arc,
+            1,
         ));
 
         client_end.write_all(&0u32.to_le_bytes()).await.unwrap();
@@ -654,7 +664,11 @@ mod tests {
 
         // Old tile (epoch 3) after epoch change → dropped.
         handle_socket_frame(&old_tile, &sink, &active, &epoch).await;
-        assert_eq!(vec.len(), 2, "tile at old epoch must be dropped after QU_EPOCH");
+        assert_eq!(
+            vec.len(),
+            2,
+            "tile at old epoch must be dropped after QU_EPOCH"
+        );
 
         // New tile (epoch 10) → relayed.
         let new_tile = qu_wire::encode_tile(10, 0, 0, 0, 0, 0, &[]);
@@ -730,7 +744,10 @@ mod tests {
         // The old task should have exited (observable: connecting to the old
         // address and trying to send should not result in relay to sink).
         // We'll also test by checking new_handle works.
-        assert!(!handle.is_active(), "old handle stays dormant (generation stopped it)");
+        assert!(
+            !handle.is_active(),
+            "old handle stays dormant (generation stopped it)"
+        );
     }
 
     // ── Test 11: second socket connection replaces first ──────────────────
@@ -858,7 +875,10 @@ mod tests {
         })
         .await;
 
-        assert!(result.is_ok(), "timed out waiting for replayed QU_SUBSCRIBE");
+        assert!(
+            result.is_ok(),
+            "timed out waiting for replayed QU_SUBSCRIBE"
+        );
         assert_eq!(
             result.unwrap().unwrap(),
             qu_wire::encode_subscribe(1),
@@ -923,7 +943,10 @@ mod tests {
         })
         .await;
 
-        assert!(result.is_ok(), "timed out waiting for replayed subscribe on reconnect");
+        assert!(
+            result.is_ok(),
+            "timed out waiting for replayed subscribe on reconnect"
+        );
         assert_eq!(
             result.unwrap().unwrap(),
             qu_wire::encode_subscribe(1),

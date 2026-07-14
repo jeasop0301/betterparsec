@@ -266,7 +266,10 @@ impl CcController {
         let service_us = send_done_us.saturating_sub(send_start_us);
 
         // Backwards or duplicate send_done_us → Skipped (A4: <= last)
-        if self.last_send_done_us.is_some_and(|last| send_done_us <= last) {
+        if self
+            .last_send_done_us
+            .is_some_and(|last| send_done_us <= last)
+        {
             return (self.cc_target_kbps, CcVerdict::Skipped);
         }
         self.last_send_done_us = Some(send_done_us);
@@ -481,8 +484,10 @@ impl CcShared {
     /// created for that stream.
     pub fn begin_generation(&self) -> u32 {
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        self.target_packed.store(pack(generation, 0), Ordering::Release);
-        self.loss_packed.store(LOSS_MAILBOX_EMPTY, Ordering::Release);
+        self.target_packed
+            .store(pack(generation, 0), Ordering::Release);
+        self.loss_packed
+            .store(LOSS_MAILBOX_EMPTY, Ordering::Release);
         generation
     }
 
@@ -494,7 +499,8 @@ impl CcShared {
         if self.generation.load(Ordering::Acquire) != generation {
             return;
         }
-        self.target_packed.store(pack(generation, kbps), Ordering::Release);
+        self.target_packed
+            .store(pack(generation, kbps), Ordering::Release);
     }
 
     /// Latest CC target (kbps); 0 = CC inactive (no controller yet, disabled,
@@ -513,8 +519,10 @@ impl CcShared {
         if self.generation.load(Ordering::Acquire) != generation {
             return;
         }
-        self.loss_packed
-            .store(pack(generation, u32::from(fraction_lost)), Ordering::Release);
+        self.loss_packed.store(
+            pack(generation, u32::from(fraction_lost)),
+            Ordering::Release,
+        );
     }
 
     /// Drain the loss mailbox. Returns the loss fraction in `[0.0, 1.0]`, or
@@ -580,7 +588,11 @@ pub fn effective_target_kbps(abr_kbps: u32, cc_kbps: u32) -> u32 {
 /// 0 fps → 0 (unknown; disables the absolute budget trigger). Rates above
 /// 1_000_000 fps truncate to 0 μs, which likewise disables the trigger.
 pub fn interval_us_from_fps(fps: u32) -> u64 {
-    if fps == 0 { 0 } else { 1_000_000 / u64::from(fps) }
+    if fps == 0 {
+        0
+    } else {
+        1_000_000 / u64::from(fps)
+    }
 }
 
 #[cfg(test)]
@@ -627,7 +639,6 @@ mod tests {
         last
     }
 
-
     // T01
     #[test]
     fn starts_at_max_kbps() {
@@ -645,14 +656,22 @@ mod tests {
         // window_frames - 1 frames → all WarmingUp, target unchanged
         for _ in 0..(window - 1) {
             let (t, v) = cc.on_frame(ts, ts + NORMAL_SERVICE, 10_000, INTERVAL_120FPS);
-            assert_eq!(v, CcVerdict::WarmingUp, "expected WarmingUp before window fills");
+            assert_eq!(
+                v,
+                CcVerdict::WarmingUp,
+                "expected WarmingUp before window fills"
+            );
             assert_eq!(t, 20_000);
             ts += NORMAL_SERVICE + 1;
         }
 
         // window_frames-th frame → verdict is no longer WarmingUp
         let (_, v) = cc.on_frame(ts, ts + NORMAL_SERVICE, 10_000, INTERVAL_120FPS);
-        assert_ne!(v, CcVerdict::WarmingUp, "expected non-WarmingUp after window fills");
+        assert_ne!(
+            v,
+            CcVerdict::WarmingUp,
+            "expected non-WarmingUp after window fills"
+        );
     }
 
     // T03
@@ -693,7 +712,10 @@ mod tests {
         let (_, last_verdict) = feed_n(&mut cc, inflate_frames, congested_service, &mut ts);
 
         assert_eq!(last_verdict, CcVerdict::Decrease);
-        assert!(cc.target_kbps() < initial_target, "target should have decreased");
+        assert!(
+            cc.target_kbps() < initial_target,
+            "target should have decreased"
+        );
     }
 
     // T05 — ctl_fast so exactly inflate_frames congested frames trigger Decrease.
@@ -735,7 +757,11 @@ mod tests {
         let target_before = cc.target_kbps();
         let (_, last_verdict) = feed_n(&mut cc, inflate_frames, congested_service, &mut ts);
         assert_eq!(last_verdict, CcVerdict::CooldownHold);
-        assert_eq!(cc.target_kbps(), target_before, "target must not change during cooldown");
+        assert_eq!(
+            cc.target_kbps(),
+            target_before,
+            "target must not change during cooldown"
+        );
     }
 
     // T07 — ctl_fast for exact frame counting.
@@ -761,7 +787,10 @@ mod tests {
         // Second round of inflation → second Decrease
         let (_, v) = feed_n(&mut cc, inflate_frames, congested_service, &mut ts);
         assert_eq!(v, CcVerdict::Decrease);
-        assert!(cc.target_kbps() < after_first, "second decrease should lower target further");
+        assert!(
+            cc.target_kbps() < after_first,
+            "second decrease should lower target further"
+        );
     }
 
     // T08 — deflate_triggers_probe_up
@@ -791,7 +820,11 @@ mod tests {
         // Cooldown is still active but only blocks Decrease, not Increase.
         let (t, v) = feed_n(&mut cc, deflate_frames, 0, &mut ts);
         assert_eq!(v, CcVerdict::Increase);
-        assert_eq!(t, before_probe + probe_step, "target must increase by exactly probe_step");
+        assert_eq!(
+            t,
+            before_probe + probe_step,
+            "target must increase by exactly probe_step"
+        );
     }
 
     // T09 — probe_bounded_by_max_kbps
@@ -900,7 +933,11 @@ mod tests {
                 "unexpected verdict {v:?} at frame {i}"
             );
         }
-        assert_eq!(cc.target_kbps(), target_before, "target must not change on jitter");
+        assert_eq!(
+            cc.target_kbps(),
+            target_before,
+            "target must not change on jitter"
+        );
     }
 
     // T12
@@ -929,8 +966,17 @@ mod tests {
         let target_after_first = cc.target_kbps();
 
         // Duplicate: same send_done_us
-        let (t, v) = cc.on_frame(ts + NORMAL_SERVICE + 1, ts + NORMAL_SERVICE, 10_000, INTERVAL_120FPS);
-        assert_eq!(v, CcVerdict::Skipped, "duplicate send_done_us must be Skipped");
+        let (t, v) = cc.on_frame(
+            ts + NORMAL_SERVICE + 1,
+            ts + NORMAL_SERVICE,
+            10_000,
+            INTERVAL_120FPS,
+        );
+        assert_eq!(
+            v,
+            CcVerdict::Skipped,
+            "duplicate send_done_us must be Skipped"
+        );
         assert_eq!(t, target_after_first);
     }
 
@@ -1053,7 +1099,11 @@ mod tests {
         // Deflate → Increase (service_us=0 triggers deflate; see T08 comment)
         let (t, v) = feed_n(&mut cc, deflate_frames, 0, &mut ts);
         check_bounds(t);
-        assert_eq!(v, CcVerdict::Increase, "expected Increase after deflate phase");
+        assert_eq!(
+            v,
+            CcVerdict::Increase,
+            "expected Increase after deflate phase"
+        );
     }
 
     // T21 — baseline_pollution_absolute_trigger_still_decreases
@@ -1100,7 +1150,10 @@ mod tests {
         let phase1_decrease = cc.target_kbps() < initial_target;
         // 혹시 쿨다운 중이면 소모
         feed_n(&mut cc, cooldown_frames + 1, congested_service, &mut ts);
-        assert!(phase1_decrease, "phase1 must get at least one Decrease (relative trigger active)");
+        assert!(
+            phase1_decrease,
+            "phase1 must get at least one Decrease (relative trigger active)"
+        );
 
         // Phase 2: window now full of congested samples → baseline = congested_service.
         // Relative score = smoothed/baseline = 1.0 → dead band. Only absolute trigger fires.
@@ -1126,7 +1179,10 @@ mod tests {
              target_before_phase2={target_before_phase2}, target_now={}",
             cc.target_kbps()
         );
-        assert!(cc.target_kbps() >= cc.config.min_kbps, "target must not fall below min_kbps");
+        assert!(
+            cc.target_kbps() >= cc.config.min_kbps,
+            "target must not fall below min_kbps"
+        );
     }
 
     // T22 — zero_interval_disables_absolute_trigger
@@ -1226,20 +1282,41 @@ mod tests {
     // T25 — pin: cooldown_frames sanitised to 1..=10_000 (finding #2)
     #[test]
     fn pin_cooldown_frames_sanitised() {
-        let cc0 = CcController::new(CcConfig { cooldown_frames: 0, ..CcConfig::from_ceiling(20_000) });
-        assert_eq!(cc0.config.cooldown_frames, 1, "cooldown_frames=0 must clamp to 1");
+        let cc0 = CcController::new(CcConfig {
+            cooldown_frames: 0,
+            ..CcConfig::from_ceiling(20_000)
+        });
+        assert_eq!(
+            cc0.config.cooldown_frames, 1,
+            "cooldown_frames=0 must clamp to 1"
+        );
 
-        let cc_max = CcController::new(CcConfig { cooldown_frames: u32::MAX, ..CcConfig::from_ceiling(20_000) });
-        assert_eq!(cc_max.config.cooldown_frames, 10_000, "cooldown_frames=u32::MAX must clamp to 10_000");
+        let cc_max = CcController::new(CcConfig {
+            cooldown_frames: u32::MAX,
+            ..CcConfig::from_ceiling(20_000)
+        });
+        assert_eq!(
+            cc_max.config.cooldown_frames, 10_000,
+            "cooldown_frames=u32::MAX must clamp to 10_000"
+        );
 
-        let cc5 = CcController::new(CcConfig { cooldown_frames: 5, ..CcConfig::from_ceiling(20_000) });
-        assert_eq!(cc5.config.cooldown_frames, 5, "cooldown_frames=5 must pass through");
+        let cc5 = CcController::new(CcConfig {
+            cooldown_frames: 5,
+            ..CcConfig::from_ceiling(20_000)
+        });
+        assert_eq!(
+            cc5.config.cooldown_frames, 5,
+            "cooldown_frames=5 must pass through"
+        );
     }
 
     // T26 — pin: budget_factor 상한 clamp → product 유한 보장 (finding #4)
     #[test]
     fn pin_budget_factor_large_no_silent_disable() {
-        let cfg = CcConfig { budget_factor: f64::MAX, ..CcConfig::from_ceiling(20_000) };
+        let cfg = CcConfig {
+            budget_factor: f64::MAX,
+            ..CcConfig::from_ceiling(20_000)
+        };
         let cc = CcController::new(cfg);
         assert!(
             cc.config.budget_factor.is_finite() && cc.config.budget_factor <= 1e6,
@@ -1248,7 +1325,10 @@ mod tests {
         );
         // clamp 후 product도 유한 → 절대 트리거가 묵음 비활성화되지 않음
         let product = cc.config.budget_factor * (u64::MAX as f64);
-        assert!(product.is_finite(), "budget_factor * u64::MAX must be finite after clamp");
+        assert!(
+            product.is_finite(),
+            "budget_factor * u64::MAX must be finite after clamp"
+        );
     }
 
     // T23 — budget_factor_nonfinite_sanitised
@@ -1275,7 +1355,10 @@ mod tests {
             cc.config.budget_factor.is_finite() && cc.config.budget_factor > 0.0,
             "budget_factor must be sanitised to a finite positive value"
         );
-        assert_eq!(cc.config.budget_factor, 1.0, "NaN budget_factor must sanitise to 1.0");
+        assert_eq!(
+            cc.config.budget_factor, 1.0,
+            "NaN budget_factor must sanitise to 1.0"
+        );
         // Also verify the controller works normally after sanitisation
         assert_eq!(cc.target_kbps(), 20_000);
     }
@@ -1312,7 +1395,11 @@ mod tests {
         let g = s.begin_generation();
         s.post_loss_for(g, 128);
         assert_eq!(s.take_loss_for(g), Some(0.5));
-        assert_eq!(s.take_loss_for(g), None, "a report must never be returned twice");
+        assert_eq!(
+            s.take_loss_for(g),
+            None,
+            "a report must never be returned twice"
+        );
     }
 
     // W04 — latest-wins overwrite: two posts between drains keep only the
@@ -1370,7 +1457,11 @@ mod tests {
         assert_eq!(s.take_loss_for(g1), None, "ghost must not steal the report");
         assert_eq!(s.take_loss_for(g2), Some(0.25), "owner still receives it");
         s.post_loss_for(g1, 200); // stale post is dropped at the write side
-        assert_eq!(s.take_loss_for(g2), None, "stale post must not be delivered");
+        assert_eq!(
+            s.take_loss_for(g2),
+            None,
+            "stale post must not be delivered"
+        );
     }
 
     // W12 — a loss-triggered MD must also cancel accumulated deflate momentum
@@ -1388,16 +1479,27 @@ mod tests {
         // service_us=0 is the reliable deflate trigger (see T08). Stop one
         // frame short of the probe-up threshold.
         let (_, v) = feed_n(&mut cc, deflate_frames - 1, 0, &mut ts);
-        assert_ne!(v, CcVerdict::Increase, "precondition: probe must not have fired yet");
+        assert_ne!(
+            v,
+            CcVerdict::Increase,
+            "precondition: probe must not have fired yet"
+        );
 
         let after_loss = cc.on_loss_report(0.5);
-        assert_eq!(after_loss, 17_000, "≥threshold loss must multiplicatively decrease");
+        assert_eq!(
+            after_loss, 17_000,
+            "≥threshold loss must multiplicatively decrease"
+        );
 
         // The frame carrying the loss is still under-budget. Without the
         // deflate reset it would be the deflate_frames-th consecutive deflate
         // frame and immediately reverse the decrease.
         let (t, v) = feed_n(&mut cc, 1, 0, &mut ts);
-        assert_ne!(v, CcVerdict::Increase, "loss MD must not be reversed by stale deflate momentum");
+        assert_ne!(
+            v,
+            CcVerdict::Increase,
+            "loss MD must not be reversed by stale deflate momentum"
+        );
         assert_eq!(t, 17_000, "target must hold at the post-loss value");
     }
 
@@ -1410,7 +1512,11 @@ mod tests {
         s.post_loss_for(g1, 30);
         let g2 = s.begin_generation();
         assert!(g2 > g1);
-        assert_eq!(s.take_loss_for(g2), None, "unread pre-setup loss must be discarded");
+        assert_eq!(
+            s.take_loss_for(g2),
+            None,
+            "unread pre-setup loss must be discarded"
+        );
     }
 
     // W06 — frame interval set/get; 0 = unknown stays representable.

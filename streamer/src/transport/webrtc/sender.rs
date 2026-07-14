@@ -408,9 +408,7 @@ async fn sample_sender<Track>(
                 cc.controller.on_loss_report(loss);
             }
 
-            let send_start_us = send_started
-                .saturating_duration_since(cc_epoch)
-                .as_micros() as u64;
+            let send_start_us = send_started.saturating_duration_since(cc_epoch).as_micros() as u64;
             let send_done_us = Instant::now()
                 .saturating_duration_since(cc_epoch)
                 .as_micros() as u64;

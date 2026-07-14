@@ -60,9 +60,7 @@ use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::S
 
 use crate::{
     audio::StreamAudioDecoder,
-    bitrate_apply::{
-        BitrateApplyMachine, BitrateApplyStatus, HostBitrateControl,
-    },
+    bitrate_apply::{BitrateApplyMachine, BitrateApplyStatus, HostBitrateControl},
     dynamic_ice_servers::load_dynamic_ice_servers,
     transport::{
         InboundPacket, OutboundPacket, TransportError, TransportEvent, TransportEvents,
@@ -999,10 +997,8 @@ impl StreamConnection {
                         if let Some(wire_status) =
                             crate::bitrate_apply::AckStatus::from_wire(raw_status)
                         {
-                            let now_ms =
-                                started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                            if let Some(new_status) =
-                                machine.handle_ack(applied_kbps, wire_status)
+                            let now_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                            if let Some(new_status) = machine.handle_ack(applied_kbps, wire_status)
                             {
                                 trace!(
                                     applied_kbps,
@@ -1011,7 +1007,12 @@ impl StreamConnection {
                                     "0x5509 ACK received"
                                 );
                                 // Record ack_latency_ms when transitioning to Applied
-                                if let BitrateApplyStatus::Applied { requested_kbps, applied_kbps: ak, tier } = &new_status {
+                                if let BitrateApplyStatus::Applied {
+                                    requested_kbps,
+                                    applied_kbps: ak,
+                                    tier,
+                                } = &new_status
+                                {
                                     let _ = (requested_kbps, ak, tier, now_ms); // placeholders: benchmark schema v2 (f1-ack.md §4)
                                 }
                             }
@@ -1062,9 +1063,10 @@ impl StreamConnection {
                     BitrateApplyStatus::PendingAck { kbps, .. } => {
                         (*kbps, RuntimeBitrateControlState::SentUnacknowledged)
                     }
-                    BitrateApplyStatus::Applied { requested_kbps, .. } => {
-                        (*requested_kbps, RuntimeBitrateControlState::SentUnacknowledged)
-                    }
+                    BitrateApplyStatus::Applied { requested_kbps, .. } => (
+                        *requested_kbps,
+                        RuntimeBitrateControlState::SentUnacknowledged,
+                    ),
                     BitrateApplyStatus::ApplyFailed { requested_kbps, .. } => {
                         (*requested_kbps, RuntimeBitrateControlState::SendFailed)
                     }
@@ -1143,7 +1145,11 @@ impl StreamConnection {
                             "awaiting 0x5509 ACK from host"
                         );
                     }
-                    BitrateApplyStatus::Applied { requested_kbps, applied_kbps, tier } => {
+                    BitrateApplyStatus::Applied {
+                        requested_kbps,
+                        applied_kbps,
+                        tier,
+                    } => {
                         info!(
                             target_kbps = target,
                             requested_kbps,
@@ -1153,7 +1159,10 @@ impl StreamConnection {
                             "host confirmed bitrate request via 0x5509 ACK"
                         );
                     }
-                    BitrateApplyStatus::ApplyFailed { requested_kbps, status: ack_status } => {
+                    BitrateApplyStatus::ApplyFailed {
+                        requested_kbps,
+                        status: ack_status,
+                    } => {
                         warn!(
                             target_kbps = target,
                             requested_kbps,

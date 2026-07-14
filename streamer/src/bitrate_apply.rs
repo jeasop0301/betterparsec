@@ -472,14 +472,20 @@ mod tests {
         let mut machine = BitrateApplyMachine::default();
         machine.enable_ack_tracking();
         machine.poll(8_000, 1_000, |_| BitrateApplyOutcome::SentUnacknowledged);
-        assert_eq!(machine.poll(8_000, 1_000 + 2_999, |_| panic!("pending")), None);
+        assert_eq!(
+            machine.poll(8_000, 1_000 + 2_999, |_| panic!("pending")),
+            None
+        );
         assert_eq!(
             machine.poll(8_000, 1_000 + 3_000, |_| panic!("timeout transition only")),
             Some(BitrateApplyStatus::AckTimeout { kbps: 8_000 })
         );
         // Late ACK after the timeout is discarded.
         assert_eq!(machine.handle_ack(8_000, AckStatus::Dispatched), None);
-        assert_eq!(machine.status(), &BitrateApplyStatus::AckTimeout { kbps: 8_000 });
+        assert_eq!(
+            machine.status(),
+            &BitrateApplyStatus::AckTimeout { kbps: 8_000 }
+        );
         // Retry proceeds under normal gate rules (new target, interval ok).
         assert_eq!(
             machine.poll(6_000, 10_000, |_| BitrateApplyOutcome::SentUnacknowledged),

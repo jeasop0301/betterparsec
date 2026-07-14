@@ -428,11 +428,29 @@ impl StreamConnection {
         });
 
         if let Some(old_transport) = old_transport {
-            spawn(async move {
-                if let Err(err) = old_transport.close().await {
-                    warn!("Failed to close old transport: {err:?}");
-                }
-            });
+            // Await (bounded) instead of fire-and-forget: a lingering ICE agent
+            // keeps its EphemeralUDP ports bound, and a rapid SetTransport retry
+            // can then fail to bind the 50000-50100 range (2026-07-14 ICE
+            // reconnect investigation — port-exhaustion amplifier).
+            match tokio::time::timeout(Duration::from_secs(5), old_transport.close()).await {
+                Ok(Err(err)) => warn!("Failed to close old transport: {err:?}"),
+                Err(_) => warn!("Old transport close timed out after 5s; continuing"),
+                Ok(Ok(())) => {}
+            }
+        }
+    }
+
+    /// Close and drop the current transport before a replacement binds its own
+    /// sockets. Called at the top of SetTransport handling so the old ICE
+    /// agent's UDP ports are released before `webrtc::new` allocates the range.
+    async fn close_current_transport(self: &Arc<Self>) {
+        let old = { self.transport_sender.lock().await.take() };
+        if let Some(old) = old {
+            match tokio::time::timeout(Duration::from_secs(5), old.close()).await {
+                Ok(Err(err)) => warn!("Failed to close old transport: {err:?}"),
+                Err(_) => warn!("Old transport close timed out after 5s; continuing"),
+                Ok(Ok(())) => {}
+            }
         }
     }
     async fn try_send_packet(&self, packet: OutboundPacket, packet_ty: &str, should_warn: bool) {
@@ -650,6 +668,10 @@ impl StreamConnection {
                     TransportType::WebRTC if self.permissions.allow_transport_webrtc => {
                         info!("Trying WebRTC transport");
 
+                        // Release the previous ICE agent's UDP ports BEFORE the
+                        // new EphemeralUDP binds the same configured range.
+                        self.close_current_transport().await;
+
                         let (sender, events) = match webrtc::new(
                             &self.config.webrtc,
                             self.video_frame_queue_size,
@@ -667,6 +689,10 @@ impl StreamConnection {
                     }
                     TransportType::WebSocket if self.permissions.allow_transport_websockets => {
                         info!("Trying Web Socket transport");
+
+                        // Same ordering as the WebRTC arm: release the old
+                        // transport (and its ports) before creating the new one.
+                        self.close_current_transport().await;
 
                         let (sender, events) = match web_socket::new().await {
                             Ok(value) => value,

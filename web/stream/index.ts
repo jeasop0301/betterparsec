@@ -407,7 +407,15 @@ export class Stream implements Component {
 
     private setTransport(transport: Transport) {
         if (this.transport) {
-            this.transport.close()
+            const oldTransport = this.transport
+            // Detach signaling before closing: a still-gathering old WebRTC
+            // peer must not route stale ICE candidates (with the previous
+            // ufrag) into the WebSocket after the swap (2026-07-14 ICE
+            // reconnect investigation - candidate-misrouting amplifier).
+            if (oldTransport instanceof WebRTCTransport) {
+                oldTransport.onsendmessage = null
+            }
+            oldTransport.close()
         }
 
         this.transport = transport

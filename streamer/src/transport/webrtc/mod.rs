@@ -85,8 +85,6 @@ struct WebRtcInner {
     /// Unreliable, unordered DataChannel carrying FEC source + repair symbols
     /// from host to client (host → client only; no on_message handler needed).
     video_fec_channel: Arc<RTCDataChannel>,
-    /// Reliable, ordered DataChannel carrying window ACKs from client to host.
-    video_fec_ack_channel: Arc<RTCDataChannel>,
     video: Mutex<WebRtcVideo>,
     target_bitrate_kbps: Arc<AtomicU32>,
     cc_shared: Arc<CcShared>,
@@ -200,7 +198,6 @@ pub async fn new(
         stats_channel,
         input_channels: Default::default(),
         video_fec_channel: video_fec_channel.clone(),
-        video_fec_ack_channel: video_fec_ack_channel.clone(),
         video: Mutex::new(WebRtcVideo::new(
             runtime.clone(),
             Arc::downgrade(&peer),

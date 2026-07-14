@@ -9,6 +9,9 @@ use crate::fec;
 
 /// Maximum on-wire size for a single `video_fec` message (source symbol).
 /// Repair symbols may slightly exceed this; that is accepted and documented.
+// Wire-spec constant: production budget lives in CHUNK_FRAGMENT_MAX; this is
+// referenced by tests and the M6 native client (fec-framing.md §8).
+#[allow(dead_code)]
 pub const FEC_MSG_MAX: usize = 1200;
 
 /// Byte length of the chunk header (frame_id u32 + chunk_index u16 +
@@ -22,6 +25,11 @@ pub const CHUNK_FRAGMENT_MAX: usize = 1182;
 // ── Chunk layer ───────────────────────────────────────────────────────────
 
 /// Parsed chunk header fields.
+// Receive-side wire API: the production consumer is the TS client
+// (web/stream/video/fec_wire.ts); the Rust parse half is exercised by the
+// in-module + cross-vector tests and is the contract for the M6 native
+// client's cdylib receiver (m6-native-spike.md Option-3).
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkHeader {
     pub frame_id: u32,
@@ -99,6 +107,7 @@ fn encode_chunk(
 
 /// Parse the first 13 bytes as a [`ChunkHeader`] and return the remaining
 /// bytes as the fragment.  Returns `None` if the slice is shorter than 13.
+#[allow(dead_code)] // receive-side wire API: tests + M6 native client (fec-framing.md §8)
 pub fn parse_chunk_header(buf: &[u8]) -> Option<(ChunkHeader, &[u8])> {
     if buf.len() < CHUNK_HEADER_LEN {
         return None;
@@ -141,6 +150,7 @@ pub fn encode_symbol_msg(sym: &fec::Symbol) -> Vec<u8> {
 
 /// Deserialise a `video_fec` wire message into a [`fec::Symbol`].
 /// Returns `None` on truncated or unknown-kind input.
+#[allow(dead_code)] // receive-side wire API: tests + M6 native client (fec-framing.md §8)
 pub fn parse_symbol_msg(buf: &[u8]) -> Option<fec::Symbol> {
     let kind = *buf.first()?;
     match kind {
@@ -208,6 +218,7 @@ pub fn parse_ack_msg(buf: &[u8]) -> Option<AckMsg> {
 }
 
 /// Encode an [`AckMsg`] to its wire bytes.
+#[allow(dead_code)] // receive-side wire API: tests + M6 native client (fec-framing.md §8)
 pub fn encode_ack_msg(msg: &AckMsg) -> Vec<u8> {
     match msg {
         AckMsg::Subscribe => vec![0x01],

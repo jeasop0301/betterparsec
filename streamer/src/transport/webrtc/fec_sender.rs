@@ -82,13 +82,15 @@ enum AckCmd {
 // ── Handle ────────────────────────────────────────────────────────────────
 
 /// Cheap-clone handle held by `WebRtcVideo`.
+///
+/// The generation ghost-writer guard lives in the task itself: `spawn` hands
+/// the shared counter (`WebRtcVideo::fec_generation`) directly to
+/// `run_fec_sender`, which exits when it no longer matches `own_generation`.
+/// The handle deliberately does not keep its own copy.
 #[derive(Clone)]
 pub(crate) struct FecSenderHandle {
     /// `true` once the client sends SUBSCRIBE; enqueues are no-ops until then.
     pub(crate) active: Arc<AtomicBool>,
-    /// Shared generation counter (same `Arc` as `WebRtcVideo::fec_generation`).
-    /// The sender task exits when this no longer matches its `own_generation`.
-    pub(crate) generation: Arc<AtomicU32>,
     queue: Arc<Mutex<VecDeque<FecFrame>>>,
     queue_notify: Arc<Notify>,
     ack_tx: mpsc::Sender<AckCmd>,
@@ -113,7 +115,6 @@ impl FecSenderHandle {
 
         let handle = FecSenderHandle {
             active: active.clone(),
-            generation: generation.clone(),
             queue: queue.clone(),
             queue_notify: queue_notify.clone(),
             ack_tx,

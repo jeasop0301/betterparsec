@@ -370,12 +370,12 @@ impl WebRtcVideo {
         // is_active() is one AtomicBool::load — the only per-frame overhead
         // when the client has not yet subscribed (default dormant state).
         // timestamp_us is truncated to u32, matching the existing WS data path.
-        if let Some(fec) = &self.fec_handle {
-            if fec.is_active() {
-                let ts_us = unit.timestamp.as_micros() as u32;
-                fec.enqueue(Bytes::copy_from_slice(&full_frame), important, ts_us)
-                    .await;
-            }
+        if let Some(fec) = &self.fec_handle
+            && fec.is_active()
+        {
+            let ts_us = unit.timestamp.as_micros() as u32;
+            fec.enqueue(Bytes::copy_from_slice(&full_frame), important, ts_us)
+                .await;
         }
 
         match &mut self.codec {

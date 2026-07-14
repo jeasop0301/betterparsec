@@ -5,3 +5,4 @@
 
 pub mod fec;
 pub mod fec_wire;
+pub mod video_rx;

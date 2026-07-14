@@ -19,13 +19,10 @@ use tracing_subscriber::{
 };
 use venator::Venator;
 
-use crate::{
-    cli::{Cli, Command},
-    human_json::preprocess_human_json,
-};
+use crate::cli::{Cli, Command};
+use web_server::human_json::preprocess_human_json;
 
 mod cli;
-mod human_json;
 
 #[actix_web::main]
 async fn main() {

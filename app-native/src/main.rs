@@ -11,6 +11,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod host;
 #[cfg(all(windows, feature = "video"))]
 mod audio;
 #[cfg(all(windows, feature = "video"))]
@@ -356,6 +357,10 @@ struct App {
     host_id_text: String,
     app_id_text: String,
     running: Option<Running>,
+    /// Host role (D1): embedded web-server; independent of the client
+    /// session ("both" is the LAN-party topology).
+    host: Option<host::Host>,
+    host_error: Option<String>,
     /// Uploaded stream texture (egui fallback present, slice 2).
     #[cfg(feature = "video")]
     video_tex: Option<eframe::egui::TextureHandle>,
@@ -378,6 +383,8 @@ impl App {
             app_id_text: form.app_id.to_string(),
             form,
             running: None,
+            host: None,
+            host_error: None,
             #[cfg(feature = "video")]
             video_tex: None,
             #[cfg(feature = "video")]
@@ -386,6 +393,54 @@ impl App {
             surface: None,
             #[cfg(all(windows, feature = "video"))]
             surface_failed: false,
+        }
+    }
+
+    /// Host role strip (D1): start/stop the embedded web-server. Rendered
+    /// on every screen — hosting and a client session may run together.
+    fn host_section(&mut self, ui: &mut eframe::egui::Ui) {
+        let mut start_clicked = false;
+        let mut stop_clicked = false;
+        ui.horizontal(|ui| match &self.host {
+            None => {
+                start_clicked = ui.button("Start host").clicked();
+                ui.small("embedded web-server (accounts/pairing/signaling)");
+            }
+            Some(h) => {
+                stop_clicked = ui.button("Stop host").clicked();
+                ui.label(format!(
+                    "hosting on {} ({})",
+                    h.server
+                        .addrs()
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    match h.config_source {
+                        host::ConfigSource::File =>
+                            format!("config: {}", h.config_path.display()),
+                        host::ConfigSource::BuiltinDefault => "default config".into(),
+                    },
+                ));
+            }
+        });
+        if start_clicked {
+            match host::start(std::path::Path::new(host::DEFAULT_CONFIG_PATH)) {
+                Ok(h) => {
+                    self.host = Some(h);
+                    self.host_error = None;
+                }
+                Err(e) => {
+                    tracing::error!(err = %e, "host role start failed");
+                    self.host_error = Some(e);
+                }
+            }
+        }
+        if stop_clicked && let Some(h) = self.host.take() {
+            h.server.stop();
+        }
+        if let Some(e) = &self.host_error {
+            ui.colored_label(eframe::egui::Color32::RED, format!("host: {e}"));
         }
     }
 }
@@ -403,8 +458,10 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("BetterParsec — A0 client first light");
+            ui.heading("BetterParsec");
             ui.add_space(8.0);
+            self.host_section(ui);
+            ui.separator();
 
             match &self.running {
                 None => {

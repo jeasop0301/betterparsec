@@ -429,9 +429,11 @@ dependencies = [
  "libc",
  "moonlight-common",
  "raw-window-handle",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
  "transport-core",
+ "web-server",
  "windows",
 ]
 

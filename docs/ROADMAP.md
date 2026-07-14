@@ -140,11 +140,21 @@ U5/M6 스파이크, f1-ack 소스 확인+0x5509 호스트 패치.
    래퍼로 축소, actix 서비스·클라 프로토콜 무변경. 검증 =
    `embedded_server_boots_serves_and_stops`(에페메랄 포트 부팅→raw
    HTTP 응답→graceful stop) 포함 lib 20 + bin 22 tests,
-   clippy --all-targets 클린. 잔여 = **라이브 첫
-   픽셀+소리+조작**(owner 스모크, 5분, 슬라이스 2–4+A2 동시 판정) →
-   A1 슬라이스 2: app-native host 롤(임베드 기동 + Sunshine/streamer
-   서브프로세스 관리) · 상대 마우스+immersive는 M4
-   `session-ux`(Phase B).
+   clippy --all-targets 클린. **A1 슬라이스 2 완료** (2026-07-14,
+   헤드리스 검증): app-native **host 롤** — `web_server::spawn_embedded`
+   (전용 actix 스레드, graceful stop+join, 바인드 충돌은 에러로 표면화,
+   rustls provider 설치 레이스-세이프化) + `host.rs`(표준 서버와 동일한
+   `./server/config.json` human-json 로드, 파싱 오류는 기본값 silent
+   override 대신 표면화) + egui host 스트립(Start/Stop, 바인드 주소·
+   config 출처 표시, 클라 세션과 동시 가동=both 토폴로지). streamer는
+   임베디드 서버가 exe 옆에서 해석·스폰(기존 경로 규약 그대로,
+   betterparsec.exe와 co-locate). 검증 = web-server 44 tests(스레드
+   임베더 sync HTTP 왕복·바인드 충돌) + app-native 3/18 tests(host 롤
+   부팅→HTTP→stop, config 폴백/오류), clippy 클린. 잔여 = **라이브
+   스모크**(owner: ①클라 5분 — 슬라이스 2–4+A2 픽셀·소리·조작,
+   ②host 롤 — 웹 클라가 betterparsec.exe 호스트로 paired 접속) →
+   A1 슬라이스 3: Foundation Sunshine 서브프로세스 관리(stage/identity
+   스크립트→Rust) · 상대 마우스+immersive는 M4 `session-ux`(Phase B).
 5. Gate B 2-machine 첫 신뢰 run — 이후 U1 CC 신호 판정, U2 P2 손실 복구
    실측·비율 튜닝, U3/U5 지연 계측이 전부 이 위에서 순차 판정된다.
 

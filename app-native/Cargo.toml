@@ -11,8 +11,10 @@ path = "src/main.rs"
 [dependencies]
 client-transport = { path = "../client-transport" }
 transport-core = { workspace = true }
-# A2 input: wire-format single source (InboundPacket) + its field types.
-common = { workspace = true, optional = true }
+# A1 host role: embedded account/pairing/signaling server (design D1/D3).
+web-server = { path = ".." }
+common = { workspace = true }
+# A2 input: wire-format field types (common::input_wire re-uses them).
 moonlight-common = { workspace = true, optional = true }
 
 # A0 shell: egui via eframe (glow backend — the stream surface will live on
@@ -62,9 +64,12 @@ video = [
     "dep:ffmpeg-sys-next",
     "dep:libc",
     "dep:windows",
-    "dep:common",
     "dep:moonlight-common",
 ]
+
+[dev-dependencies]
+# host.rs tests serialize a Config fixture instead of hand-writing JSON.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

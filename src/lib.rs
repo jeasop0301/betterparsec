@@ -31,14 +31,29 @@ use crate::{
 
 mod api;
 mod app;
+pub mod human_json;
 mod web;
 
-pub fn ensure_rustls_crypto_provider() {
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("failed to install the rustls ring crypto provider");
+/// Read and parse a config file in the human-json format the CLI accepts.
+/// `Ok(None)` when the file does not exist (caller decides the default).
+pub fn load_config_file(path: &std::path::Path) -> Result<Option<Config>, anyhow::Error> {
+    use anyhow::Context;
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let json = human_json::preprocess_human_json(text);
+            let config = serde_json::from_str(&json)
+                .with_context(|| format!("invalid config file {}", path.display()))?;
+            Ok(Some(config))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("read {}", path.display()))),
     }
+}
+
+pub fn ensure_rustls_crypto_provider() {
+    // Idempotent and race-safe: install_default fails only when another
+    // thread won the race, which leaves a provider installed either way.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 struct ActixDebugSpan;
@@ -164,6 +179,82 @@ pub async fn start(config: Config) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+// ── Embedded runner (unified app host role) ────────────────────────────────
+
+/// A server running on its own thread with a dedicated actix `System`.
+/// The embedder needs no actix/tokio of its own; [`EmbeddedServer::stop`]
+/// (or `Drop`) shuts it down gracefully and joins the thread.
+pub struct EmbeddedServer {
+    addrs: Vec<SocketAddr>,
+    handle: actix_web::dev::ServerHandle,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EmbeddedServer {
+    /// The concrete bind addresses (port 0 resolved).
+    pub fn addrs(&self) -> &[SocketAddr] {
+        &self.addrs
+    }
+
+    /// Graceful stop; joins the server thread.
+    pub fn stop(mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(t) = self.thread.take() {
+            futures::executor::block_on(self.handle.stop(true));
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for EmbeddedServer {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Bind and run the server on a dedicated thread. Returns once the bind
+/// completed (or failed) — the caller thread never touches actix.
+pub fn spawn_embedded(config: Config) -> Result<EmbeddedServer, anyhow::Error> {
+    ensure_rustls_crypto_provider();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread = std::thread::Builder::new()
+        .name("bp-web-server".into())
+        .spawn(move || {
+            actix_web::rt::System::new().block_on(async move {
+                match build(config).await {
+                    Ok(bound) => {
+                        let handle = bound.server.handle();
+                        let _ = tx.send(Ok((bound.addrs, handle)));
+                        if let Err(e) = bound.server.await {
+                            tracing::error!("embedded web-server exited with error: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                    }
+                }
+            });
+        })?;
+    match rx.recv() {
+        Ok(Ok((addrs, handle))) => Ok(EmbeddedServer {
+            addrs,
+            handle,
+            thread: Some(thread),
+        }),
+        Ok(Err(e)) => {
+            let _ = thread.join();
+            Err(e)
+        }
+        Err(_) => {
+            let _ = thread.join();
+            Err(anyhow::anyhow!("embedded web-server thread died during bind"))
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -171,6 +262,25 @@ mod tests {
     use moonlight_common::http::client::{
         async_client::RequestClient, tokio_hyper::TokioHyperClient,
     };
+
+    fn test_config(tag: &str) -> (common::config::Config, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "bp-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let mut config = common::config::Config::default();
+        config.data_storage = common::config::StorageConfig::Json {
+            path: dir.join("data.json").to_string_lossy().into_owned(),
+            session_expiration_check_interval: std::time::Duration::from_secs(3600),
+        };
+        config.web_server.bind_address = "127.0.0.1:0".parse().expect("addr");
+        config.web_server.certificate = None;
+        (config, dir)
+    }
 
     #[test]
     fn moonlight_https_client_can_be_constructed() {
@@ -186,21 +296,7 @@ mod tests {
     async fn embedded_server_boots_serves_and_stops() {
         ensure_rustls_crypto_provider();
 
-        let dir = std::env::temp_dir().join(format!(
-            "bp-embed-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let mut config = common::config::Config::default();
-        config.data_storage = common::config::StorageConfig::Json {
-            path: dir.join("data.json").to_string_lossy().into_owned(),
-            session_expiration_check_interval: std::time::Duration::from_secs(3600),
-        };
-        config.web_server.bind_address = "127.0.0.1:0".parse().expect("addr");
-        config.web_server.certificate = None;
+        let (config, dir) = test_config("embed-test");
 
         let bound = super::build(config).await.expect("build embedded server");
         let addr = bound.addrs[0];
@@ -226,5 +322,45 @@ mod tests {
         handle.stop(true).await;
         join.await.expect("server task").expect("server exit");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The threaded embedder (unified app host role): no actix runtime on
+    /// the caller side, sync HTTP answer, graceful stop joins the thread.
+    #[test]
+    fn spawn_embedded_serves_without_caller_runtime() {
+        let (config, dir) = test_config("spawn-test");
+        let server = super::spawn_embedded(config).expect("spawn embedded server");
+        let addr = server.addrs()[0];
+        assert_ne!(addr.port(), 0);
+
+        use std::io::{Read, Write};
+        let mut sock = std::net::TcpStream::connect(addr).expect("connect");
+        sock.write_all(b"GET /api/config.js HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .expect("send request");
+        let mut response = Vec::new();
+        sock.read_to_end(&mut response).expect("read response");
+        assert!(
+            response.starts_with(b"HTTP/1.1 "),
+            "embedded server answered HTTP"
+        );
+
+        server.stop(); // joins the bp-web-server thread
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bind failures surface as errors instead of a wedged thread.
+    #[test]
+    fn spawn_embedded_reports_bind_conflict() {
+        let (config, dir) = test_config("spawn-conflict");
+        let first = super::spawn_embedded(config).expect("first bind");
+        let (mut config2, dir2) = test_config("spawn-conflict2");
+        config2.web_server.bind_address = first.addrs()[0];
+        assert!(
+            super::spawn_embedded(config2).is_err(),
+            "second bind on the same port must fail cleanly"
+        );
+        first.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }

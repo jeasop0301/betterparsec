@@ -6,6 +6,7 @@ use std::{
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicU32, Ordering},
+        mpsc,
     },
     time::{Duration, Instant},
 };
@@ -59,7 +60,9 @@ use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::S
 
 use crate::{
     audio::StreamAudioDecoder,
-    bitrate_apply::{BitrateApplyMachine, BitrateApplyStatus, HostBitrateControl},
+    bitrate_apply::{
+        BitrateApplyMachine, BitrateApplyStatus, HostBitrateControl,
+    },
     dynamic_ice_servers::load_dynamic_ice_servers,
     transport::{
         InboundPacket, OutboundPacket, TransportError, TransportEvent, TransportEvents,
@@ -838,6 +841,22 @@ impl StreamConnection {
             HostFeatures::default()
         });
 
+        // f1-ack.md §3: arm ACK tracking only when BOTH 0x40 AND 0x80 are set.
+        let ack_rx = if host_features.dynamic_bitrate_ack {
+            let (ack_tx, ack_rx) = mpsc::sync_channel::<(u32, u32)>(8);
+            MoonlightStream::register_bitrate_ack_callback(Some(move |applied_kbps, status| {
+                // Called on the C control-receive thread — must not block.
+                let _ = ack_tx.try_send((applied_kbps, status));
+            }));
+            info!(
+                ack_capable = true,
+                "0x5509 ACK tracking armed; arming BitrateApplyMachine"
+            );
+            Some(ack_rx)
+        } else {
+            None
+        };
+
         let capabilities = StreamCapabilities {
             touch: host_features.controller_touch,
         };
@@ -903,8 +922,14 @@ impl StreamConnection {
         };
 
         if let Some(target) = runtime_bitrate_target {
-            self.start_runtime_bitrate_task(target, runtime_cc_shared, settings.bitrate)
-                .await;
+            self.start_runtime_bitrate_task(
+                target,
+                runtime_cc_shared,
+                settings.bitrate,
+                host_features.dynamic_bitrate_ack,
+                ack_rx,
+            )
+            .await;
         }
 
         Ok(())
@@ -915,6 +940,8 @@ impl StreamConnection {
         target_kbps: Arc<AtomicU32>,
         cc_shared: Option<Arc<cc::CcShared>>,
         initial_bitrate_kbps: u32,
+        ack_capable: bool,
+        ack_rx: Option<mpsc::Receiver<(u32, u32)>>,
     ) {
         let mut task_guard = self.runtime_bitrate_task.lock().await;
         if let Some(old_task) = task_guard.take() {
@@ -927,6 +954,11 @@ impl StreamConnection {
             let mut ticker = interval(Duration::from_millis(500));
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let mut machine = BitrateApplyMachine::new(initial_bitrate_kbps);
+            if ack_capable {
+                // f1-ack.md §3: arm only when 0x40 ∧ 0x80 (already checked by
+                // host_features.dynamic_bitrate_ack before reaching this point).
+                machine.enable_ack_tracking();
+            }
             let mut attempts = 0u32;
 
             loop {
@@ -934,6 +966,35 @@ impl StreamConnection {
                 let Some(connection) = connection.upgrade() else {
                     return;
                 };
+
+                // Drain any 0x5509 ACKs that arrived since the last tick.
+                // handle_ack silently discards late/unexpected ACKs.
+                if let Some(rx) = &ack_rx {
+                    while let Ok((applied_kbps, raw_status)) = rx.try_recv() {
+                        if let Some(wire_status) =
+                            crate::bitrate_apply::AckStatus::from_wire(raw_status)
+                        {
+                            let now_ms =
+                                started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                            if let Some(new_status) =
+                                machine.handle_ack(applied_kbps, wire_status)
+                            {
+                                trace!(
+                                    applied_kbps,
+                                    raw_status,
+                                    ?new_status,
+                                    "0x5509 ACK received"
+                                );
+                                // Record ack_latency_ms when transitioning to Applied
+                                if let BitrateApplyStatus::Applied { requested_kbps, applied_kbps: ak, tier } = &new_status {
+                                    let _ = (requested_kbps, ak, tier, now_ms); // placeholders: benchmark schema v2 (f1-ack.md §4)
+                                }
+                            }
+                        } else {
+                            trace!(raw_status, "0x5509 ACK: unknown status value; discarding");
+                        }
+                    }
+                }
 
                 // Compose the ABR (RTCP-driven) and frame-delay CC (sender-loop
                 // driven) targets; 0 = "no signal" on either side. See
@@ -967,13 +1028,24 @@ impl StreamConnection {
                         (*requested_kbps, RuntimeBitrateControlState::SendFailed)
                     }
                     BitrateApplyStatus::Idle => continue,
-                    // 0x5509 ACK states: unreachable while ack tracking stays
-                    // disarmed (f1-ack.md R-1/R-2 unverified). Telemetry
-                    // mapping is added together with the receive path.
-                    BitrateApplyStatus::PendingAck { .. }
-                    | BitrateApplyStatus::Applied { .. }
-                    | BitrateApplyStatus::ApplyFailed { .. }
-                    | BitrateApplyStatus::AckTimeout { .. } => continue,
+                    // 0x5509 ACK path: poll() transitions from AckTimeout to a
+                    // new PendingAck (next send). Applied/ApplyFailed are set by
+                    // handle_ack in the drain loop above; they are stable until
+                    // the next send, so poll() will not change them here (gate
+                    // enforces minimum send interval). Skip telemetry for these —
+                    // they are logged by the drain loop already.
+                    BitrateApplyStatus::PendingAck { kbps, .. } => {
+                        (*kbps, RuntimeBitrateControlState::SentUnacknowledged)
+                    }
+                    BitrateApplyStatus::Applied { requested_kbps, .. } => {
+                        (*requested_kbps, RuntimeBitrateControlState::SentUnacknowledged)
+                    }
+                    BitrateApplyStatus::ApplyFailed { requested_kbps, .. } => {
+                        (*requested_kbps, RuntimeBitrateControlState::SendFailed)
+                    }
+                    BitrateApplyStatus::AckTimeout { kbps } => {
+                        (*kbps, RuntimeBitrateControlState::SentUnacknowledged)
+                    }
                 };
                 connection
                     .try_send_packet(
@@ -1035,12 +1107,44 @@ impl StreamConnection {
                         );
                     }
                     BitrateApplyStatus::Idle => {}
-                    // Filtered out by the telemetry match above (ACK tracking
-                    // is disarmed until f1-ack.md R-1/R-2 are verified).
-                    BitrateApplyStatus::PendingAck { .. }
-                    | BitrateApplyStatus::Applied { .. }
-                    | BitrateApplyStatus::ApplyFailed { .. }
-                    | BitrateApplyStatus::AckTimeout { .. } => {}
+                    // ACK path: PendingAck is logged when sent; Applied/ApplyFailed
+                    // are logged in the ACK drain loop above; AckTimeout is a
+                    // transient state (next poll will retry).
+                    BitrateApplyStatus::PendingAck { kbps, .. } => {
+                        trace!(
+                            target_kbps = target,
+                            pending_kbps = kbps,
+                            status = "pending_ack",
+                            "awaiting 0x5509 ACK from host"
+                        );
+                    }
+                    BitrateApplyStatus::Applied { requested_kbps, applied_kbps, tier } => {
+                        info!(
+                            target_kbps = target,
+                            requested_kbps,
+                            applied_kbps,
+                            ?tier,
+                            status = "applied_dispatched",
+                            "host confirmed bitrate request via 0x5509 ACK"
+                        );
+                    }
+                    BitrateApplyStatus::ApplyFailed { requested_kbps, status: ack_status } => {
+                        warn!(
+                            target_kbps = target,
+                            requested_kbps,
+                            ?ack_status,
+                            status = "apply_failed",
+                            "host rejected bitrate request (0x5509 VALIDATION_FAILED or similar)"
+                        );
+                    }
+                    BitrateApplyStatus::AckTimeout { kbps } => {
+                        warn!(
+                            target_kbps = target,
+                            pending_kbps = kbps,
+                            status = "ack_timeout",
+                            "0x5509 ACK not received within 3000 ms; will retry"
+                        );
+                    }
                 }
             }
         });

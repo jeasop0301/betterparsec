@@ -1,8 +1,56 @@
 diff --git a/src/ControlStream.c b/src/ControlStream.c
-index 2b5182e..5c7dca0 100644
+index 2b5182e..667ab72 100644
 --- a/src/ControlStream.c
 +++ b/src/ControlStream.c
-@@ -2084,3 +2084,35 @@ bool LiGetHdrMetadata(PSS_HDR_METADATA metadata) {
+@@ -122,6 +122,11 @@ static PLT_EVENT idrFrameRequiredEvent;
+ static PPLT_CRYPTO_CONTEXT encryptionCtx;
+ static PPLT_CRYPTO_CONTEXT decryptionCtx;
+ 
++// 0x5509 bitrate ACK listener (BetterParsec/Foundation extension).
++// NULL = silently discard arriving 0x5509 packets (safe for unpatched hosts
++// that send no ACK -- see docs/design/f1-ack.md sec 6 R-2).
++static BitrateAckListener bitrateAckListener = NULL;
++
+ #define CONN_IMMEDIATE_POOR_LOSS_RATE 30
+ #define CONN_CONSECUTIVE_POOR_LOSS_RATE 15
+ #define CONN_OKAY_LOSS_RATE 5
+@@ -1374,6 +1379,35 @@ static void controlReceiveThreadFunc(void* context) {
+                 free(ctlHdr);
+                 return;
+             }
++            else if (ctlHdr->type == 0x5509) {
++                // 0x5509: host -> client bitrate ACK (BetterParsec/Foundation extension).
++                // Called on the control receive thread; listener must be cheap + thread-safe.
++                // 16-byte LE payload: parameter_type(4), request_seq(4), applied_kbps(4), status(4)
++                // (docs/design/f1-ack.md sec 2).
++                if (bitrateAckListener != NULL && packetLength >= (int)(sizeof(*ctlHdr) + 16)) {
++                    const uint8_t* p = (const uint8_t*)(ctlHdr + 1);
++                    uint32_t paramType   = (uint32_t)p[0]  | ((uint32_t)p[1]  << 8)
++                                        | ((uint32_t)p[2]  << 16) | ((uint32_t)p[3]  << 24);
++                    // p[4..7] = request_seq (reserved, always 0 in this revision -- skip)
++                    uint32_t appliedKbps = (uint32_t)p[8]  | ((uint32_t)p[9]  << 8)
++                                        | ((uint32_t)p[10] << 16) | ((uint32_t)p[11] << 24);
++                    uint32_t status      = (uint32_t)p[12] | ((uint32_t)p[13] << 8)
++                                        | ((uint32_t)p[14] << 16) | ((uint32_t)p[15] << 24);
++                    if (paramType == 2) {
++                        bitrateAckListener(appliedKbps, status);
++                    }
++                    else {
++                        Limelog("0x5509 ACK: unexpected parameter_type %u; discarding\n", paramType);
++                    }
++                }
++                else if (bitrateAckListener == NULL) {
++                    Limelog("0x5509 ACK: no listener registered; discarding\n");
++                }
++                else {
++                    Limelog("0x5509 ACK: malformed packet (length %d < %d); discarding\n",
++                            packetLength, (int)(sizeof(*ctlHdr) + 16));
++                }
++            }
+ 
+             free(ctlHdr);
+         }
+@@ -2084,3 +2118,39 @@ bool LiGetHdrMetadata(PSS_HDR_METADATA metadata) {
      *metadata = hdrMetadata;
      return true;
  }
@@ -38,11 +86,15 @@ index 2b5182e..5c7dca0 100644
 +
 +    return 0;
 +}
++
++void LiRegisterBitrateAckListener(BitrateAckListener listener) {
++    bitrateAckListener = listener;
++}
 diff --git a/src/Limelight.h b/src/Limelight.h
-index ac87a4b..88d18c6 100644
+index ac87a4b..d84478a 100644
 --- a/src/Limelight.h
 +++ b/src/Limelight.h
-@@ -569,6 +569,17 @@ const char* LiGetStageName(int stage);
+@@ -569,6 +569,31 @@ const char* LiGetStageName(int stage);
  // This function may only be called between LiStartConnection() and LiStopConnection().
  bool LiGetEstimatedRttInfo(uint32_t* estimatedRtt, uint32_t* estimatedRttVariance);
  
@@ -57,10 +109,24 @@ index ac87a4b..88d18c6 100644
 +// the compatible host implementation.
 +int LiChangeBitrate(int bitrateKbps);
 +
++// Callback invoked when a 0x5509 bitrate ACK packet arrives on the encrypted
++// control channel (BetterParsec/Foundation extension). Called on the control
++// receive thread -- must be cheap and thread-safe. appliedKbps is the clamped
++// bitrate the host accepted. status is the AckStatus enum value (u32 LE):
++//   0=DISPATCHED, 1=VALIDATION_FAILED, 2=ENCODER_APPLIED,
++//   3=ENCODER_FAILED, 4=UNSUPPORTED_PARAM.
++// Register NULL (the default) to silently discard 0x5509 packets.
++typedef void(*BitrateAckListener)(uint32_t appliedKbps, uint32_t status);
++
++// Register a listener for 0x5509 ACK packets. Safe to call before
++// LiStartConnection(). Pass NULL to deregister. The listener persists across
++// calls unless explicitly replaced or NULLed.
++void LiRegisterBitrateAckListener(BitrateAckListener listener);
++
  // This function queues a relative mouse move event to be sent to the remote server.
  int LiSendMouseMoveEvent(short deltaX, short deltaY);
  
-@@ -1002,6 +1013,10 @@ void LiRequestIdrFrame(void);
+@@ -1002,6 +1027,16 @@ void LiRequestIdrFrame(void);
  // This function returns any extended feature flags supported by the host.
  #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
  #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
@@ -68,6 +134,12 @@ index ac87a4b..88d18c6 100644
 +// accept the 0x5506 dynamic bitrate control message. Foundation currently uses
 +// 0x01 through 0x20; this next free bit must be coordinated before upstreaming.
 +#define LI_FF_DYNAMIC_BITRATE         0x40
++// Provisional BetterParsec/Foundation extension. Hosts advertising this bit
++// will send a 0x5509 ACK reply to each 0x5506 bitrate request. Requires
++// LI_FF_DYNAMIC_BITRATE (0x40) to also be set; do NOT infer ACK support from
++// 0x40 alone -- pre-ACK Foundation builds advertise 0x40 without 0x5509 support
++// (docs/design/f1-ack.md sec 3).
++#define LI_FF_DYNAMIC_BITRATE_ACK     0x80
  uint32_t LiGetHostFeatureFlags(void);
  
  #ifdef __cplusplus

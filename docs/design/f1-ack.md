@@ -322,11 +322,15 @@ for the residual multi-request edge.
 
 ## Implementation order — status (2026-07-14)
 
-1. [ ] Define `LI_FF_DYNAMIC_BITRATE_ACK = 0x80` in `moonlight-common-c.patch`
+1. [x] Define `LI_FF_DYNAMIC_BITRATE_ACK = 0x80` in `moonlight-common-c.patch`
    **plus** the `0x5509` receive branch in `controlReceiveThreadFunc` and a
-   callback registration (R-2 resolution showed the bit alone is not enough —
+   callback registration (R-2 resolution showed the bit alone is not enough --
    without the branch the ACK is freed before any client code sees it).
-2. [x] Client-side `BitrateApplyStatus` extension with unit tests — commit
+   Hook = `controlReceiveThreadFunc` 0x5509 branch + `LiRegisterBitrateAckListener`
+   listener API; `moonlight-common-rust` Rust binding + trampoline wired;
+   streamer arming behind 0x80 capability wired; 199 tests pass (5 new A09-A13).
+   End-to-end ACK pending Foundation fork build (step 4).
+2. [x] Client-side `BitrateApplyStatus` extension with unit tests -- commit
    `3774524` (disarmed). The `0x5509` parser in `moonlight-common-rust` remains
    with step 1's callback.
 3. [x] Foundation source access; R-1/R-2/R-5/R-6 confirmed (§6). Opcode moved

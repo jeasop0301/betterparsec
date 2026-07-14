@@ -110,6 +110,22 @@ impl BitrateApplyStatus {
     }
 }
 
+/// Returns true iff the host feature flags warrant arming 0x5509 ACK tracking.
+///
+/// BOTH bits must be set. 0x40 alone is unsafe (pre-ACK Foundation hosts
+/// advertise 0x40 without sending 0x5509; 0x80-only violates the defined
+/// dependency -- see docs/design/f1-ack.md sec 3).
+///
+/// Only used in tests (A09-A13); production code reads the parsed
+/// `host_features.dynamic_bitrate_ack` bool from `HostFeatures::into_host_features`.
+#[cfg(test)]
+fn should_enable_ack_tracking(host_flags: u32) -> bool {
+    // Feature-flag constants mirror docs/design/f1-ack.md sec 3 and Limelight.h.
+    const LI_FF_DYNAMIC_BITRATE: u32 = 0x40;
+    const LI_FF_DYNAMIC_BITRATE_ACK: u32 = 0x80;
+    (host_flags & LI_FF_DYNAMIC_BITRATE != 0) && (host_flags & LI_FF_DYNAMIC_BITRATE_ACK != 0)
+}
+
 /// Small host-facing seam around the Moonlight fork's `0x5506` sender.
 pub(crate) trait HostBitrateControl {
     fn apply_bitrate_kbps(&self, requested_kbps: u32) -> BitrateApplyOutcome;
@@ -164,9 +180,6 @@ impl BitrateApplyMachine {
 
     /// Arm 0x5509 ACK tracking. Call only after capability negotiation
     /// confirms the host sends ACK replies (0x80 bit) — see field docs.
-    // Inactive until the Foundation host side is verified (f1-ack.md R-1/R-2);
-    // exercised by unit tests only.
-    #[allow(dead_code)]
     pub(crate) fn enable_ack_tracking(&mut self) {
         self.ack_supported = true;
     }
@@ -498,5 +511,52 @@ mod tests {
         assert_eq!(AckStatus::from_wire(4), Some(AckStatus::UnsupportedParam));
         assert_eq!(AckStatus::from_wire(5), None);
         assert_eq!(AckStatus::from_wire(u32::MAX), None);
+    }
+
+    // ── Arming boundary domain (should_enable_ack_tracking, f1-ack.md §3) ──
+    // Covers all four corners of the {0x40, 0x80} flag space.
+
+    // A09 — neither bit: no ACK support (stock Sunshine path).
+    #[test]
+    fn arming_no_flags_stays_disarmed() {
+        assert!(!should_enable_ack_tracking(0x00));
+    }
+
+    // A10 — only 0x40: pre-ACK Foundation host; 0x5509 never arrives;
+    // arming would cause PendingAck to wait forever then retry-loop.
+    #[test]
+    fn arming_dynamic_bitrate_only_stays_disarmed() {
+        assert!(!should_enable_ack_tracking(0x40));
+    }
+
+    // A11 — only 0x80: violates the defined dependency (0x40 must also be set);
+    // treated as a misconfigured host — must NOT arm.
+    #[test]
+    fn arming_ack_bit_only_stays_disarmed() {
+        assert!(!should_enable_ack_tracking(0x80));
+    }
+
+    // A12 — both 0x40 and 0x80: Foundation ACK-capable host — the only case
+    // that arms the machine.
+    #[test]
+    fn arming_both_bits_arms_tracking() {
+        assert!(should_enable_ack_tracking(0x40 | 0x80));
+    }
+
+    // A13 — verify that the machine armed via should_enable_ack_tracking
+    // transitions to PendingAck on a successful send, end-to-end.
+    #[test]
+    fn arming_boundary_e2e_both_bits_enters_pending_ack() {
+        let mut machine = BitrateApplyMachine::default();
+        if should_enable_ack_tracking(0x40 | 0x80) {
+            machine.enable_ack_tracking();
+        }
+        assert_eq!(
+            machine.poll(8_000, 0, |_| BitrateApplyOutcome::SentUnacknowledged),
+            Some(BitrateApplyStatus::PendingAck {
+                kbps: 8_000,
+                sent_at_ms: 0,
+            })
+        );
     }
 }

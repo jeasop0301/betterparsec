@@ -59,10 +59,10 @@ index 5bab923..cdf851b 100644
  
      fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
 diff --git a/src/stream/c/mod.rs b/src/stream/c/mod.rs
-index 40e2f0c..432c649 100644
+index 40e2f0c..1da9334 100644
 --- a/src/stream/c/mod.rs
 +++ b/src/stream/c/mod.rs
-@@ -10,15 +10,15 @@ use std::{
+@@ -10,15 +10,16 @@ use std::{
  
  use moonlight_common_sys::limelight::{
      _SERVER_INFORMATION, _STREAM_CONFIGURATION, LI_BATTERY_PERCENTAGE_UNKNOWN, LI_ERR_UNSUPPORTED,
@@ -76,18 +76,42 @@ index 40e2f0c..432c649 100644
 -    PAUDIO_RENDERER_CALLBACKS, PCONNECTION_LISTENER_CALLBACKS, PDECODER_RENDERER_CALLBACKS,
 -    PSERVER_INFORMATION, PSTREAM_CONFIGURATION,
 +    LI_ROT_UNKNOWN, LiChangeBitrate, LiGetEstimatedRttInfo, LiGetHostFeatureFlags,
-+    LiGetLaunchUrlQueryParameters, LiInterruptConnection, LiSendControllerArrivalEvent,
-+    LiSendControllerBatteryEvent, LiSendControllerEvent, LiSendControllerMotionEvent,
-+    LiSendControllerTouchEvent, LiSendHScrollEvent, LiSendHighResHScrollEvent,
-+    LiSendHighResScrollEvent, LiSendKeyboardEvent, LiSendKeyboardEvent2, LiSendMouseButtonEvent,
-+    LiSendMouseMoveAsMousePositionEvent, LiSendMouseMoveEvent, LiSendMousePositionEvent,
-+    LiSendMultiControllerEvent, LiSendScrollEvent, LiSendTouchEvent, LiSendUtf8TextEvent,
-+    LiStartConnection, LiStopConnection, PAUDIO_RENDERER_CALLBACKS, PCONNECTION_LISTENER_CALLBACKS,
-+    PDECODER_RENDERER_CALLBACKS, PSERVER_INFORMATION, PSTREAM_CONFIGURATION,
++    LiGetLaunchUrlQueryParameters, LiInterruptConnection, LiRegisterBitrateAckListener,
++    LiSendControllerArrivalEvent, LiSendControllerBatteryEvent, LiSendControllerEvent,
++    LiSendControllerMotionEvent, LiSendControllerTouchEvent, LiSendHScrollEvent,
++    LiSendHighResHScrollEvent, LiSendHighResScrollEvent, LiSendKeyboardEvent, LiSendKeyboardEvent2,
++    LiSendMouseButtonEvent, LiSendMouseMoveAsMousePositionEvent, LiSendMouseMoveEvent,
++    LiSendMousePositionEvent, LiSendMultiControllerEvent, LiSendScrollEvent, LiSendTouchEvent,
++    LiSendUtf8TextEvent, LiStartConnection, LiStopConnection, PAUDIO_RENDERER_CALLBACKS,
++    PCONNECTION_LISTENER_CALLBACKS, PDECODER_RENDERER_CALLBACKS, PSERVER_INFORMATION,
++    PSTREAM_CONFIGURATION,
  };
  
  use crate::{
-@@ -269,6 +269,29 @@ impl MoonlightStream {
+@@ -48,6 +49,22 @@ static INSTANCE: LazyLock<Arc<Handle>> = LazyLock::new(|| {
+     })
+ });
+ 
++// 0x5509 bitrate ACK callback storage (mirrors connection.rs GLOBAL_CONNECTION_LISTENER
++// pattern). The C layer calls the extern "C" trampoline on the control receive thread;
++// the trampoline locks this static and routes to the Rust closure.
++static GLOBAL_BITRATE_ACK_CALLBACK: Mutex<Option<Box<dyn Fn(u32, u32) + Send + 'static>>> =
++    Mutex::new(None);
++
++unsafe extern "C" fn bitrate_ack_trampoline(applied_kbps: u32, status: u32) {
++    // Called on the moonlight-common-c control receive thread. Must not block.
++    let lock = GLOBAL_BITRATE_ACK_CALLBACK
++        .lock()
++        .unwrap_or_else(|e| e.into_inner());
++    if let Some(cb) = lock.as_ref() {
++        cb(applied_kbps, status);
++    }
++}
++
+ pub(crate) struct Handle {
+     /// This is also the lock because start / stop Connection is not thread safe
+     connection_exists: Mutex<bool>,
+@@ -269,6 +286,57 @@ impl MoonlightStream {
          }
      }
  
@@ -112,6 +136,34 @@ index 40e2f0c..432c649 100644
 +        }
 +
 +        Ok(())
++    }
++
++    /// Register a callback for 0x5509 bitrate ACK packets (BetterParsec/Foundation
++    /// extension). The callback is invoked on the moonlight-common-c control receive
++    /// thread — it must be cheap and thread-safe; no async awaiting, no blocking.
++    ///
++    /// Call this before [`MoonlightInstance::start_connection`] if the host advertises
++    /// `LI_FF_DYNAMIC_BITRATE_ACK`. Only arm after confirming both `LI_FF_DYNAMIC_BITRATE`
++    /// (0x40) and `LI_FF_DYNAMIC_BITRATE_ACK` (0x80) are set — 0x40 alone is unsafe
++    /// (docs/design/f1-ack.md §3).
++    ///
++    /// Pass `None` to deregister.
++    pub fn register_bitrate_ack_callback(
++        callback: Option<impl Fn(u32, u32) + Send + 'static>,
++    ) {
++        let mut lock = GLOBAL_BITRATE_ACK_CALLBACK
++            .lock()
++            .unwrap_or_else(|e| e.into_inner());
++        match callback {
++            Some(cb) => {
++                *lock = Some(Box::new(cb));
++                unsafe { LiRegisterBitrateAckListener(Some(bitrate_ack_trampoline)); }
++            }
++            None => {
++                *lock = None;
++                unsafe { LiRegisterBitrateAckListener(None); }
++            }
++        }
 +    }
 +
      fn send_event_error(error: i32) -> Option<MoonlightError> {
@@ -216,3 +268,91 @@ index 6dcc2e2..1e08a7f 100644
      ///
      /// References:
      /// - Moonlight common c: https://github.com/moonlight-stream/moonlight-common-c/blob/62687809b1f7410c3db4be2527503a54ae408d70/src/RtpVideoQueue.c#L157
+diff --git a/src/stream/bindings.rs b/src/stream/bindings.rs
+index f4e55ea..dfff5a3 100644
+--- a/src/stream/bindings.rs
++++ b/src/stream/bindings.rs
+@@ -174,3 +174,6 @@ pub const ML_PORT_FLAG_UDP_48010: u32 = 2048;
+ pub const ML_TEST_RESULT_INCONCLUSIVE: u32 = 4294967295;
+ pub const LI_FF_PEN_TOUCH_EVENTS: u32 = 1;
+ pub const LI_FF_CONTROLLER_TOUCH_EVENTS: u32 = 2;
++// BetterParsec/Foundation extensions (docs/design/f1-ack.md §3)
++pub const LI_FF_DYNAMIC_BITRATE: u32 = 0x40;
++pub const LI_FF_DYNAMIC_BITRATE_ACK: u32 = 0x80;
+diff --git a/src/stream/mod.rs b/src/stream/mod.rs
+index 4d0df02..13655a4 100644
+--- a/src/stream/mod.rs
++++ b/src/stream/mod.rs
+@@ -14,7 +14,8 @@ use crate::{
+         audio::AudioConfig,
+         bindings::{
+             ENCFLG_ALL, ENCFLG_AUDIO, ENCFLG_NONE, ENCFLG_VIDEO, LI_FF_CONTROLLER_TOUCH_EVENTS,
+-            LI_FF_PEN_TOUCH_EVENTS, STREAM_CFG_AUTO, STREAM_CFG_LOCAL, STREAM_CFG_REMOTE,
++            LI_FF_DYNAMIC_BITRATE, LI_FF_DYNAMIC_BITRATE_ACK, LI_FF_PEN_TOUCH_EVENTS,
++            STREAM_CFG_AUTO, STREAM_CFG_LOCAL, STREAM_CFG_REMOTE,
+         },
+         control::ActiveGamepads,
+         video::{ColorRange, ColorSpace, ServerCodecModeSupport, VideoFormats},
+@@ -324,15 +325,23 @@ bitflags! {
+     pub struct RawHostFeatures: u32 {
+         const PEN_TOUCH_EVENTS = LI_FF_PEN_TOUCH_EVENTS;
+         const CONTROLLER_TOUCH_EVENTS = LI_FF_CONTROLLER_TOUCH_EVENTS;
++        /// BetterParsec/Foundation: host accepts 0x5506 dynamic bitrate requests.
++        const DYNAMIC_BITRATE = LI_FF_DYNAMIC_BITRATE;
++        /// BetterParsec/Foundation: host sends 0x5509 ACK replies to 0x5506 requests.
++        /// Requires DYNAMIC_BITRATE (0x40) to also be set.
++        const DYNAMIC_BITRATE_ACK = LI_FF_DYNAMIC_BITRATE_ACK;
+     }
+ }
+ 
+ impl RawHostFeatures {
+     pub fn into_host_features(self, server_version: ServerVersion) -> HostFeatures {
++        let ack_capable = self.contains(RawHostFeatures::DYNAMIC_BITRATE)
++            && self.contains(RawHostFeatures::DYNAMIC_BITRATE_ACK);
+         let extensions = HostProtocolExtensions {
+             sunshine_pen: self.contains(RawHostFeatures::PEN_TOUCH_EVENTS),
+             sunshine_touch: self.contains(RawHostFeatures::PEN_TOUCH_EVENTS),
+             sunshine_controller_touch: self.contains(RawHostFeatures::CONTROLLER_TOUCH_EVENTS),
++            dynamic_bitrate_ack: ack_capable,
+             ..Default::default()
+         };
+ 
+@@ -346,6 +355,7 @@ impl RawHostFeatures {
+             pen: extensions.sunshine_pen,
+             touch: extensions.sunshine_touch,
+             controller_touch: extensions.sunshine_controller_touch,
++            dynamic_bitrate_ack: ack_capable,
+             extensions,
+             ..Default::default()
+         }
+@@ -395,6 +405,11 @@ pub struct HostProtocolExtensions {
+     /// - https://github.com/AlkaidLab/foundation-sunshine/blob/c2d8de3650a2ddf65281b6694e623c865a603831/src/stream.cpp#L88-L89
+     pub foundation_microphone: bool,
+     // TODO: https://github.com/AlkaidLab/foundation-sunshine/blob/c2d8de3650a2ddf65281b6694e623c865a603831/src/stream.cpp#L90-L91
++
++    /// BetterParsec/Foundation extension: host sends 0x5509 ACK replies to
++    /// 0x5506 bitrate requests (requires LI_FF_DYNAMIC_BITRATE also set).
++    /// See docs/design/f1-ack.md §3.
++    pub dynamic_bitrate_ack: bool,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq)]
+@@ -409,6 +424,10 @@ pub struct HostFeatures {
+     pub controller_touch: bool,
+     /// If the host supports any microphone protocol.
+     pub microphone: bool,
++    /// True only when the host advertises both LI_FF_DYNAMIC_BITRATE (0x40)
++    /// and LI_FF_DYNAMIC_BITRATE_ACK (0x80). Drives the ACK-tracking arm
++    /// decision in BitrateApplyMachine (docs/design/f1-ack.md §3).
++    pub dynamic_bitrate_ack: bool,
+     /// More details about the extensions this host supports
+     pub extensions: HostProtocolExtensions,
+ }
+@@ -421,6 +440,7 @@ impl Default for HostFeatures {
+             pen: false,
+             touch: false,
+             microphone: false,
++            dynamic_bitrate_ack: false,
+             extensions: HostProtocolExtensions::default(),
+         }
+     }

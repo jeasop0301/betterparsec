@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "name": "1080p60-h264-20-8-15-comparison",
+  "description": "Strict direct-UDP congestion/recovery comparison profile for the deterministic 20→8→15 Mbps trace.",
+  "stream": {
+    "width": 1920,
+    "height": 1080,
+    "fps": 60,
+    "codec": "h264",
+    "hdr": false,
+    "requestedBitrateKbps": 20000,
+    "audio": false
+  },
+  "timing": {
+    "warmupSeconds": 30,
+    "measurementSeconds": 120,
+    "cooldownSeconds": 10
+  },
+  "validityGates": {
+    "requireCleanRepository": true,
+    "requireContentTraceHash": true,
+    "requireNetworkTraceApplied": true,
+    "requirePacketCapture": true,
+    "requiredIceRoute": "direct",
+    "requiredCandidateProtocol": "udp",
+    "rejectIcePathTransitions": true,
+    "maximumArtifactClockSkewMs": 5000,
+    "minimumMeasuredDurationPercent": 95,
+    "maximumSourceFreshnessMs": 2500,
+    "maximumSenderQueueFrames": 3,
+    "maximumHealthyLinkFrameRejectionPercent": 5,
+    "requireZeroSenderWriteFailures": true,
+    "minimumBrowserFpsP50": 45,
+    "maximumBrowserDecodeP95Ms": 8,
+    "maximumBrowserProcessingP95Ms": 12,
+    "maximumJitterBufferTargetP95Ms": 100,
+    "maximumJitterBufferMinimumP95Ms": 100,
+    "requireZeroHealthyLinkFreezes": false,
+    "maximumPacketLossPercent": 5
+  },
+  "networkTrace": {
+    "name": "20-8-15mbps",
+    "required": true
+  },
+  "contentTrace": {
+    "name": "deterministic-motion-v1",
+    "source": "external",
+    "requiredSha256": true
+  }
+}

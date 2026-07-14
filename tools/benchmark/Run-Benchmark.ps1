@@ -24,6 +24,8 @@ param(
     [switch] $SkipPacketCapture,
     [switch] $SkipNetworkTrace,
     [switch] $NoPrompt,
+    [switch] $SkipAnalysis,
+    [switch] $AllowRejectedRun,
     [switch] $DryRun
 )
 
@@ -33,6 +35,15 @@ Set-StrictMode -Version Latest
 $scriptRoot = $PSScriptRoot
 $repoRoot = (Resolve-Path (Join-Path $scriptRoot '..\..')).Path
 . (Join-Path $scriptRoot 'lib\Benchmark.Common.ps1')
+
+$analyzerScript = Join-Path $scriptRoot 'analyze-benchmark.mjs'
+$nodeCommand = $null
+if (-not $SkipAnalysis -and -not $DryRun) {
+    $nodeCommand = Get-Command node -ErrorAction Stop
+    if (-not (Test-Path -LiteralPath $analyzerScript -PathType Leaf)) {
+        throw "Benchmark analyzer not found: $analyzerScript"
+    }
+}
 
 if (-not $ProfilePath) {
     $ProfilePath = Join-Path $scriptRoot 'profiles\1080p60-h264.json'
@@ -118,6 +129,14 @@ $manifest = [ordered]@{
         requestedPath = if ($BrowserExportPath) { $BrowserExportPath } else { $null }
         artifact = $null
         status = if ($BrowserExportPath) { 'pending' } else { 'not-requested' }
+    }
+    analysis = [ordered]@{
+        enabled = -not [bool]$SkipAnalysis
+        artifact = if (-not $SkipAnalysis) { 'analysis.json' } else { $null }
+        status = if ($SkipAnalysis -or $DryRun) { 'skipped' } else { 'pending' }
+        verdict = $null
+        accepted = $null
+        exitCode = $null
     }
     artifacts = [ordered]@{
         system = 'system.json'
@@ -391,8 +410,49 @@ finally {
     Write-BenchmarkJson -Value $manifest -Path $manifestPath
 }
 
+$analysisRejected = $false
+$analysisExecutionError = $null
+if (-not $SkipAnalysis -and -not $DryRun) {
+    $analysisPath = Join-Path $runRoot 'analysis.json'
+    $analysisProcess = Start-Process `
+        -FilePath $nodeCommand.Source `
+        -ArgumentList @(
+            $analyzerScript,
+            '--run', $runRoot,
+            '--output', $analysisPath
+        ) `
+        -NoNewWindow `
+        -Wait `
+        -PassThru
+
+    $manifest.analysis.exitCode = $analysisProcess.ExitCode
+    if (Test-Path -LiteralPath $analysisPath -PathType Leaf) {
+        $analysis = Get-Content -Raw -LiteralPath $analysisPath | ConvertFrom-Json
+        $manifest.analysis.status = 'collected'
+        $manifest.analysis.verdict = $analysis.verdict
+        $manifest.analysis.accepted = [bool]$analysis.accepted
+        $analysisRejected = -not [bool]$analysis.accepted
+    } else {
+        $manifest.analysis.status = 'failed'
+    }
+
+    if ($analysisProcess.ExitCode -eq 1) {
+        $analysisExecutionError = 'Benchmark analyzer failed to produce a valid verdict.'
+    } elseif ($analysisProcess.ExitCode -notin @(0, 2)) {
+        $analysisExecutionError = "Benchmark analyzer returned unexpected exit code $($analysisProcess.ExitCode)."
+    }
+
+    Write-BenchmarkJson -Value $manifest -Path $manifestPath
+}
+
 if ($runError) {
     throw $runError
+}
+if ($analysisExecutionError) {
+    throw $analysisExecutionError
+}
+if ($analysisRejected -and -not $AllowRejectedRun) {
+    throw "Benchmark truth gate rejected run '$RunId'. Review $runRoot\analysis.json."
 }
 
 Write-Host "Benchmark run complete: $runRoot"

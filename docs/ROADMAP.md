@@ -35,10 +35,10 @@ Tetrys FEC · 서브프레임 슬라이스 · QU · 네이티브 클라이언트
 | 트랙 | 순수 로직/설계 | 배선/구현 | 활성·판정 게이트 |
 |---|---|---|---|
 | U1. 프레임딜레이 CC (Pudica류) | [x] cc.rs 26 tests | [x] 송신루프 배선 + `min(abr, cc)` 합성 + 세대 가드/손실 모멘텀 수정 (2026-07-14, docs/design/cc-wiring.md, +12 tests) | Gate B 벤치 셀에서 송신측 신호 대역폭 판정 → 부족 시 TWCC/수신측 피드(Gate D) |
-| U2. Tetrys 슬라이딩윈도우 FEC | [x] fec.rs 47 tests (GF(256), MDS sweep) | [ ] 전송 프레이밍 설계(커스텀 RTP vs DataChannel) → 배선 | Gate B/D — 고정 20% 대비 적응 비율 A/B |
+| U2. Tetrys 슬라이딩윈도우 FEC | [x] fec.rs 47 tests (GF(256), MDS sweep) + u32 wrap/윈도캡 가드 3핀 | [x] 프레이밍 설계(video_fec DataChannel) + **P1 배선 완료** (2026-07-14): streamer 송신부(fec_wire/fec_sender, subscribe 게이트·세대 가드) + 웹 수신부(fec.ts 코덱 미러 18핀, FecDecodePipe, enableVideoFec 기본 off) + Rust↔TS 교차 벡터. fec-framing.md §8 | Gate B/D — P2 손실 복구 실측(tc netem), P3 적응 비율 A/B·기본 경로 판정 |
 | U3. 서브프레임 슬라이스 | [x] 제약 인벤토리 (docs/design/slice-qu-constraints.md) | [ ] moonlight-common 포크 콜백 granularity 조사 → 호스트 슬라이스 모드 + per-slice 송신 | Gate C에서 인코드→프레젠트 겹침 이득 실측 |
-| U4. QU build-to-lossless | [ ] 채널·타일 프로토콜 설계 | [ ] 스트리머 DataChannel 라우팅(스트리머 단독) · 호스트 무손실 타일 경로(포크, 중규모) | Gate E — 데스크톱 모드 픽셀-퍼펙트 |
-| U5. 네이티브 클라이언트 (ultra 티어) | [x] 리서치 05 §3 아키텍처 | [ ] moonlight-qt 포크 스파이크(전송 이식 공수 검증) | Gate C 외부 계측으로 지연 왕좌 판정 |
+| U4. QU build-to-lossless | [x] 채널·타일 프로토콜 설계 (2026-07-14, docs/design/qu-protocol.md — `video_qu` 단일 reliable 채널, PNG 타일+CRC 자가검증, epoch/invalidate, 오버레이 캔버스 합성 결정, localhost 릴레이 인터페이스) | [ ] P1 스트리머 채널+릴레이+클라 오버레이(스트리머 단독) · 호스트 무손실 타일 경로(포크, 중규모) | Gate E — 데스크톱 모드 픽셀-퍼펙트 |
+| U5. 네이티브 클라이언트 (ultra 티어) | [x] 리서치 05 §3 아키텍처 | [x] moonlight-qt 포크 스파이크 완료 (2026-07-14, docs/design/m6-native-spike.md — "2–4주" 판정 OPTIMISTIC → 실측 3–5주, 접합 = Rust cdylib 사이드카(Option-3), ALLOW_TEARING/FLIP_DISCARD는 기존재·waitable만 부재, CUVID 경로 존재하나 Windows pass-1) → [ ] 포크 착수(W1: client-transport cdylib) | Gate C 외부 계측으로 지연 왕좌 판정 |
 
 - **착수 조건 변경**: 리서치 04 §5의 "M6는 웹 클라 gate 통과 후"는 **owner 티어
   판정(리서치 05 결정 0, 2026-07-14)이 대체한다** — 네이티브는 ultra 티어 제품
@@ -47,15 +47,21 @@ Tetrys FEC · 서브프레임 슬라이스 · QU · 네이티브 클라이언트
 - U1–U2는 스트리머 단독(호스트 포크 불필요), U3–U4는 Sunshine 포크 필요(하드
   블로커 분류: slice-qu-constraints.md §4), U5는 별도 클라이언트 트랙.
 
-### 다음 액션 순서
+### 다음 액션 순서 (2026-07-14 갱신)
 
-1. 워킹트리 커밋 — Gate A 잔여이자 리서치 05 §4-5의 착수 블로커(TLS pin ·
-   analyzer · CC/FEC 모듈+배선 포함).
-2. 라이브 paired 회귀(stock + Foundation) — 사용자 참석 세션.
-3. U2 FEC 전송 프레이밍 설계 — 스트리머 단독으로 진행 가능한 다음 must-do.
-4. U3 moonlight-common 포크 콜백 granularity 조사(open question 해소).
-5. Gate B 2-machine 첫 신뢰 run — 이후 U1 CC 신호 판정, U2 비율 튜닝, U3/U5
-   지연 계측이 전부 이 위에서 순차 판정된다.
+완료: 워킹트리 커밋(1), U2 설계+P1 배선(3), U3 조사(4), U4 프로토콜 설계,
+U5/M6 스파이크, f1-ack 소스 확인+0x5509 호스트 패치.
+
+1. 라이브 paired 회귀(stock + Foundation) — 사용자 참석 세션 (Gate A 잔여).
+   같은 세션에서 U2 P1 루프백 스모크(enableVideoFec=true, 손실 0 환경 프레임
+   동일성)와 0x5509 ACK 패치 포크 빌드까지 겸하면 효율적.
+2. f1-ack 클라 플러밍 — moonlight-common-c/rust 패치에 0x5509 수신 훅 +
+   상태머신 arming (헤드리스 가능; vendor 재생성 필요).
+3. U4 P1 — `video_qu` 채널 + localhost 릴레이 + 클라 오버레이(스트리머 단독,
+   합성 타일 인젝터로 테스트).
+4. M6 W1 — `client-transport` Rust cdylib 착수 (Qt 빌드 환경 ~2–3h 포함).
+5. Gate B 2-machine 첫 신뢰 run — 이후 U1 CC 신호 판정, U2 P2 손실 복구
+   실측·비율 튜닝, U3/U5 지연 계측이 전부 이 위에서 순차 판정된다.
 
 ---
 
@@ -108,8 +114,12 @@ Parsec web app 문서
   3단 truth table로 만들고 실제로 끝까지 동작하는 조합만 광고한다.
 - [x] encoder bitrate 요청의 client state를 `sent_unacknowledged`로 제한하고 Foundation
   host log와 대조해 실제 NVENC apply를 별도로 증명한다.
-- [ ] request-id 기반 protocol ACK를 추가해 일반 run에서도 `queued`와 `applied`를
-  자동 상관관계로 연결한다.
+- [~] request-id 기반 protocol ACK: 설계·클라 상태머신(비활성)·호스트 패치까지
+  완료 — 옵코드는 Foundation 소스 확인으로 `0x5509` 확정(0x5507/0x5508 선점),
+  R-1/R-2/R-5/R-6 소스 해소, 패치 apply-검증
+  (docs/host-patches/foundation-sunshine-dynamic-bitrate-ack.patch). 잔여:
+  moonlight-common-c/rust 패치의 0x5509 수신 훅 + 상태머신 arming + 포크
+  빌드/라이브 검증 (f1-ack.md implementation order).
 - [x] patched Moonlight dependency를 고정 revision + repository-owned patch + bootstrap/CI
   구조로 전환해 외부 로컬 작업 트리 없이 clean clone을 재현한다.
 - [ ] RTX 4070 ULL/슬라이스 인코드 지연 자체 실측(리서치 04 §3-1 문헌 상충 해소;
@@ -145,7 +155,9 @@ Parsec web app 문서
 - [x] REMB + Receiver Report 손실 → bounded target_kbps (급락 즉시, 회복 완만)
 - [x] 프레임딜레이 CC 순수 컨트롤러(cc.rs, 26 tests) + 송신루프 배선 +
   `min(abr, cc)` 합성 — U1, docs/design/cc-wiring.md (라이브 검증은 Gate B)
-- [x] Tetrys 슬라이딩윈도우 FEC 순수 코덱(fec.rs, 47 tests) — 전송 프레이밍/배선은 U2
+- [x] Tetrys 슬라이딩윈도우 FEC 순수 코덱(fec.rs, 47 tests) + P1 전송
+  프레이밍/배선(video_fec DataChannel, 기본 off — fec-framing.md §8); 라이브
+  손실 복구 실측은 P2(Gate B rig)
 - [ ] CC 신호(송신측 service time) 대역폭 판정 — Gate B 벤치 셀; 부족 시
   TWCC/수신측 타임스탬프 피드로 같은 on_frame API에 교체
 - [ ] 적응형 FEC 비율(고정 20% 탈피) A/B — U2 배선 후
@@ -175,8 +187,12 @@ Parsec web app 문서
 **목표:** 인코드→전송→디코드 겹침으로 프레임 내 지연을 깎고, 정지 화면을
 픽셀-퍼펙트로 만든다(데스크톱 모드의 구조적 "뭉개짐" 해결).
 
-- [ ] moonlight-common 포크의 슬라이스 콜백 granularity 조사(현재 1 콜백=1 프레임
-  가정 — slice-qu-constraints.md open question)
+- [x] moonlight-common 포크의 슬라이스 콜백 granularity 조사 — 2026-07-14
+  해소(slice-qu-constraints.md §5): 1 콜백=1 완성 프레임이 프로토콜 구조상
+  항상 성립. per-slice 전달 = depacketizer 패치(FEC-block 경계를 DU 경계로,
+  중규모·기존 패치 확장). 부수 발견: `CAPABILITY_SLICES_PER_FRAME`은
+  인코더 전용 레버(포크 불필요·저비용)이고 Rust C-경로 래퍼가
+  `slices_per_frame`을 무시하는 갭 존재(래퍼 패치 소규모).
 - [ ] Sunshine 포크 NVENC 슬라이스 모드 + 스트리머 per-slice 즉시 송신. 깨지는
   4개 불변 재설계: IDR 검출, PLI 응답, IDR 큐 클리어, RTP marker bit
   (slice-qu-constraints.md §2)
@@ -190,8 +206,17 @@ Parsec web app 문서
 **목표:** 지연 왕좌 — CUVID 4:4:4 디코드, VRR/tearing 프레젠트, WASAPI
 exclusive, Raw 입력. 웹 클라는 간편/호환 티어로 유지(동일 백엔드).
 
-- [ ] moonlight-qt 포크 스파이크: 커스텀 전송(CC/FEC/슬라이스 보존) 이식 공수
-  검증(리서치 05 추정 2–4주의 실측)
+- [x] moonlight-qt 포크 스파이크: 커스텀 전송(CC/FEC/슬라이스 보존) 이식 공수
+  검증 — 2026-07-14 완료, docs/design/m6-native-spike.md. 판정: "2–4주"는
+  OPTIMISTIC, 현실 3–5주(~1.4–1.7k LOC). 접합 = Rust cdylib 사이드카
+  (moonlight-common-c 무수정, fec.rs/cc.rs 재사용, IVideoDecoder 경계 주입,
+  `LiWaitForNextVideoFrame` pull 루프 ~30 LOC 교체). 프레젠트는
+  FLIP_DISCARD+ALLOW_TEARING 기존재/waitable(1)만 추가(~50 LOC), WASAPI
+  exclusive 렌더러 신규(~250 LOC), CUVID는 Windows pass-0 승격 ~30 LOC.
+  핀: moonlight-qt c0c4d60 / moonlight-common-c 2ea4775.
+- [ ] 포크 착수 W1: `client-transport` Rust cdylib (WebRTC 클라 +
+  video_fec DataChannel 수신 + DECODE_UNIT 출력 + C ABI) — 빌드 환경(Qt 6
+  MSVC, ~2–3h 설치)은 착수 시 구축
 - [ ] CUVID `ulMaxDisplayDelay=0` + `FLIP_DISCARD`/`ALLOW_TEARING`/waitable(1)
   프레젠트 + WASAPI exclusive + RawInputBuffer/GameInput
 - [ ] (장기) Rust 네이티브(nvcodec-rs+wgpu+windows-rs) 전환 판단

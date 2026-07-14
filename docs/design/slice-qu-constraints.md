@@ -148,14 +148,64 @@ is entirely inside Sunshine.
 
 ---
 
-## Open questions
+## 5. Resolved open questions (2026-07-14 vendored-source investigation)
 
-- Does the Moonlight protocol in the moonlight-common fork deliver NVENC slice
-  output as a single `VideoDecodeUnit` or as separate per-slice callbacks?
-  Requires moonlight-common fork source inspection.
-- Does `VideoDecodeUnit` in the fork carry any additional metadata fields
-  (dirty-rect, `slice_index`, `is_static`) beyond `frame_type` and
-  `frame_processing_latency`?
+Investigated against `vendor/moonlight-common-rust` (patches applied).
+
+### 5.1 Callback granularity: 1 callback = 1 COMPLETE frame, always
+
+`RtpVideoQueue.c` tracks per-frame multi-FEC blocks
+(`multiFecCurrentBlockNumber`/`multiFecLastBlockNumber`, i.e. slices) and only
+calls `submitCompletedFrame` after the LAST block
+(`RtpVideoQueue.c:783-800`). The depacketizer accumulates every NAL across
+all blocks into one chain and calls `reassembleFrame()` exactly once per
+frame (`VideoDepacketizer.c:1124`, DU assembly at `469-551`). `FLAG_SOF`/
+`FLAG_EOF` (`Video.h:21-23`) are frame boundaries — no slice-boundary flags
+exist. **Per-slice delivery is architecturally absent from the protocol
+layer**; enabling it means patching the depacketizer to treat FEC-block
+boundaries as decode-unit boundaries. Note: we already carry
+`patches/moonlight-common-c.patch`, so this is a patch extension, not a new
+hard fork.
+
+### 5.2 `CAPABILITY_SLICES_PER_FRAME` controls the ENCODER only
+
+`Limelight.h:279-282` packs a slice count into capability bits 24–31;
+`SdpGenerator.c:421-431` forwards it as
+`x-nv-video[0].videoEncoderSlicesPerFrame=N`. Sunshine then configures NVENC
+with N slices — **encoder-side parallelization (encode-latency win) without
+any change to callback granularity**. This is a cheap, host-fork-free lever.
+
+### 5.3 Wrapper gap found: `slices_per_frame` silently ignored on the C path
+
+The Rust C-stream wrapper never translates `VideoCapabilities.
+slices_per_frame` into the C capabilities integer
+(`src/stream/c/video.rs:167-195`, bitflags at `src/stream/c/bindings.rs:77-88`)
+— the C-stream path always advertises 1 slice regardless of the field. The
+proto path forwards it correctly (`src/stream/proto/mod.rs:1015`,
+`src/stream/proto/sdp/client.rs:706-710`). Fixing the C path = small
+extension to `patches/moonlight-common-rust.patch`.
+
+### 5.4 `VideoDecodeUnit` metadata inventory
+
+Rust struct carries frame_number/frame_type/frame_processing_latency/
+timestamp/color_space/buffers (`src/stream/video.rs:255-292`). The wrapper
+DROPS C fields `receiveTimeUs`, `enqueueTimeUs`, `rtpTimestamp`, `hdrActive`,
+`fullLength`. No slice index, slice count, or dirty-rect exists anywhere in
+the protocol; `multiFecLastBlockNumber` (`RtpVideoQueue.h:45`) is the closest
+client-side observable of "slices actually sent" but is not exposed above the
+RTP queue layer.
+
+### 5.5 Revised blocker classification
+
+| Item | Cost | Where |
+|---|---|---|
+| Encoder-side slicing (encode-latency win, no pipelining) | Small: wrapper patch (5.3) + advertise `CAPABILITY_SLICES_PER_FRAME(n)` | patches/moonlight-common-rust.patch + streamer capability |
+| Per-slice decode-unit delivery | Medium: depacketizer patch treating FEC-block boundaries as DU boundaries + DU slice metadata | patches/moonlight-common-c.patch |
+| Timing fields for latency attribution (`receiveTimeUs`, `rtpTimestamp`) | Small: wrapper field pass-through | patches/moonlight-common-rust.patch |
+| Dirty-rect / QU metadata | Large: no protocol carrier exists — needs a new extension (or the QU DataChannel path from fec-framing.md, which bypasses this protocol entirely) | Sunshine fork + protocol extension |
+
+## Open questions (remaining)
+
 - How should QU tiles be composited on the browser client (separate `VideoFrame`
   overlay vs. canvas blending)? Client-side constraints have not been
   investigated.

@@ -6,6 +6,59 @@
 
 ---
 
+## 실행 스파인 — 감사 게이트 × ultra 성능 코어 병합 (2026-07-14)
+
+2026-07-13 성능·보안 감사(docs/audits/2026-07-13-performance-security-audit.md)의
+잠금 실행 순서(Gate A–E)와 리서치 04/05의 ultra 성능 코어(프레임딜레이 CC ·
+Tetrys FEC · 서브프레임 슬라이스 · QU · 네이티브 클라이언트)를 하나의 스파인으로
+병합한다. **ultra 성능 코어는 must-do다(owner, 2026-07-14).** 두 로드맵은
+충돌하지 않고 역할이 다르다:
+
+- **감사 게이트 = 진실·주장 순서.** 성능 주장, 튜닝 결정, 파라미터 선택은 게이트
+  순서를 따른다. 신뢰 가능한 측정 전에 수행한 최적화는 대외 주장하지 않는다.
+- **ultra 코어 = 빌드 트랙.** 순수 로직·설계·클라이언트측 배선처럼 게이트 없이
+  단위검증 가능한 기계는 게이트를 기다리지 않고 병렬로 만든다. 단 **활성화
+  기본값·튜닝·대외 주장**은 해당 게이트 통과 후에만.
+
+### 게이트 진행 상태
+
+| 게이트 | 내용 | 상태 |
+|---|---|---|
+| A. 보안·진실 기반 | TLS pin 통합, paired 회귀, analyzer 통합, strict profile | TLS pin [x] · analyzer 통합 [x] · strict profiles [x] · stock/Foundation paired 라이브 회귀 [ ] (사용자 참석 필요) · 워킹트리 커밋 [ ] (리서치 05 §4-5 블로커) |
+| B. 첫 신뢰 베이스라인 | 분리된 host/client/router, H.264 1080p60 direct UDP, 결정적 트레이스, clean LAN + 20→8→15 Mbps, ABBA 5회, 무효 run 거부 | [ ] 전부 (2-machine 셋업 필요) |
+| C. 지연 분리 | sender/PCAP/browser/decode/present 상관, 렌더 경로 비교, 지터버퍼 제어, 외부 input-to-photon | [ ] |
+| D. 컨트롤러·인코더 최적화 | ABR에 queue/write/freshness 피드백, TWCC(재생 가능 트레이스 후), NVENC LL 매트릭스, Pareto 선택 | CC 기계는 완성(U1) — 튜닝·판정은 Gate B/C 이후 |
+| E. 코덱·콘텐츠 효율 | HEVC 4:4:4 / AV1 truth table, 콘텐츠 인지 배분 | [ ] (M3과 동일) |
+
+### ultra 성능 코어 트랙 (must-do)
+
+| 트랙 | 순수 로직/설계 | 배선/구현 | 활성·판정 게이트 |
+|---|---|---|---|
+| U1. 프레임딜레이 CC (Pudica류) | [x] cc.rs 26 tests | [x] 송신루프 배선 + `min(abr, cc)` 합성 + 세대 가드/손실 모멘텀 수정 (2026-07-14, docs/design/cc-wiring.md, +12 tests) | Gate B 벤치 셀에서 송신측 신호 대역폭 판정 → 부족 시 TWCC/수신측 피드(Gate D) |
+| U2. Tetrys 슬라이딩윈도우 FEC | [x] fec.rs 47 tests (GF(256), MDS sweep) | [ ] 전송 프레이밍 설계(커스텀 RTP vs DataChannel) → 배선 | Gate B/D — 고정 20% 대비 적응 비율 A/B |
+| U3. 서브프레임 슬라이스 | [x] 제약 인벤토리 (docs/design/slice-qu-constraints.md) | [ ] moonlight-common 포크 콜백 granularity 조사 → 호스트 슬라이스 모드 + per-slice 송신 | Gate C에서 인코드→프레젠트 겹침 이득 실측 |
+| U4. QU build-to-lossless | [ ] 채널·타일 프로토콜 설계 | [ ] 스트리머 DataChannel 라우팅(스트리머 단독) · 호스트 무손실 타일 경로(포크, 중규모) | Gate E — 데스크톱 모드 픽셀-퍼펙트 |
+| U5. 네이티브 클라이언트 (ultra 티어) | [x] 리서치 05 §3 아키텍처 | [ ] moonlight-qt 포크 스파이크(전송 이식 공수 검증) | Gate C 외부 계측으로 지연 왕좌 판정 |
+
+- **착수 조건 변경**: 리서치 04 §5의 "M6는 웹 클라 gate 통과 후"는 **owner 티어
+  판정(리서치 05 결정 0, 2026-07-14)이 대체한다** — 네이티브는 ultra 티어 제품
+  그 자체이므로 조건부(선택)가 아니라 must-do. 단 지연 우위의 **대외 주장**은
+  여전히 Gate C 외부 계측 이후.
+- U1–U2는 스트리머 단독(호스트 포크 불필요), U3–U4는 Sunshine 포크 필요(하드
+  블로커 분류: slice-qu-constraints.md §4), U5는 별도 클라이언트 트랙.
+
+### 다음 액션 순서
+
+1. 워킹트리 커밋 — Gate A 잔여이자 리서치 05 §4-5의 착수 블로커(TLS pin ·
+   analyzer · CC/FEC 모듈+배선 포함).
+2. 라이브 paired 회귀(stock + Foundation) — 사용자 참석 세션.
+3. U2 FEC 전송 프레이밍 설계 — 스트리머 단독으로 진행 가능한 다음 must-do.
+4. U3 moonlight-common 포크 콜백 granularity 조사(open question 해소).
+5. Gate B 2-machine 첫 신뢰 run — 이후 U1 CC 신호 판정, U2 비율 튜닝, U3/U5
+   지연 계측이 전부 이 위에서 순차 판정된다.
+
+---
+
 ## Browser-native product wedge
 
 Moonlight 공식 FAQ는 브라우저가 raw TCP/UDP socket API를 제공하지 않아 순수 웹
@@ -59,6 +112,8 @@ Parsec web app 문서
   자동 상관관계로 연결한다.
 - [x] patched Moonlight dependency를 고정 revision + repository-owned patch + bootstrap/CI
   구조로 전환해 외부 로컬 작업 트리 없이 clean clone을 재현한다.
+- [ ] RTX 4070 ULL/슬라이스 인코드 지연 자체 실측(리서치 04 §3-1 문헌 상충 해소;
+  U3 착수 전 필요).
 
 **검증:** 내부 수치가 packet capture/외부 계측과 각각 ±2 ms 또는 ±10% 안에서
 일치해야 한다. 기존 2026-07-13 최초 same-PC run의 host latency와 RTP jitter는 단위
@@ -85,8 +140,15 @@ Parsec web app 문서
 ## M2 — 적응형 비트레이트 (feature #1, flagship)
 **목표:** 대역 급락 시 뭉개지는 대신 비트레이트가 따라 내려간다.
 
-- [ ] TWCC(transport-cc) 피드백 활성 (SDP 협상 + webrtc-rs)
+- [ ] TWCC(transport-cc) 피드백 활성 (SDP 협상 + webrtc-rs) — Gate D: 재생 가능
+  트레이스 테스트 후에만 (감사 잠금 순서)
 - [x] REMB + Receiver Report 손실 → bounded target_kbps (급락 즉시, 회복 완만)
+- [x] 프레임딜레이 CC 순수 컨트롤러(cc.rs, 26 tests) + 송신루프 배선 +
+  `min(abr, cc)` 합성 — U1, docs/design/cc-wiring.md (라이브 검증은 Gate B)
+- [x] Tetrys 슬라이딩윈도우 FEC 순수 코덱(fec.rs, 47 tests) — 전송 프레이밍/배선은 U2
+- [ ] CC 신호(송신측 service time) 대역폭 판정 — Gate B 벤치 셀; 부족 시
+  TWCC/수신측 타임스탬프 피드로 같은 on_frame API에 교체
+- [ ] 적응형 FEC 비율(고정 20% 탈피) A/B — U2 배선 후
 - [x] WebRTC target → bridge apply task → moonlight-common-c `0x5506` sender
 - [x] 10% hysteresis, 900ms 일반 제한, 20% 이상 하향은 즉시, 실패 시 baseline 미갱신
 - [x] `DYNAMIC_BITRATE_V1` capability gate + stock Sunshine 기본 미지원 처리
@@ -108,6 +170,34 @@ Parsec web app 문서
 - [ ] 보안 감사(ARCHITECTURE §보안 6항: 서명·짧은토큰·상수시간·replay·안전인코딩·revocation)
 - [ ] 입력(Gamepad/Keyboard Lock) secure-context 동작, 오디오, 재접속 안정성
 - [ ] upstream 병합 전략 정리
+
+## M5 — 서브프레임 슬라이스 + QU (ultra 코어 U3·U4, must-do)
+**목표:** 인코드→전송→디코드 겹침으로 프레임 내 지연을 깎고, 정지 화면을
+픽셀-퍼펙트로 만든다(데스크톱 모드의 구조적 "뭉개짐" 해결).
+
+- [ ] moonlight-common 포크의 슬라이스 콜백 granularity 조사(현재 1 콜백=1 프레임
+  가정 — slice-qu-constraints.md open question)
+- [ ] Sunshine 포크 NVENC 슬라이스 모드 + 스트리머 per-slice 즉시 송신. 깨지는
+  4개 불변 재설계: IDR 검출, PLI 응답, IDR 큐 클리어, RTP marker bit
+  (slice-qu-constraints.md §2)
+- [ ] QU 전용 reliable DataChannel(스트리머 단독) + 호스트 무손실 타일 인코드
+  경로(포크, 중규모) + 클라 합성 방식 결정
+- **검증:** Gate C 상관 계측에서 슬라이스 on/off 프레임 내 겹침 이득 실측. QU는
+  모션 정지 후 정지 화면 픽셀-퍼펙트 + 정적 대역 ~0. 하드 블로커 분류는
+  docs/design/slice-qu-constraints.md §4를 따른다.
+
+## M6 — 네이티브 클라이언트 (ultra 티어, must-do)
+**목표:** 지연 왕좌 — CUVID 4:4:4 디코드, VRR/tearing 프레젠트, WASAPI
+exclusive, Raw 입력. 웹 클라는 간편/호환 티어로 유지(동일 백엔드).
+
+- [ ] moonlight-qt 포크 스파이크: 커스텀 전송(CC/FEC/슬라이스 보존) 이식 공수
+  검증(리서치 05 추정 2–4주의 실측)
+- [ ] CUVID `ulMaxDisplayDelay=0` + `FLIP_DISCARD`/`ALLOW_TEARING`/waitable(1)
+  프레젠트 + WASAPI exclusive + RawInputBuffer/GameInput
+- [ ] (장기) Rust 네이티브(nvcodec-rs+wgpu+windows-rs) 전환 판단
+- **검증:** Gate C 외부 input-to-photon 계측으로 LAN 120Hz G2G 8–12ms 가설
+  (리서치 05 §3) 검증. 착수 조건 없음(owner 티어 판정으로 must-do) — 단 지연
+  우위 **대외 주장**은 Gate C 통과 후.
 
 ---
 

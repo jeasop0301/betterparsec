@@ -115,12 +115,13 @@ Parsec web app 문서
   3단 truth table로 만들고 실제로 끝까지 동작하는 조합만 광고한다.
 - [x] encoder bitrate 요청의 client state를 `sent_unacknowledged`로 제한하고 Foundation
   host log와 대조해 실제 NVENC apply를 별도로 증명한다.
-- [~] request-id 기반 protocol ACK: 설계·클라 상태머신(비활성)·호스트 패치까지
-  완료 — 옵코드는 Foundation 소스 확인으로 `0x5509` 확정(0x5507/0x5508 선점),
-  R-1/R-2/R-5/R-6 소스 해소, 패치 apply-검증
-  (docs/host-patches/foundation-sunshine-dynamic-bitrate-ack.patch). 잔여:
-  moonlight-common-c/rust 패치의 0x5509 수신 훅 + 상태머신 arming + 포크
-  빌드/라이브 검증 (f1-ack.md implementation order).
+- [~] request-id 기반 protocol ACK: 설계·클라 상태머신·0x5509 수신 훅/arming
+  (88bf433)·호스트 패치·**Foundation 포크 빌드/스테이징까지 완료** —
+  2026-07-14 컴파일 검증 통과(e110872d+양 패치, MSYS2 UCRT64), staged
+  바이너리가 stock identity로 기동·0x40|0x80 광고, 스왑/워치독 원복 3회
+  검증 (C:\tmp\foundation-build\stage, f1-ack.md step 4). 잔여: 라이브
+  0x5506→0x5509 왕복 1회 관측(사용자 브라우저 세션 5분) + step 5
+  ack_latency 벤치 상관.
 - [x] patched Moonlight dependency를 고정 revision + repository-owned patch + bootstrap/CI
   구조로 전환해 외부 로컬 작업 트리 없이 clean clone을 재현한다.
 - [ ] RTX 4070 ULL/슬라이스 인코드 지연 자체 실측(리서치 04 §3-1 문헌 상충 해소;

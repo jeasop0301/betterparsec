@@ -335,10 +335,15 @@ for the residual multi-request edge.
    with step 1's callback.
 3. [x] Foundation source access; R-1/R-2/R-5/R-6 confirmed (§6). Opcode moved
    to `0x5509`.
-4. [~] Host patch **written and apply-verified**
-   (`docs/host-patches/foundation-sunshine-dynamic-bitrate-ack.patch`);
-   compile + paired local Foundation build remains (fork-build session, user
-   present).
+4. [~] Host patch written, apply-verified, and **compile-verified** — full
+   Foundation build (e110872d + capability + ack patches, MSYS2 UCRT64,
+   gcc 16.1.0) succeeded 2026-07-14; staged binary launches with stock
+   pairing identity and advertises 0x40|0x80
+   (`docs/host-patches/foundation-sunshine-dynamic-bitrate-ack.patch`,
+   stage/swap/watchdog-restore machinery validated 3×). Remaining: live
+   paired stream with a 0x5506→0x5509 round-trip observed in the streamer
+   log (client logs receipt at info since 005496c) — needs one user browser
+   session against the swapped host.
 5. [ ] Measure `ack_latency_ms` in the benchmark runner; correlate with
    host-log NVENC apply records.
 6. [ ] Decide whether Tier B is required based on step 5 correlation quality.

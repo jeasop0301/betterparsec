@@ -967,6 +967,13 @@ impl StreamConnection {
                         (*requested_kbps, RuntimeBitrateControlState::SendFailed)
                     }
                     BitrateApplyStatus::Idle => continue,
+                    // 0x5507 ACK states: unreachable while ack tracking stays
+                    // disarmed (f1-ack.md R-1/R-2 unverified). Telemetry
+                    // mapping is added together with the receive path.
+                    BitrateApplyStatus::PendingAck { .. }
+                    | BitrateApplyStatus::Applied { .. }
+                    | BitrateApplyStatus::ApplyFailed { .. }
+                    | BitrateApplyStatus::AckTimeout { .. } => continue,
                 };
                 connection
                     .try_send_packet(
@@ -1028,6 +1035,12 @@ impl StreamConnection {
                         );
                     }
                     BitrateApplyStatus::Idle => {}
+                    // Filtered out by the telemetry match above (ACK tracking
+                    // is disarmed until f1-ack.md R-1/R-2 are verified).
+                    BitrateApplyStatus::PendingAck { .. }
+                    | BitrateApplyStatus::Applied { .. }
+                    | BitrateApplyStatus::ApplyFailed { .. }
+                    | BitrateApplyStatus::AckTimeout { .. } => {}
                 }
             }
         });

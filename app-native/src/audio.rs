@@ -1,0 +1,587 @@
+//! Audio — A0 slice 4 (design D7 Phase A,
+//! docs/design/unified-app-architecture.md §4-3).
+//!
+//! Opus decode through libavcodec's built-in decoder (same FFmpeg pin as
+//! video — no new native dependency) and WASAPI **shared**-mode render
+//! with a plain polling fill loop. Phase B replaces the sink with
+//! exclusive event-driven 128-frame buffers (spike §C-3); the decode
+//! half survives that switch.
+//!
+//! The host sends opus 48 kHz stereo over an RTP track (RFC 7587, one
+//! packet per payload); `client-transport` queues raw packets in
+//! [`RxCore`]'s sample queue and [`run`] drains it on the `a0-audio`
+//! thread: wait → decode → convert to the device mix format → fill.
+
+use std::collections::VecDeque;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::time::Duration;
+
+use client_transport::capi::RxCore;
+use ffmpeg_sys_next as ff;
+
+/// Audio failure. Fatal to audio only — the session and video continue.
+#[derive(Debug)]
+pub struct AudioError(pub String);
+
+impl std::fmt::Display for AudioError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+fn err_str(rc: i32) -> String {
+    let mut buf = [0u8; 128];
+    let ok = unsafe { ff::av_strerror(rc, buf.as_mut_ptr().cast(), buf.len()) } >= 0;
+    if !ok {
+        return format!("ffmpeg error {rc}");
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    format!("{} ({rc})", String::from_utf8_lossy(&buf[..end]))
+}
+
+// ── Shared state (audio thread → UI) ──────────────────────────────────────
+
+/// `AudioShared::state` values; 0 (default) = starting.
+pub const AUDIO_RUNNING: u8 = 1;
+pub const AUDIO_FAILED: u8 = 2;
+
+#[derive(Default)]
+pub struct AudioShared {
+    pub packets: AtomicU64,
+    pub decode_errors: AtomicU64,
+    /// 0 = starting, [`AUDIO_RUNNING`], [`AUDIO_FAILED`].
+    pub state: AtomicU8,
+}
+
+// ── Opus decode (libavcodec built-in) ─────────────────────────────────────
+
+/// Decodes RFC 7587 opus packets to interleaved f32 stereo @ 48 kHz.
+pub struct OpusDecoder {
+    ctx: *mut ff::AVCodecContext,
+    frame: *mut ff::AVFrame,
+    pkt: *mut ff::AVPacket,
+}
+
+// SAFETY: pointers are exclusively owned; the audio thread is the only
+// user (same argument as video::Decoder).
+unsafe impl Send for OpusDecoder {}
+
+impl OpusDecoder {
+    pub fn new() -> Result<Self, AudioError> {
+        unsafe {
+            let codec = ff::avcodec_find_decoder(ff::AVCodecID::AV_CODEC_ID_OPUS);
+            if codec.is_null() {
+                return Err(AudioError("no opus decoder in libavcodec".into()));
+            }
+            let ctx = ff::avcodec_alloc_context3(codec);
+            if ctx.is_null() {
+                return Err(AudioError("avcodec_alloc_context3 failed".into()));
+            }
+            let mut d = Self {
+                ctx,
+                frame: ptr::null_mut(),
+                pkt: ptr::null_mut(),
+            };
+            // RTP opus is always decoded at 48 kHz; TOC switches frame
+            // sizes internally. The track is stereo (RFC 7587 §4.2).
+            (*ctx).sample_rate = 48_000;
+            ff::av_channel_layout_default(&mut (*ctx).ch_layout, 2);
+            let rc = ff::avcodec_open2(ctx, codec, ptr::null_mut());
+            if rc < 0 {
+                return Err(AudioError(format!("avcodec_open2: {}", err_str(rc))));
+            }
+            d.frame = ff::av_frame_alloc();
+            d.pkt = ff::av_packet_alloc();
+            if d.frame.is_null() || d.pkt.is_null() {
+                return Err(AudioError("frame/packet alloc failed".into()));
+            }
+            Ok(d)
+        }
+    }
+
+    /// Decode one opus packet, appending interleaved stereo f32 @ 48 kHz
+    /// to `out`. Errors are per-packet: skip and continue.
+    pub fn decode(&mut self, data: &[u8], out: &mut Vec<f32>) -> Result<(), AudioError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            let rc = ff::av_new_packet(self.pkt, data.len() as i32);
+            if rc < 0 {
+                return Err(AudioError(format!("av_new_packet: {}", err_str(rc))));
+            }
+            ptr::copy_nonoverlapping(data.as_ptr(), (*self.pkt).data, data.len());
+            let rc = ff::avcodec_send_packet(self.ctx, self.pkt);
+            ff::av_packet_unref(self.pkt);
+            if rc < 0 && rc != ff::AVERROR(libc::EAGAIN) {
+                return Err(AudioError(format!("send_packet: {}", err_str(rc))));
+            }
+            loop {
+                let rc = ff::avcodec_receive_frame(self.ctx, self.frame);
+                if rc == ff::AVERROR(libc::EAGAIN) || rc == ff::AVERROR_EOF {
+                    break;
+                }
+                if rc < 0 {
+                    return Err(AudioError(format!("receive_frame: {}", err_str(rc))));
+                }
+                self.frame_to_f32(out)?;
+                ff::av_frame_unref(self.frame);
+            }
+        }
+        Ok(())
+    }
+
+    /// Interleave the current `self.frame` as stereo f32.
+    unsafe fn frame_to_f32(&mut self, out: &mut Vec<f32>) -> Result<(), AudioError> {
+        unsafe {
+            let f = self.frame;
+            let n = (*f).nb_samples as usize;
+            let ch = (*f).ch_layout.nb_channels as usize;
+            if n == 0 || ch == 0 {
+                return Ok(());
+            }
+            use ff::AVSampleFormat as S;
+            let fmt = (*f).format;
+            if fmt == S::AV_SAMPLE_FMT_FLTP as i32 {
+                // Planar float — libavcodec's native opus output.
+                let l = (*f).data[0].cast::<f32>();
+                let r = if ch > 1 { (*f).data[1].cast::<f32>() } else { l };
+                out.reserve(n * 2);
+                for i in 0..n {
+                    out.push(*l.add(i));
+                    out.push(*r.add(i));
+                }
+            } else if fmt == S::AV_SAMPLE_FMT_FLT as i32 {
+                // Already interleaved float.
+                let p = (*f).data[0].cast::<f32>();
+                out.reserve(n * 2);
+                for i in 0..n {
+                    let base = i * ch;
+                    out.push(*p.add(base));
+                    out.push(*p.add(base + usize::from(ch > 1)));
+                }
+            } else {
+                return Err(AudioError(format!("unsupported sample format {fmt}")));
+            }
+            Ok(())
+        }
+    }
+}
+
+impl Drop for OpusDecoder {
+    fn drop(&mut self) {
+        unsafe {
+            ff::av_packet_free(&mut self.pkt);
+            ff::av_frame_free(&mut self.frame);
+            ff::avcodec_free_context(&mut self.ctx);
+        }
+    }
+}
+
+// ── WASAPI shared-mode sink (Windows) ─────────────────────────────────────
+
+#[cfg(windows)]
+mod sink {
+    use super::AudioError;
+    use windows::Win32::Media::Audio::{
+        AUDCLNT_SHAREMODE_SHARED, IAudioClient, IAudioRenderClient, IMMDeviceEnumerator,
+        MMDeviceEnumerator, WAVEFORMATEXTENSIBLE, eConsole, eRender,
+    };
+    use windows::Win32::System::Com::{
+        CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+        CoUninitialize,
+    };
+    use windows::core::GUID;
+
+    const TAG_IEEE_FLOAT: u16 = 0x0003;
+    const TAG_EXTENSIBLE: u16 = 0xFFFE;
+    /// KSDATAFORMAT_SUBTYPE_IEEE_FLOAT.
+    const SUBTYPE_IEEE_FLOAT: GUID = GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
+
+    impl From<windows::core::Error> for AudioError {
+        fn from(e: windows::core::Error) -> Self {
+            Self(e.to_string())
+        }
+    }
+
+    /// Per-thread COM guard; create before any sink, drop after.
+    pub struct ComGuard(());
+
+    impl ComGuard {
+        pub fn init() -> Self {
+            // S_FALSE/RPC_E_CHANGED_MODE both leave COM usable here.
+            let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+            Self(())
+        }
+    }
+
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    /// Shared-mode render endpoint at the engine mix format (f32 only —
+    /// the shared engine format is float on every supported Windows).
+    pub struct WasapiOut {
+        client: IAudioClient,
+        render: IAudioRenderClient,
+        buffer_frames: u32,
+        pub rate: u32,
+        pub channels: u16,
+    }
+
+    impl WasapiOut {
+        pub fn new() -> Result<Self, AudioError> {
+            unsafe {
+                let enumerator: IMMDeviceEnumerator =
+                    CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+                let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
+                let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
+
+                let fmt = client.GetMixFormat()?;
+                let (rate, channels, is_f32) = {
+                    // WAVEFORMATEX(TENSIBLE) is packed — read fields
+                    // unaligned, never through references.
+                    let f = std::ptr::read_unaligned(fmt);
+                    let f32_fmt = match f.wFormatTag {
+                        TAG_IEEE_FLOAT => f.wBitsPerSample == 32,
+                        TAG_EXTENSIBLE => {
+                            let sub = std::ptr::addr_of!(
+                                (*fmt.cast::<WAVEFORMATEXTENSIBLE>()).SubFormat
+                            )
+                            .read_unaligned();
+                            sub == SUBTYPE_IEEE_FLOAT && f.wBitsPerSample == 32
+                        }
+                        _ => false,
+                    };
+                    (f.nSamplesPerSec, f.nChannels, f32_fmt)
+                };
+                if !is_f32 {
+                    CoTaskMemFree(Some(fmt.cast()));
+                    return Err(AudioError("mix format is not float32".into()));
+                }
+
+                // 200 ms buffer (100 ns units), timer-driven polling fill.
+                let rc = client.Initialize(
+                    AUDCLNT_SHAREMODE_SHARED,
+                    0,
+                    2_000_000,
+                    0,
+                    fmt,
+                    None,
+                );
+                CoTaskMemFree(Some(fmt.cast()));
+                rc?;
+                let buffer_frames = client.GetBufferSize()?;
+                let render: IAudioRenderClient = client.GetService()?;
+                client.Start()?;
+                Ok(Self {
+                    client,
+                    render,
+                    buffer_frames,
+                    rate,
+                    channels,
+                })
+            }
+        }
+
+        /// Move as many device-format frames (interleaved f32,
+        /// `self.channels` wide) from `fifo` into the render buffer as
+        /// currently fit. The engine plays silence when nothing is queued.
+        pub fn fill(&self, fifo: &mut std::collections::VecDeque<f32>) -> Result<(), AudioError> {
+            let ch = self.channels as usize;
+            unsafe {
+                let padding = self.client.GetCurrentPadding()?;
+                let writable = (self.buffer_frames - padding) as usize;
+                let frames = (fifo.len() / ch).min(writable);
+                if frames == 0 {
+                    return Ok(());
+                }
+                let buf = self.render.GetBuffer(frames as u32)?.cast::<f32>();
+                for i in 0..frames * ch {
+                    *buf.add(i) = fifo.pop_front().unwrap_or(0.0);
+                }
+                self.render.ReleaseBuffer(frames as u32, 0)?;
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for WasapiOut {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = self.client.Stop();
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+pub use sink::{ComGuard, WasapiOut};
+
+// ── Format conversion (48 kHz stereo → device format) ─────────────────────
+
+/// Convert interleaved stereo f32 @ 48 kHz into the device format and
+/// append to `fifo`. Channel map: L/R to the first two channels, other
+/// channels silent; mono downmixes. Rate mismatch uses linear
+/// interpolation (Phase A; the shared engine is 48 kHz virtually always).
+fn convert_into(
+    src: &[f32],
+    src_rate: u32,
+    dst_rate: u32,
+    dst_channels: u16,
+    fifo: &mut VecDeque<f32>,
+) {
+    let ch = dst_channels as usize;
+    let src_frames = src.len() / 2;
+    if src_frames == 0 || ch == 0 {
+        return;
+    }
+    let push = |fifo: &mut VecDeque<f32>, l: f32, r: f32| match ch {
+        1 => fifo.push_back((l + r) * 0.5),
+        _ => {
+            fifo.push_back(l);
+            fifo.push_back(r);
+            for _ in 2..ch {
+                fifo.push_back(0.0);
+            }
+        }
+    };
+    if src_rate == dst_rate {
+        for f in 0..src_frames {
+            push(fifo, src[f * 2], src[f * 2 + 1]);
+        }
+        return;
+    }
+    let dst_frames = (src_frames as u64 * dst_rate as u64 / src_rate as u64) as usize;
+    let step = src_rate as f64 / dst_rate as f64;
+    for i in 0..dst_frames {
+        let pos = i as f64 * step;
+        let i0 = pos as usize;
+        let i1 = (i0 + 1).min(src_frames - 1);
+        let t = (pos - i0 as f64) as f32;
+        let l = src[i0 * 2] * (1.0 - t) + src[i1 * 2] * t;
+        let r = src[i0 * 2 + 1] * (1.0 - t) + src[i1 * 2 + 1] * t;
+        push(fifo, l, r);
+    }
+}
+
+// ── Audio thread ───────────────────────────────────────────────────────────
+
+/// Audio thread body: drain the session's opus queue, decode, fill the
+/// default render endpoint. Returns when `stopped` is set. Any WASAPI
+/// init failure latches [`AUDIO_FAILED`] and receives-and-drops instead
+/// (keeps the sample queue from backing up).
+#[cfg(windows)]
+pub fn run(core: &RxCore, shared: &AudioShared, stopped: &AtomicBool) {
+    let _com = ComGuard::init();
+    let out = match WasapiOut::new() {
+        Ok(o) => {
+            tracing::info!(rate = o.rate, ch = o.channels, "WASAPI shared render up");
+            shared.state.store(AUDIO_RUNNING, Ordering::Release);
+            Some(o)
+        }
+        Err(e) => {
+            tracing::error!(err = %e, "WASAPI init failed — audio off");
+            shared.state.store(AUDIO_FAILED, Ordering::Release);
+            None
+        }
+    };
+    let mut dec = match OpusDecoder::new() {
+        Ok(d) => Some(d),
+        Err(e) => {
+            tracing::error!(err = %e, "opus decoder init failed — audio off");
+            shared.state.store(AUDIO_FAILED, Ordering::Release);
+            None
+        }
+    };
+
+    // Device-format FIFO between decode and fill; ~250 ms cap, drop
+    // oldest (latency beats continuity for realtime audio).
+    let mut fifo: VecDeque<f32> = VecDeque::new();
+    let mut pcm: Vec<f32> = Vec::new();
+    let fifo_cap = out
+        .as_ref()
+        .map(|o| o.rate as usize / 4 * o.channels as usize)
+        .unwrap_or(0);
+
+    loop {
+        match core.wait_audio(Duration::from_millis(20)) {
+            Some(pkt) => {
+                shared.packets.fetch_add(1, Ordering::Relaxed);
+                if let (Some(dec), Some(out)) = (dec.as_mut(), out.as_ref()) {
+                    pcm.clear();
+                    if let Err(e) = dec.decode(&pkt, &mut pcm) {
+                        shared.decode_errors.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(err = %e, "opus decode failed — skipping packet");
+                    } else {
+                        convert_into(&pcm, 48_000, out.rate, out.channels, &mut fifo);
+                        while fifo.len() > fifo_cap {
+                            fifo.pop_front();
+                        }
+                    }
+                }
+            }
+            None => {
+                if stopped.load(Ordering::Acquire) {
+                    return;
+                }
+                // Closed queue returns instantly; cap the spin.
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        if let Some(out) = out.as_ref()
+            && let Err(e) = out.fill(&mut fifo)
+        {
+            tracing::error!(err = %e, "WASAPI fill failed — audio off");
+            shared.state.store(AUDIO_FAILED, Ordering::Release);
+            dec = None;
+            fifo.clear();
+        }
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opus_decoder_initializes() {
+        OpusDecoder::new().expect("libavcodec has the built-in opus decoder");
+    }
+
+    /// Encode a sine with libavcodec's opus encoder (libopus, or the
+    /// native encoder under experimental compliance) and decode it back:
+    /// output must be 48 kHz stereo interleaved with real energy.
+    #[test]
+    fn opus_roundtrip_produces_stereo_pcm() {
+        unsafe {
+            let mut codec =
+                ff::avcodec_find_encoder_by_name(c"libopus".as_ptr());
+            let mut experimental = false;
+            if codec.is_null() {
+                codec = ff::avcodec_find_encoder(ff::AVCodecID::AV_CODEC_ID_OPUS);
+                experimental = true;
+            }
+            if codec.is_null() {
+                eprintln!("skipping: no opus encoder in this FFmpeg build");
+                return;
+            }
+            let ctx = ff::avcodec_alloc_context3(codec);
+            assert!(!ctx.is_null());
+            (*ctx).sample_rate = 48_000;
+            ff::av_channel_layout_default(&mut (*ctx).ch_layout, 2);
+            (*ctx).sample_fmt = if experimental {
+                (*ctx).strict_std_compliance = ff::FF_COMPLIANCE_EXPERIMENTAL;
+                ff::AVSampleFormat::AV_SAMPLE_FMT_FLTP
+            } else {
+                ff::AVSampleFormat::AV_SAMPLE_FMT_FLT
+            };
+            (*ctx).bit_rate = 96_000;
+            let rc = ff::avcodec_open2(ctx, codec, ptr::null_mut());
+            assert!(rc >= 0, "encoder open: {}", err_str(rc));
+            let frame_size = (*ctx).frame_size as usize; // typically 960
+            assert!(frame_size > 0);
+
+            // 4 frames of a 440 Hz sine.
+            let mut packets: Vec<Vec<u8>> = Vec::new();
+            let frame = ff::av_frame_alloc();
+            let pkt = ff::av_packet_alloc();
+            for k in 0..4 {
+                ff::av_frame_unref(frame);
+                (*frame).nb_samples = frame_size as i32;
+                (*frame).format = (*ctx).sample_fmt as i32;
+                (*frame).sample_rate = 48_000;
+                ff::av_channel_layout_default(&mut (*frame).ch_layout, 2);
+                assert!(ff::av_frame_get_buffer(frame, 0) >= 0);
+                for i in 0..frame_size {
+                    let t = (k * frame_size + i) as f32 / 48_000.0;
+                    let s = (t * 440.0 * std::f32::consts::TAU).sin() * 0.5;
+                    if experimental {
+                        // planar
+                        *(*frame).data[0].cast::<f32>().add(i) = s;
+                        *(*frame).data[1].cast::<f32>().add(i) = s;
+                    } else {
+                        // interleaved
+                        *(*frame).data[0].cast::<f32>().add(i * 2) = s;
+                        *(*frame).data[0].cast::<f32>().add(i * 2 + 1) = s;
+                    }
+                }
+                assert!(ff::avcodec_send_frame(ctx, frame) >= 0);
+                while ff::avcodec_receive_packet(ctx, pkt) >= 0 {
+                    let data =
+                        std::slice::from_raw_parts((*pkt).data, (*pkt).size as usize).to_vec();
+                    packets.push(data);
+                    ff::av_packet_unref(pkt);
+                }
+            }
+            assert!(!packets.is_empty(), "encoder produced packets");
+
+            let mut dec = OpusDecoder::new().expect("decoder");
+            let mut pcm = Vec::new();
+            for p in &packets {
+                dec.decode(p, &mut pcm).expect("decode");
+            }
+            assert!(!pcm.is_empty(), "decoded samples");
+            assert_eq!(pcm.len() % 2, 0, "interleaved stereo");
+            let energy: f32 = pcm.iter().map(|s| s * s).sum::<f32>() / pcm.len() as f32;
+            assert!(energy > 1e-4, "sine energy survives the roundtrip: {energy}");
+
+            // Cleanup.
+            let mut frame = frame;
+            let mut pkt = pkt;
+            let mut ctx = ctx;
+            ff::av_frame_free(&mut frame);
+            ff::av_packet_free(&mut pkt);
+            ff::avcodec_free_context(&mut ctx);
+        }
+    }
+
+    #[test]
+    fn convert_passthrough_and_channel_map() {
+        // Same rate, 2ch: identity.
+        let mut fifo = VecDeque::new();
+        convert_into(&[0.1, -0.1, 0.2, -0.2], 48_000, 48_000, 2, &mut fifo);
+        assert_eq!(Vec::from(fifo.clone()), vec![0.1, -0.1, 0.2, -0.2]);
+        // Mono downmix.
+        fifo.clear();
+        convert_into(&[0.4, 0.2], 48_000, 48_000, 1, &mut fifo);
+        assert_eq!(Vec::from(fifo.clone()), vec![0.3]);
+        // 4ch: L R 0 0.
+        fifo.clear();
+        convert_into(&[0.4, 0.2], 48_000, 48_000, 4, &mut fifo);
+        assert_eq!(Vec::from(fifo.clone()), vec![0.4, 0.2, 0.0, 0.0]);
+        // Rate halving keeps frame count proportional.
+        fifo.clear();
+        let src: Vec<f32> = (0..96).map(|i| i as f32 / 96.0).collect(); // 48 frames
+        convert_into(&src, 48_000, 24_000, 2, &mut fifo);
+        assert_eq!(fifo.len() / 2, 24);
+    }
+
+    /// Init the default render endpoint and push 100 ms of silence
+    /// through the shared engine. Skips when the machine has no audio
+    /// endpoint (bare CI).
+    #[cfg(windows)]
+    #[test]
+    fn wasapi_renders_silence() {
+        let _com = ComGuard::init();
+        let out = match WasapiOut::new() {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("skipping: {e}");
+                return;
+            }
+        };
+        assert!(out.rate > 0 && out.channels > 0);
+        let mut fifo: VecDeque<f32> =
+            std::iter::repeat_n(0.0, out.rate as usize / 10 * out.channels as usize).collect();
+        while !fifo.is_empty() {
+            out.fill(&mut fifo).expect("fill");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}

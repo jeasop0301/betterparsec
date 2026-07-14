@@ -12,6 +12,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[cfg(all(windows, feature = "video"))]
+mod audio;
+#[cfg(all(windows, feature = "video"))]
 mod present;
 #[cfg(feature = "video")]
 mod video;
@@ -189,6 +191,11 @@ struct Running {
     pump: Option<std::thread::JoinHandle<()>>,
     #[cfg(feature = "video")]
     video: Arc<VideoShared>,
+    /// Opus → WASAPI shared render thread (slice 4).
+    #[cfg(all(windows, feature = "video"))]
+    audio: Arc<audio::AudioShared>,
+    #[cfg(all(windows, feature = "video"))]
+    audio_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Running {
@@ -270,6 +277,19 @@ impl Running {
                 .expect("spawn frame pump")
         };
 
+        #[cfg(all(windows, feature = "video"))]
+        let audio_shared = Arc::new(audio::AudioShared::default());
+        #[cfg(all(windows, feature = "video"))]
+        let audio_thread = {
+            let core = core.clone();
+            let shared = audio_shared.clone();
+            let stats = stats.clone();
+            std::thread::Builder::new()
+                .name("a0-audio".into())
+                .spawn(move || audio::run(&core, &shared, &stats.stopped))
+                .expect("spawn audio thread")
+        };
+
         Self {
             session,
             core,
@@ -279,14 +299,22 @@ impl Running {
             pump: Some(pump),
             #[cfg(feature = "video")]
             video: video_shared,
+            #[cfg(all(windows, feature = "video"))]
+            audio: audio_shared,
+            #[cfg(all(windows, feature = "video"))]
+            audio_thread: Some(audio_thread),
         }
     }
 
     fn stop(mut self) {
         self.stats.stopped.store(true, Ordering::Release);
-        self.core.close(); // unblocks the pump
+        self.core.close(); // unblocks the pump and the audio thread
         if let Some(p) = self.pump.take() {
             let _ = p.join();
+        }
+        #[cfg(all(windows, feature = "video"))]
+        if let Some(a) = self.audio_thread.take() {
+            let _ = a.join();
         }
         self.session.stop();
     }
@@ -467,12 +495,23 @@ impl eframe::App for App {
                                 "egui fallback present"
                             },
                         ));
+                        #[cfg(windows)]
+                        ui.label(format!(
+                            "audio: {} (packets: {}, errors: {})",
+                            match run.audio.state.load(Ordering::Acquire) {
+                                audio::AUDIO_RUNNING => "wasapi shared",
+                                audio::AUDIO_FAILED => "off — see log",
+                                _ => "starting",
+                            },
+                            run.audio.packets.load(Ordering::Relaxed),
+                            run.audio.decode_errors.load(Ordering::Relaxed),
+                        ));
                     }
                     ui.add_space(8.0);
                     let disconnect = ui.button("Disconnect").clicked();
                     ui.add_space(4.0);
                     #[cfg(feature = "video")]
-                    ui.small("A0 slice 3: FFmpeg decode + raw D3D11 FLIP_DISCARD stream surface");
+                    ui.small("A0 slice 4: FFmpeg decode + raw D3D11 stream surface + WASAPI audio");
                     #[cfg(not(feature = "video"))]
                     ui.small("built without the `video` feature — frames are received and counted only");
 

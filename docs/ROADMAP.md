@@ -109,9 +109,19 @@ U5/M6 스파이크, f1-ack 소스 확인+0x5509 호스트 패치.
    디바이스 lost 시 1회 재생성 → egui 텍스처 폴백 래치(비 Windows 포함).
    검증 = 실 하드웨어 스왑체인 draw→백버퍼 readback 픽셀-동일 +
    중간 해상도 변경(ResizeBuffers) + Present 성공(4 tests 그린),
-   non-video 빌드 무손상, clippy(--tests 포함) 클린. 잔여 = **라이브
-   첫 픽셀**(owner 스모크, 5분, 슬라이스 2+3 동시 판정) → 슬라이스 4:
-   WASAPI shared 오디오(D7 Phase A) → A2 입력 왕복.
+   non-video 빌드 무손상, clippy(--tests 포함) 클린. **슬라이스 4 기계
+   완성** (2026-07-14, 헤드리스 검증): 오디오(D7 Phase A) — 지금까지
+   discard-read되던 opus RTP 트랙(RFC 7587)을 client-transport가
+   `RxCore` 샘플 큐(drop-oldest 64)로 라우팅(+C ABI
+   `ct_receiver_wait_audio` 미러·헤더 동기), app-native `a0-audio`
+   스레드가 avcodec 내장 opus 디코드(신규 네이티브 조달 0) → 믹스포맷
+   변환(채널맵·선형 리샘플) → WASAPI **shared** 폴링 필(200 ms 버퍼,
+   실패 시 오디오-off 래치·세션 무영향). 검증 = client-transport 22
+   tests(큐 FIFO/overflow/close·ABI 복사/절단/타임아웃) + app-native 8
+   tests(libopus 인코드→디코드 라운드트립 에너지, 변환 항등/다운믹스/
+   리샘플, 실 엔드포인트 100 ms 렌더), clippy 클린. 잔여 = **라이브
+   첫 픽셀+첫 소리**(owner 스모크, 5분, 슬라이스 2–4 동시 판정) → A2
+   입력 왕복(RawInput → input DataChannel).
 5. Gate B 2-machine 첫 신뢰 run — 이후 U1 CC 신호 판정, U2 P2 손실 복구
    실측·비율 튜닝, U3/U5 지연 계측이 전부 이 위에서 순차 판정된다.
 

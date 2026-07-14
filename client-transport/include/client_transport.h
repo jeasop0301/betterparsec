@@ -57,6 +57,14 @@ CtFrame *ct_receiver_wait_frame(CtReceiver *p, uint64_t timeout_ms);
 int32_t  ct_frame_view(const CtFrame *f, CtDecodeUnit *out);
 void     ct_frame_free(CtFrame *f);
 
+/* Audio pull loop (audio thread). Blocks up to timeout_ms for the next
+ * opus packet and copies it into buf (at most cap bytes). Returns the
+ * full packet length (truncated when > cap; 4096 always suffices for
+ * RFC 7587 payloads), 0 on timeout / after ct_receiver_close, -1 on
+ * NULL input. The packet is consumed either way. */
+intptr_t ct_receiver_wait_audio(CtReceiver *p, uint64_t timeout_ms,
+                                uint8_t *buf, size_t cap);
+
 /* ── Session (connection) ───────────────────────────────────────────────
  * ct_start connects like the browser does: POST /api/login (cookie) →
  * ws /api/host/stream signaling → WebRTC answer → video_fec subscribe.

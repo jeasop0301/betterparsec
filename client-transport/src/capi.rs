@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use transport_core::video_rx::{DecodeUnit, RxEvent, VideoReceiver};
 
-use crate::frame_queue::{DEFAULT_FRAME_CAP, FrameQueue};
+use crate::frame_queue::{DEFAULT_AUDIO_CAP, DEFAULT_FRAME_CAP, FrameQueue, SampleQueue};
 
 // ── Objects ───────────────────────────────────────────────────────────────
 
@@ -36,6 +36,9 @@ pub struct RxCore {
     /// error (e.g. missing reference after frame-queue eviction); drained
     /// through [`RxCore::poll_needs_idr`] like the receiver-side flags.
     decode_needs_idr: AtomicBool,
+    /// Opus packets from the audio RTP track (session `on_track` pushes;
+    /// the audio render thread pops). Independent of the video pipeline.
+    audio: SampleQueue,
 }
 
 impl RxCore {
@@ -45,6 +48,7 @@ impl RxCore {
             queue: FrameQueue::new(DEFAULT_FRAME_CAP),
             pending_ack: Mutex::new(None),
             decode_needs_idr: AtomicBool::new(false),
+            audio: SampleQueue::new(DEFAULT_AUDIO_CAP),
         }
     }
 
@@ -89,8 +93,20 @@ impl RxCore {
         self.queue.wait_pop(timeout)
     }
 
+    /// Push one opus packet from the audio RTP track (transport thread).
+    pub fn push_audio(&self, pkt: Vec<u8>) {
+        self.audio.push(pkt);
+    }
+
+    /// Block up to `timeout` for the next opus packet (audio thread).
+    /// `None` on timeout or after [`RxCore::close`].
+    pub fn wait_audio(&self, timeout: Duration) -> Option<Vec<u8>> {
+        self.audio.wait_pop(timeout)
+    }
+
     pub fn close(&self) {
         self.queue.close();
+        self.audio.close();
     }
 }
 
@@ -290,6 +306,42 @@ pub unsafe extern "C" fn ct_frame_view(f: *const CtFrame, out: *mut CtDecodeUnit
 pub unsafe extern "C" fn ct_frame_free(f: *mut CtFrame) {
     if !f.is_null() {
         drop(unsafe { Box::from_raw(f) });
+    }
+}
+
+// ── Audio pull loop (audio thread) ────────────────────────────────────────
+
+/// Block up to `timeout_ms` for the next opus packet and copy it into
+/// `buf` (at most `cap` bytes). Returns the full packet length (caller
+/// detects truncation when it exceeds `cap`; 4096 always suffices for
+/// RFC 7587 payloads), 0 on timeout / after [`ct_receiver_close`], -1 on
+/// NULL input. The packet is consumed either way.
+///
+/// # Safety
+/// `p` as in [`ct_receiver_free`]; `buf` must point to `cap` writable
+/// bytes (NULL only when `cap == 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ct_receiver_wait_audio(
+    p: *mut CtReceiver,
+    timeout_ms: u64,
+    buf: *mut u8,
+    cap: usize,
+) -> isize {
+    let Some(r) = (unsafe { p.as_ref() }) else {
+        return -1;
+    };
+    if buf.is_null() && cap != 0 {
+        return -1;
+    }
+    match r.core.wait_audio(Duration::from_millis(timeout_ms)) {
+        Some(pkt) => {
+            let n = pkt.len().min(cap);
+            if n > 0 {
+                unsafe { std::ptr::copy_nonoverlapping(pkt.as_ptr(), buf, n) };
+            }
+            pkt.len() as isize
+        }
+        None => 0,
     }
 }
 
@@ -633,6 +685,10 @@ mod tests {
                 0
             );
             assert_eq!(ct_receiver_poll_needs_idr(std::ptr::null_mut()), 0);
+            assert_eq!(
+                ct_receiver_wait_audio(std::ptr::null_mut(), 0, std::ptr::null_mut(), 0),
+                -1
+            );
             assert!(ct_receiver_wait_frame(std::ptr::null_mut(), 0).is_null());
             assert_eq!(ct_frame_view(std::ptr::null(), std::ptr::null_mut()), 0);
             ct_frame_free(std::ptr::null_mut());
@@ -642,10 +698,36 @@ mod tests {
         unsafe {
             // NULL buf with non-zero len must be rejected, not dereferenced.
             ct_receiver_on_message(rx.p(), std::ptr::null(), 5, 0);
+            assert_eq!(ct_receiver_wait_audio(rx.p(), 0, std::ptr::null_mut(), 8), -1);
             // NULL out pointer.
             assert_eq!(ct_receiver_poll_ack(rx.p(), std::ptr::null_mut()), 0);
         }
         feed(&rx, &[0xFF, 1, 2, 3], 0); // unknown symbol kind
         assert!(pop_frame(&rx, 5).is_none());
+    }
+
+    #[test]
+    fn audio_pull_copies_truncates_and_times_out() {
+        let rx = Rx::new(0);
+        let core = unsafe { &(*rx.p()).core };
+        core.push_audio(vec![0xAA, 0xBB, 0xCC]);
+        core.push_audio(vec![0x11; 10]);
+
+        let mut buf = [0u8; 8];
+        // Full copy.
+        let n = unsafe { ct_receiver_wait_audio(rx.p(), 0, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(n, 3);
+        assert_eq!(&buf[..3], &[0xAA, 0xBB, 0xCC]);
+        // Truncation: returns the full length, copies only `cap`.
+        let n = unsafe { ct_receiver_wait_audio(rx.p(), 0, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(n, 10);
+        assert_eq!(&buf, &[0x11; 8]);
+        // Timeout.
+        let n = unsafe { ct_receiver_wait_audio(rx.p(), 10, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(n, 0);
+        // Closed → 0 immediately.
+        unsafe { ct_receiver_close(rx.p()) };
+        let n = unsafe { ct_receiver_wait_audio(rx.p(), 30_000, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(n, 0);
     }
 }

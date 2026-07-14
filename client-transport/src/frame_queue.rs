@@ -112,6 +112,94 @@ impl FrameQueue {
     }
 }
 
+/// Default audio packet capacity. Opus packets arrive every 5–20 ms; 64
+/// packets is 320 ms–1.3 s of backlog — far more than the render buffer
+/// ever wants, so overflow only happens when the consumer stalls.
+pub const DEFAULT_AUDIO_CAP: usize = 64;
+
+#[derive(Debug, Default)]
+struct SampleState {
+    packets: VecDeque<Vec<u8>>,
+    closed: bool,
+}
+
+/// Thread-safe bounded FIFO of opaque audio packets (opus) with blocking
+/// pop. Unlike [`FrameQueue`], overflow drops the *oldest* packet: audio
+/// has no reference chain, and skipping ahead preserves latency at the
+/// cost of one inaudible gap.
+#[derive(Debug)]
+pub struct SampleQueue {
+    state: Mutex<SampleState>,
+    cond: Condvar,
+    cap: usize,
+}
+
+impl SampleQueue {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            state: Mutex::new(SampleState::default()),
+            cond: Condvar::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, SampleState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Push one packet. Returns `false` when the queue is closed.
+    pub fn push(&self, pkt: Vec<u8>) -> bool {
+        let mut st = self.lock();
+        if st.closed {
+            return false;
+        }
+        while st.packets.len() >= self.cap {
+            st.packets.pop_front();
+        }
+        st.packets.push_back(pkt);
+        drop(st);
+        self.cond.notify_one();
+        true
+    }
+
+    /// Block up to `timeout` for the next packet. `None` on timeout or
+    /// when the queue is closed and drained.
+    pub fn wait_pop(&self, timeout: Duration) -> Option<Vec<u8>> {
+        let mut st = self.lock();
+        loop {
+            if let Some(pkt) = st.packets.pop_front() {
+                return Some(pkt);
+            }
+            if st.closed {
+                return None;
+            }
+            let (guard, res) = self
+                .cond
+                .wait_timeout(st, timeout)
+                .unwrap_or_else(PoisonError::into_inner);
+            st = guard;
+            if res.timed_out() && st.packets.is_empty() {
+                return None;
+            }
+        }
+    }
+
+    /// Close the queue and wake all waiters. Queued packets stay poppable;
+    /// further pushes are rejected.
+    pub fn close(&self) {
+        self.lock().closed = true;
+        self.cond.notify_all();
+    }
+
+    pub fn len(&self) -> usize {
+        self.lock().packets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +323,59 @@ mod tests {
             got.windows(2).all(|w| w[0] < w[1]),
             "strictly increasing order"
         );
+    }
+
+    // ── SampleQueue (audio) ────────────────────────────────────────────
+
+    #[test]
+    fn sample_queue_fifo_and_timeout() {
+        let q = SampleQueue::new(8);
+        assert!(q.push(vec![1]));
+        assert!(q.push(vec![2, 2]));
+        assert_eq!(q.wait_pop(Duration::from_millis(10)), Some(vec![1]));
+        assert_eq!(q.wait_pop(Duration::from_millis(10)), Some(vec![2, 2]));
+        let t = Instant::now();
+        assert_eq!(q.wait_pop(Duration::from_millis(30)), None);
+        assert!(t.elapsed() >= Duration::from_millis(25), "timed out, not spun");
+    }
+
+    #[test]
+    fn sample_queue_overflow_drops_oldest_only() {
+        let q = SampleQueue::new(3);
+        for i in 0..5u8 {
+            assert!(q.push(vec![i]));
+        }
+        // 0 and 1 dropped; 2, 3, 4 remain in order.
+        assert_eq!(q.len(), 3);
+        assert_eq!(q.wait_pop(Duration::ZERO), Some(vec![2]));
+        assert_eq!(q.wait_pop(Duration::ZERO), Some(vec![3]));
+        assert_eq!(q.wait_pop(Duration::ZERO), Some(vec![4]));
+    }
+
+    #[test]
+    fn sample_queue_close_rejects_push_and_drains() {
+        let q = SampleQueue::new(4);
+        assert!(q.push(vec![7]));
+        q.close();
+        assert!(!q.push(vec![8]));
+        // Queued packet still poppable, then None immediately (no timeout).
+        assert_eq!(q.wait_pop(Duration::from_secs(5)), Some(vec![7]));
+        let t = Instant::now();
+        assert_eq!(q.wait_pop(Duration::from_secs(5)), None);
+        assert!(t.elapsed() < Duration::from_millis(100), "closed pop returns fast");
+    }
+
+    #[test]
+    fn sample_queue_close_wakes_blocked_waiter() {
+        let q = Arc::new(SampleQueue::new(4));
+        let waiter = {
+            let q = Arc::clone(&q);
+            std::thread::spawn(move || q.wait_pop(Duration::from_secs(30)))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        q.close();
+        let t = Instant::now();
+        assert_eq!(waiter.join().expect("join"), None);
+        assert!(t.elapsed() < Duration::from_secs(5), "woken by close");
     }
 }

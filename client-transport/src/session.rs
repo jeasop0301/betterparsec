@@ -361,7 +361,10 @@ async fn run_session(
                     match action {
                         FlowAction::Send(m) => send_ws(&ws_tx, &m).await?,
                         FlowAction::CreatePeer(ice_servers) => {
-                            peer = Some(create_peer(&api, ice_servers, ev_tx.clone()).await?);
+                            peer = Some(
+                                create_peer(&api, ice_servers, ev_tx.clone(), core.clone())
+                                    .await?,
+                            );
                         }
                         FlowAction::ApplyRemoteOffer(desc) => {
                             let p = peer.as_ref().context("offer before Setup")?;
@@ -444,6 +447,7 @@ async fn create_peer(
     api: &API,
     ice_servers: Vec<RtcIceServer>,
     ev_tx: mpsc::Sender<LocalEvent>,
+    core: Arc<RxCore>,
 ) -> anyhow::Result<Arc<RTCPeerConnection>> {
     let rtc_config = RTCConfiguration {
         ice_servers: ice_servers
@@ -517,19 +521,31 @@ async fn create_peer(
         done()
     }));
 
-    // Discard-read incoming RTP tracks (the default video path stays on the
-    // track; the probe consumes the FEC DataChannel duplicate). Not reading
+    // Incoming RTP tracks: opus audio feeds the receive core's sample
+    // queue (RFC 7587 — one opus packet per RTP payload, so no
+    // depacketizer stage). The video track is discard-read: the default
+    // video path stays on the FEC DataChannel duplicate, but not reading
     // would stall the interceptor pipeline.
     peer.on_track(Box::new(move |track, _receiver, _transceiver| {
+        let core = core.clone();
         Box::pin(async move {
-            debug!(
-                "track from host: {} — discard-reading",
-                track.codec().capability.mime_type
-            );
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 1500];
-                while track.read(&mut buf).await.is_ok() {}
-            });
+            let mime = track.codec().capability.mime_type.to_ascii_lowercase();
+            if mime == "audio/opus" {
+                debug!("track from host: {mime} — feeding audio queue");
+                tokio::spawn(async move {
+                    while let Ok((pkt, _)) = track.read_rtp().await {
+                        if !pkt.payload.is_empty() {
+                            core.push_audio(pkt.payload.to_vec());
+                        }
+                    }
+                });
+            } else {
+                debug!("track from host: {mime} — discard-reading");
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 1500];
+                    while track.read(&mut buf).await.is_ok() {}
+                });
+            }
         })
     }));
 

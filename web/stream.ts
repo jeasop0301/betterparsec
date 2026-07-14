@@ -218,6 +218,10 @@ class ViewerApp implements Component {
         })
 
         document.addEventListener("pointerlockchange", this.onPointerLockChange.bind(this))
+        // A pointer lock request has settled (granted or refused): clear the
+        // in-flight guard so it can never brick future requests, even if the
+        // request promise itself hangs (e.g. the page lost focus).
+        document.addEventListener("pointerlockerror", () => { this.pointerLockPending = false })
         document.addEventListener("fullscreenchange", this.onFullscreenChange.bind(this))
 
         window.addEventListener("gamepadconnected", this.onGamepadConnect.bind(this))
@@ -736,6 +740,9 @@ class ViewerApp implements Component {
         }
     }
     private onPointerLockChange() {
+        // The request settled — clear the in-flight guard (see the constructor
+        // pointerlockerror listener for the refusal case).
+        this.pointerLockPending = false
         this.checkFullyImmersed()
 
         if (!document.pointerLockElement) {

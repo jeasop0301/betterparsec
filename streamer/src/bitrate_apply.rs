@@ -17,9 +17,8 @@ pub(crate) enum BitrateApplyOutcome {
 
 /// `0x5509` ACK status (u32 LE on the wire). See docs/design/f1-ack.md §2.
 /// A Tier A host emits only `Dispatched` or `ValidationFailed`.
-// Constructed only by the (not yet wired) 0x5509 receive path and tests —
-// production stays on the legacy path until f1-ack.md R-1/R-2 are verified.
-#[allow(dead_code)]
+// Produced by the 0x5509 receive path (main.rs ack drain, wired 88bf433)
+// and tests. R-1/R-2 were source-confirmed 2026-07-14 (f1-ack.md §6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AckStatus {
     /// Validation passed, encoder event queued (Tier A success).
@@ -38,8 +37,7 @@ impl AckStatus {
     /// Decode the wire value. Unknown values (5..=u32::MAX) are rejected —
     /// a forward-compatible host emitting a new status must not be
     /// misinterpreted as one of the known outcomes.
-    // Caller will be the 0x5509 receive path (not yet wired; f1-ack.md R-2).
-    #[allow(dead_code)]
+    // Caller: the 0x5509 ack drain in main.rs (wired 88bf433).
     pub(crate) fn from_wire(raw: u32) -> Option<Self> {
         match raw {
             0 => Some(Self::Dispatched),
@@ -153,10 +151,10 @@ pub(crate) struct BitrateApplyMachine {
     status: BitrateApplyStatus,
     last_attempt_ms: Option<u64>,
     /// True only after the host advertises the 0x5509 ACK capability
-    /// (LI_FF_DYNAMIC_BITRATE_ACK, 0x80). MUST stay false until Foundation
-    /// R-1/R-2 are verified (docs/design/f1-ack.md): with 0x40-only hosts,
-    /// entering PendingAck would wait forever and retry-loop every 3 s.
-    /// No production caller sets this yet — shipped behavior is unchanged.
+    /// (LI_FF_DYNAMIC_BITRATE_ACK, 0x80) — armed in main.rs from the parsed
+    /// `host_features.dynamic_bitrate_ack`. With 0x40-only hosts, entering
+    /// PendingAck would wait forever and retry-loop every 3 s, so both bits
+    /// are required (docs/design/f1-ack.md §3).
     ack_supported: bool,
 }
 
@@ -193,9 +191,7 @@ impl BitrateApplyMachine {
     /// `ApplyFailed` and returns the new status; an ACK arriving in any other
     /// state (late ACK after timeout, duplicate, unexpected delivery) is
     /// discarded and returns `None` with the state unchanged.
-    // Inactive until the 0x5509 receive path exists (f1-ack.md R-2);
-    // exercised by unit tests only.
-    #[allow(dead_code)]
+    // Caller: the 0x5509 ack drain in main.rs (wired 88bf433).
     pub(crate) fn handle_ack(
         &mut self,
         applied_kbps: u32,

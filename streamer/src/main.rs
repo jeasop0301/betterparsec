@@ -1000,12 +1000,7 @@ impl StreamConnection {
                             let now_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                             if let Some(new_status) = machine.handle_ack(applied_kbps, wire_status)
                             {
-                                trace!(
-                                    applied_kbps,
-                                    raw_status,
-                                    ?new_status,
-                                    "0x5509 ACK received"
-                                );
+                                info!(applied_kbps, raw_status, ?new_status, "0x5509 ACK received");
                                 // Record ack_latency_ms when transitioning to Applied
                                 if let BitrateApplyStatus::Applied {
                                     requested_kbps,
@@ -1017,7 +1012,7 @@ impl StreamConnection {
                                 }
                             }
                         } else {
-                            trace!(raw_status, "0x5509 ACK: unknown status value; discarding");
+                            warn!(raw_status, "0x5509 ACK: unknown status value; discarding");
                         }
                     }
                 }

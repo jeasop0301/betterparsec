@@ -418,6 +418,10 @@ class ViewerApp implements Component {
     }
 
     // Mouse
+    // Swallows the mouseup paired with a click that was consumed to (re)arm
+    // pointer lock, so the host never sees a button-up without its down.
+    private pendingPointerLockMouseGesture = false
+
     onMouseButtonDown(event: MouseEvent) {
         if (this.consumeAutoFullscreenInteraction()) {
             this.pendingAutoFullscreenMouseGesture = true
@@ -428,12 +432,34 @@ class ViewerApp implements Component {
 
         this.onUserInteraction()
 
+        // Relative mode without an active pointer lock: the fullscreen-entry
+        // request can fail (gesture already consumed by requestFullscreen) or
+        // the lock can drop (Esc, focus loss) — without this, movement deltas
+        // stop at the window edge and mouselook cannot turn past it. A click
+        // is a fresh user gesture, the most reliable acquisition path; swallow
+        // it so the arming press does not fire an action in-game.
+        if (this.inputConfig.mouseMode == "relative" && !document.pointerLockElement) {
+            this.pendingPointerLockMouseGesture = true
+            event.preventDefault()
+            event.stopPropagation()
+            this.requestPointerLock().catch((error) => {
+                console.warn("Pointer lock re-arm failed", error)
+            })
+            return
+        }
+
         event.preventDefault()
         this.stream.getInput().onMouseDown(event, this.getStreamRect());
 
         event.stopPropagation()
     }
     onMouseButtonUp(event: MouseEvent) {
+        if (this.pendingPointerLockMouseGesture) {
+            this.pendingPointerLockMouseGesture = false
+            event.preventDefault()
+            event.stopPropagation()
+            return
+        }
         if (this.pendingAutoFullscreenMouseGesture) {
             this.pendingAutoFullscreenMouseGesture = false
             event.preventDefault()

@@ -669,71 +669,65 @@ class ViewerApp implements Component {
 
     // Pointer Lock
     //
-    // Learned once per page: when a browser rejects the unadjustedMovement
-    // options form, its rejection arrives ASYNC — by then the user gesture is
-    // consumed and the plain-call fallback throws "user gesture required",
-    // so every attempt fails forever. Remember the failure and issue the
-    // plain call synchronously (inside the gesture) from then on.
+    // `pointerLockOptionsUnsupported`: a browser that rejects the
+    // `unadjustedMovement` options form has its rejection delivered ASYNC, by
+    // which point the user gesture is spent. Remember it and use the plain
+    // call on the NEXT gesture instead of retrying inside this one.
     private pointerLockOptionsUnsupported = false
+    // Exactly one request may be in flight. Issuing a second
+    // `requestPointerLock` while one is pending throws InUseAttributeError
+    // ("Pointer lock pending") — the two entry points (Lock Mouse button and
+    // click-to-relock) plus any stray gesture would otherwise collide. Set and
+    // cleared synchronously around the awaited request; JS is single-threaded,
+    // so no two invocations can pass the guard between the check and the set.
+    private pointerLockPending = false
 
     async requestPointerLock(errorIfNotFound: boolean = false) {
-        this.previousMouseMode = this.inputConfig.mouseMode
-
         const inputElement = document.getElementById("input") as HTMLDivElement
 
-        if (inputElement && "requestPointerLock" in inputElement && typeof inputElement.requestPointerLock == "function") {
-            this.focusInput()
+        if (!(inputElement && "requestPointerLock" in inputElement && typeof inputElement.requestPointerLock == "function")) {
+            if (errorIfNotFound) {
+                await showMessage(I.stream.pointerLockUnsupported)
+            }
+            return
+        }
 
-            this.inputConfig.mouseMode = "relative"
-            this.setInputConfig(this.inputConfig)
+        // Already locked, or a request is still resolving. A concurrent
+        // request is the InUseAttributeError this guards against; a redundant
+        // one when already locked is simply a no-op.
+        if (this.pointerLockPending || document.pointerLockElement === inputElement) {
+            return
+        }
 
-            setSidebarExtended(false)
+        this.previousMouseMode = this.inputConfig.mouseMode
+        this.focusInput()
+        this.inputConfig.mouseMode = "relative"
+        this.setInputConfig(this.inputConfig)
+        setSidebarExtended(false)
 
+        this.pointerLockPending = true
+        try {
+            // unadjustedMovement gives raw deltas (no OS pointer acceleration).
+            // Exactly one request per gesture — no competing pointerlockerror
+            // retry (that second request, fired while this one was pending, was
+            // the "Pointer lock pending" bug). A browser that rejects the
+            // options form trips the flag; the next click uses the plain call
+            // (retrying here would land outside the user-activation window).
             if (this.pointerLockOptionsUnsupported) {
-                inputElement.requestPointerLock()
-                return
+                await inputElement.requestPointerLock()
+            } else {
+                await inputElement.requestPointerLock({ unadjustedMovement: true })
             }
-
-            const onLockError = () => {
-                document.removeEventListener("pointerlockerror", onLockError)
+        } catch (error) {
+            // Only the options form being unsupported should disable it; an
+            // InUseAttributeError (should no longer occur behind the guard) or
+            // transient rejection must not permanently drop unadjustedMovement.
+            if (error instanceof Error && (error.name == "NotSupportedError" || error.name == "InvalidStateError")) {
                 this.pointerLockOptionsUnsupported = true
-
-                // Fallback: try to request pointer lock without options.
-                // May be past the gesture window — the next click retakes
-                // the synchronous plain-call path above.
-                inputElement.requestPointerLock()
             }
-
-            document.addEventListener("pointerlockerror", onLockError, { once: true })
-
-            try {
-                let promise = inputElement.requestPointerLock({
-                    unadjustedMovement: true
-                })
-
-                if (promise) {
-                    await promise
-                } else {
-                    inputElement.requestPointerLock()
-                }
-            } catch (error) {
-                console.warn("Pointer lock with unadjustedMovement failed", error)
-                this.pointerLockOptionsUnsupported = true
-                // Some platforms do not support unadjusted movement. If you
-                // would like PointerLock anyway, request again. This retry can
-                // land outside the gesture window; the next click uses the
-                // synchronous plain-call path above and succeeds.
-                if (error instanceof Error && error.name == "NotSupportedError") {
-                    inputElement.requestPointerLock()
-                } else {
-                    throw error
-                }
-            } finally {
-                document.removeEventListener("pointerlockerror", onLockError)
-            }
-
-        } else if (errorIfNotFound) {
-            await showMessage(I.stream.pointerLockUnsupported)
+            console.warn("Pointer lock request failed; next click retries", error)
+        } finally {
+            this.pointerLockPending = false
         }
     }
     async exitPointerLock() {

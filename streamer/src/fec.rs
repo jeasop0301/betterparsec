@@ -1760,6 +1760,61 @@ mod tests {
             "in-spec repair sharing the rejected key must still be accepted and recover");
     }
 
+    /// Exact cap boundary: a 128-symbol repair window (the widest our encoder
+    /// can emit — window_max_symbols clamps to 128) is ACCEPTED and usable for
+    /// recovery; 129 is the first rejected width (guard is `window_len > 128`,
+    /// textually mirrored in the TS decoder).
+    #[test]
+    fn pin_repair_window_cap_boundary_128_accepted_129_rejected() {
+        // Encoder: redundancy 1/128 with a full 128-symbol window → exactly one
+        // repair, emitted on the 128th push, covering [0, 128).
+        let config = FecConfig {
+            redundancy_numerator: 1,
+            redundancy_denominator: 128,
+            window_max_symbols: 128,
+            window_max_bytes: 1 << 24,
+        };
+        let mut enc = FecEncoder::new(config);
+        let mut repair_128 = None;
+        for seq in 0..128u32 {
+            let out = enc.push_source(seq, &[seq as u8]);
+            for r in out.repairs {
+                repair_128 = Some(r);
+            }
+        }
+        let repair_128 = repair_128.expect("1/128 ratio must emit a repair by push 128");
+        match &repair_128 {
+            Symbol::Repair { window_base, window_end, .. } => {
+                assert_eq!(window_end.wrapping_sub(*window_base), 128,
+                    "test premise: repair must span the full 128-symbol window");
+            }
+            _ => unreachable!(),
+        }
+
+        // Decoder receives every source except seq 0, then the 128-wide repair:
+        // acceptance at the exact cap is proven by the recovery of seq 0.
+        let mut dec = FecDecoder::new(128, 1 << 24);
+        for seq in 1..128u32 {
+            dec.push_symbol(Symbol::Source { seq, payload: vec![seq as u8] });
+        }
+        let events = dec.push_symbol(repair_128);
+        let recovered = events.iter().any(|e| matches!(
+            e,
+            DecoderEvent::Recovered { seq: 0, payload } if payload.as_slice() == [0u8]
+        ));
+        assert!(recovered, "128-wide repair window must be accepted at the cap");
+
+        // 129: first rejected width — no events, decoder state untouched.
+        let mut dec2 = FecDecoder::new(128, 1 << 24);
+        let events = dec2.push_symbol(Symbol::Repair {
+            repair_seq: 7,
+            window_base: 0,
+            window_end: 129,
+            payload: vec![0, 0],
+        });
+        assert!(events.is_empty(), "129-wide repair window must be rejected");
+    }
+
     /// window_max_symbols=u16::MAX → sanitised() clamps to 128.
     #[test]
     fn symbol_cap_u16_max_clamped_to_128() {

@@ -247,6 +247,14 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
 **목표:** 지연 왕좌 — CUVID 4:4:4 디코드, VRR/tearing 프레젠트, WASAPI
 exclusive, Raw 입력. 웹 클라는 간편/호환 티어로 유지(동일 백엔드).
 
+**제품 방향 (owner, 2026-07-14)**: 최종 형태는 **Sunshine+Moonlight 통합
+양방향 단일 앱**(호스트도 되고 클라도 되는), UI·알고리즘 전면 자체화 —
+웹/네이티브 공통 전역 개편. 따라서 moonlight-qt 포크(Option-3)는 **참조
+구현·지연 검증 비히클**이지 제품 셸이 아니다. 투자 우선순위는 UI-무관
+엔진 조각(transport-core, client-transport, cc/fec/cursor 알고리즘)에
+두고, 포크 전용 글루는 최소화한다. "(장기) Rust 네이티브 전환 판단"은
+판단이 아니라 **확정된 종착지**로 승격 — 시점만 Gate C 검증 후 결정.
+
 - [x] moonlight-qt 포크 스파이크: 커스텀 전송(CC/FEC/슬라이스 보존) 이식 공수
   검증 — 2026-07-14 완료, docs/design/m6-native-spike.md. 판정: "2–4주"는
   OPTIMISTIC, 현실 3–5주(~1.4–1.7k LOC). 접합 = Rust cdylib 사이드카

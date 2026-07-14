@@ -1,14 +1,19 @@
-//! client-transport — the native (moonlight-qt fork) client's transport
-//! sidecar cdylib (m6-native-spike.md Option-3, M6 W1).
+//! client-transport — BetterParsec native client transport engine
+//! (m6-native-spike.md Option-3, M6 W1).
 //!
-//! Receive path: `video_fec` DataChannel bytes → `transport_core::video_rx`
-//! (FEC decode + reassembly) → [`frame_queue::FrameQueue`] → C ABI pull loop
-//! ([`capi::ct_receiver_wait_frame`]) consumed by the FFmpeg decoder thread
-//! in place of `LiWaitForNextVideoFrame`.
+//! Product direction (owner, 2026-07-14): the end state is a unified
+//! bidirectional Sunshine+Moonlight app with a fully custom UI. This crate
+//! is deliberately UI-agnostic: everything here survives the shell swap
+//! (moonlight-qt fork today, our own native shell later).
 //!
-//! The WebRTC/signaling client half of W1 (ICE + DataChannel subscribe)
-//! attaches on top of [`capi::ct_receiver_on_message`]; the C header
-//! contract lives in `include/client_transport.h`.
+//! Receive path: signaling ([`session`] + [`flow`]) → WebRTC peer →
+//! `video_fec` DataChannel → `transport_core::video_rx` (FEC decode +
+//! reassembly) → [`frame_queue::FrameQueue`] → C ABI pull loop
+//! ([`capi::ct_receiver_wait_frame`]) consumed by the decoder thread in
+//! place of `LiWaitForNextVideoFrame`.
 
 pub mod capi;
+pub mod flow;
 pub mod frame_queue;
+pub mod session;
+pub mod tls;

@@ -57,6 +57,37 @@ CtFrame *ct_receiver_wait_frame(CtReceiver *p, uint64_t timeout_ms);
 int32_t  ct_frame_view(const CtFrame *f, CtDecodeUnit *out);
 void     ct_frame_free(CtFrame *f);
 
+/* ── Session (connection) ───────────────────────────────────────────────
+ * ct_start connects like the browser does: POST /api/login (cookie) →
+ * ws /api/host/stream signaling → WebRTC answer → video_fec subscribe.
+ * Frames land in the receiver's queue; ACK/needs-IDR replies are sent
+ * automatically by the session's internal 50 ms ticker.
+ */
+typedef struct CtSession CtSession;
+
+typedef struct CtSessionConfig {
+    const char *base_url;   /* e.g. "https://192.168.0.10:8080" */
+    const char *username;
+    const char *password;
+    uint32_t host_id;
+    uint32_t app_id;
+    uint32_t bitrate_kbps;
+    uint32_t width;
+    uint32_t height;
+    uint32_t fps;
+    /* 1 = accept any TLS certificate (dev only). When 0, cert_sha256 must
+     * point to the 32-byte SHA-256 of the server certificate (DER). */
+    uint8_t insecure_tls;
+    const uint8_t *cert_sha256;
+} CtSessionConfig;
+
+/* NULL on invalid config. The receiver must outlive the session. */
+CtSession *ct_start(const CtSessionConfig *cfg, CtReceiver *rx);
+/* 0=connecting 1=peer-connected 2=streaming 3=failed 4=stopped, -1 NULL. */
+int32_t ct_session_state(const CtSession *s);
+/* Stops (joins) and frees. Closes the receiver queue as a side effect. */
+void ct_stop(CtSession *s);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

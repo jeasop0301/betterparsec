@@ -12,7 +12,7 @@
 //! The mirror C header lives at `client-transport/include/client_transport.h`
 //! and must stay in sync with this file.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use transport_core::video_rx::{DecodeUnit, RxEvent, VideoReceiver};
@@ -21,14 +21,69 @@ use crate::frame_queue::{DEFAULT_FRAME_CAP, FrameQueue};
 
 // ── Objects ───────────────────────────────────────────────────────────────
 
-/// Opaque receiver handle (`CtReceiver*` in C).
-pub struct CtReceiver {
+/// Shared receive core: FEC receive pipeline + frame queue + ack latch.
+/// `Arc`-shared between the C ABI handle and the Rust session
+/// (`crate::session`) so both can drive the same pipeline.
+pub struct RxCore {
     rx: Mutex<VideoReceiver>,
     queue: FrameQueue,
     /// Latest un-polled ACK value. ACKs are cumulative
     /// (highest_fully_decoded), so newest-wins collapsing is lossless for
     /// the host window — see fec-framing.md §2.
     pending_ack: Mutex<Option<u32>>,
+}
+
+impl RxCore {
+    pub fn new(now_ms: u64) -> Self {
+        Self {
+            rx: Mutex::new(VideoReceiver::new(now_ms)),
+            queue: FrameQueue::new(DEFAULT_FRAME_CAP),
+            pending_ack: Mutex::new(None),
+        }
+    }
+
+    pub fn on_message(&self, bytes: &[u8], now_ms: u64) {
+        let events = lock_ignore_poison(&self.rx).on_message(bytes, now_ms);
+        for ev in events {
+            match ev {
+                RxEvent::Frame(unit) => {
+                    self.queue.push(unit);
+                }
+                RxEvent::Ack(a) => {
+                    *lock_ignore_poison(&self.pending_ack) = Some(a);
+                }
+            }
+        }
+    }
+
+    pub fn tick(&self, now_ms: u64) {
+        if let Some(a) = lock_ignore_poison(&self.rx).tick(now_ms) {
+            *lock_ignore_poison(&self.pending_ack) = Some(a);
+        }
+    }
+
+    pub fn poll_ack(&self) -> Option<u32> {
+        lock_ignore_poison(&self.pending_ack).take()
+    }
+
+    pub fn poll_needs_idr(&self) -> bool {
+        let rx_flag = lock_ignore_poison(&self.rx).poll_needs_idr();
+        let overflow = self.queue.take_overflowed();
+        rx_flag || overflow
+    }
+
+    pub fn wait_frame(&self, timeout: Duration) -> Option<DecodeUnit> {
+        self.queue.wait_pop(timeout)
+    }
+
+    pub fn close(&self) {
+        self.queue.close();
+    }
+}
+
+/// Opaque receiver handle (`CtReceiver*` in C).
+pub struct CtReceiver {
+    pub(crate) core: Arc<RxCore>,
 }
 
 /// Opaque frame handle (`CtFrame*` in C). Owns the frame bytes; the view
@@ -54,9 +109,7 @@ pub struct CtDecodeUnit {
 #[unsafe(no_mangle)]
 pub extern "C" fn ct_receiver_new(now_ms: u64) -> *mut CtReceiver {
     Box::into_raw(Box::new(CtReceiver {
-        rx: Mutex::new(VideoReceiver::new(now_ms)),
-        queue: FrameQueue::new(DEFAULT_FRAME_CAP),
-        pending_ack: Mutex::new(None),
+        core: Arc::new(RxCore::new(now_ms)),
     }))
 }
 
@@ -70,7 +123,7 @@ pub unsafe extern "C" fn ct_receiver_close(p: *mut CtReceiver) {
     let Some(r) = (unsafe { p.as_ref() }) else {
         return;
     };
-    r.queue.close();
+    r.core.close();
 }
 
 /// Destroy the receiver. NULL is ignored.
@@ -113,18 +166,7 @@ pub unsafe extern "C" fn ct_receiver_on_message(
     } else {
         unsafe { std::slice::from_raw_parts(buf, len) }
     };
-
-    let events = lock_ignore_poison(&r.rx).on_message(bytes, now_ms);
-    for ev in events {
-        match ev {
-            RxEvent::Frame(unit) => {
-                r.queue.push(unit);
-            }
-            RxEvent::Ack(a) => {
-                *lock_ignore_poison(&r.pending_ack) = Some(a);
-            }
-        }
-    }
+    r.core.on_message(bytes, now_ms);
 }
 
 /// ~50 ms timer tick (keeps the host encoder window advancing on idle
@@ -137,9 +179,7 @@ pub unsafe extern "C" fn ct_receiver_tick(p: *mut CtReceiver, now_ms: u64) {
     let Some(r) = (unsafe { p.as_ref() }) else {
         return;
     };
-    if let Some(a) = lock_ignore_poison(&r.rx).tick(now_ms) {
-        *lock_ignore_poison(&r.pending_ack) = Some(a);
-    }
+    r.core.tick(now_ms);
 }
 
 /// Take the latest un-sent ACK. Returns 1 and writes `*out` when one is
@@ -155,7 +195,7 @@ pub unsafe extern "C" fn ct_receiver_poll_ack(p: *mut CtReceiver, out: *mut u32)
     if out.is_null() {
         return 0;
     }
-    match lock_ignore_poison(&r.pending_ack).take() {
+    match r.core.poll_ack() {
         Some(a) => {
             unsafe { *out = a };
             1
@@ -174,9 +214,7 @@ pub unsafe extern "C" fn ct_receiver_poll_needs_idr(p: *mut CtReceiver) -> i32 {
     let Some(r) = (unsafe { p.as_ref() }) else {
         return 0;
     };
-    let rx_flag = lock_ignore_poison(&r.rx).poll_needs_idr();
-    let overflow = r.queue.take_overflowed();
-    i32::from(rx_flag || overflow)
+    i32::from(r.core.poll_needs_idr())
 }
 
 // ── Decoder pull loop (decoder thread) ────────────────────────────────────
@@ -196,7 +234,7 @@ pub unsafe extern "C" fn ct_receiver_wait_frame(
     let Some(r) = (unsafe { p.as_ref() }) else {
         return std::ptr::null_mut();
     };
-    match r.queue.wait_pop(Duration::from_millis(timeout_ms)) {
+    match r.core.wait_frame(Duration::from_millis(timeout_ms)) {
         Some(unit) => Box::into_raw(Box::new(CtFrame(unit))),
         None => std::ptr::null_mut(),
     }
@@ -239,6 +277,125 @@ pub unsafe extern "C" fn ct_frame_view(f: *const CtFrame, out: *mut CtDecodeUnit
 pub unsafe extern "C" fn ct_frame_free(f: *mut CtFrame) {
     if !f.is_null() {
         drop(unsafe { Box::from_raw(f) });
+    }
+}
+
+// ── Session (connection) ABI ──────────────────────────────────────────────
+
+/// C-side session configuration for [`ct_start`]. All strings are
+/// NUL-terminated UTF-8; lifetimes only need to cover the `ct_start` call.
+#[repr(C)]
+pub struct CtSessionConfig {
+    /// e.g. `https://192.168.0.10:8080` (no trailing slash).
+    pub base_url: *const std::os::raw::c_char,
+    pub username: *const std::os::raw::c_char,
+    pub password: *const std::os::raw::c_char,
+    pub host_id: u32,
+    pub app_id: u32,
+    pub bitrate_kbps: u32,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    /// 1 = accept any TLS certificate (dev only). When 0, `cert_sha256`
+    /// must point to the 32-byte SHA-256 of the server certificate (DER).
+    pub insecure_tls: u8,
+    pub cert_sha256: *const u8,
+}
+
+/// Opaque session handle (`CtSession*` in C).
+pub struct CtSession(Option<crate::session::Session>);
+
+unsafe fn cstr_arg(p: *const std::os::raw::c_char) -> Option<String> {
+    if p.is_null() {
+        return None;
+    }
+    unsafe { std::ffi::CStr::from_ptr(p) }
+        .to_str()
+        .ok()
+        .map(str::to_owned)
+}
+
+/// Start a client session feeding the given receiver. Returns NULL on
+/// invalid config. The receiver must stay alive until after [`ct_stop`].
+///
+/// # Safety
+/// `cfg` must point to a valid [`CtSessionConfig`]; `rx` must be a live
+/// pointer from [`ct_receiver_new`]. String/pin pointers per field docs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ct_start(
+    cfg: *const CtSessionConfig,
+    rx: *mut CtReceiver,
+) -> *mut CtSession {
+    let (Some(cfg), Some(rx_ref)) = (unsafe { cfg.as_ref() }, unsafe { rx.as_ref() }) else {
+        return std::ptr::null_mut();
+    };
+    let (Some(base_url), Some(username), Some(password)) = (
+        unsafe { cstr_arg(cfg.base_url) },
+        unsafe { cstr_arg(cfg.username) },
+        unsafe { cstr_arg(cfg.password) },
+    ) else {
+        return std::ptr::null_mut();
+    };
+    let trust = if cfg.insecure_tls != 0 {
+        crate::tls::ServerTrust::InsecureAcceptAny
+    } else if !cfg.cert_sha256.is_null() {
+        let mut pin = [0u8; 32];
+        pin.copy_from_slice(unsafe { std::slice::from_raw_parts(cfg.cert_sha256, 32) });
+        crate::tls::ServerTrust::PinnedSha256(pin)
+    } else {
+        return std::ptr::null_mut(); // neither pin nor explicit insecure opt-in
+    };
+
+    let config = crate::session::SessionConfig {
+        base_url,
+        username,
+        password,
+        trust,
+        flow: crate::flow::FlowConfig {
+            host_id: cfg.host_id,
+            app_id: cfg.app_id,
+            video_frame_queue_size: 3,
+            audio_sample_queue_size: 20,
+            bitrate_kbps: cfg.bitrate_kbps,
+            width: cfg.width,
+            height: cfg.height,
+            fps: cfg.fps,
+            supported_codecs: crate::session::H264_BIT,
+        },
+    };
+    let session = crate::session::Session::start(config, rx_ref.core.clone());
+    Box::into_raw(Box::new(CtSession(Some(session))))
+}
+
+/// Session state: 0=connecting 1=peer-connected 2=streaming 3=failed
+/// 4=stopped, -1 on NULL.
+///
+/// # Safety
+/// `s` must be NULL or a live pointer from [`ct_start`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ct_session_state(s: *const CtSession) -> i32 {
+    let Some(s) = (unsafe { s.as_ref() }) else {
+        return -1;
+    };
+    match &s.0 {
+        Some(session) => session.state() as i32,
+        None => crate::session::SessionState::Stopped as i32,
+    }
+}
+
+/// Stop the session (joins its thread) and free the handle. NULL ignored.
+/// The associated receiver is closed as a side effect (decoder unblocks).
+///
+/// # Safety
+/// `s` must be NULL or an owned pointer from [`ct_start`]; not used after.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ct_stop(s: *mut CtSession) {
+    if s.is_null() {
+        return;
+    }
+    let mut boxed = unsafe { Box::from_raw(s) };
+    if let Some(session) = boxed.0.take() {
+        session.stop();
     }
 }
 

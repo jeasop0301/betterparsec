@@ -6,11 +6,35 @@ license.workspace = true
 
 [lib]
 # cdylib: linked by the moonlight-qt fork's our_transport.cpp shim
-# (m6-native-spike.md Option-3). rlib: workspace unit tests.
+# (m6-native-spike.md Option-3). rlib: workspace unit tests + ct-probe bin.
 crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "ct-probe"
+path = "src/bin/ct_probe.rs"
 
 [dependencies]
 transport-core = { workspace = true }
+# Signaling message types (StreamClientMessage etc.) — single source of
+# truth shared with web-server/streamer; no hand-mirrored JSON.
+common = { workspace = true }
+
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+webrtc = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+rustls = { workspace = true }
+
+# WS signaling client (m6-native-spike.md §F-1).
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# Login POST + cookie jar. rustls-only; no native-tls.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "json"] }
+
+# ct-probe logging
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [lints]
 workspace = true

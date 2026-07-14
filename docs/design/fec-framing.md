@@ -158,6 +158,25 @@ etc. are transport-agnostic); this is part of phase 2, not a new mechanism.
    프로덕션 디코더는 현재 TS뿐). TS 쪽은 256-엔트리 lazy pruning을 넣었다.
    M6 cdylib이 fec.rs 디코더를 프로덕션 투입할 때 같은 pruning을 이식할 것.
 
+## 8-A. P2-lite 라이브 손실 검증 결과 (2026-07-14, 루프백 + clumsy)
+
+Gate B 리그 부재로 P2를 로컬 근사(P2-lite)로 축소해 실검증했다. 셋업:
+릴리스 서버 루프백 스트림, `enableVideoFec=true`(URL 파라미터), clumsy
+(WinDivert)로 루프백 UDP 50000–50100에 드랍 주입("loopback은 outbound로만
+필터" — clumsy config.txt).
+
+| 관찰 | 결과 |
+|---|---|
+| FEC-only 렌더 경로 | 라이브 동작 — 이 모드의 유일한 렌더 경로가 video_fec이므로 영상 표시 자체가 체인 전체(SUBSCRIBE→청킹→비신뢰 채널→재조립→디코드)의 증거 |
+| 5% 드랍 | 대체로 매끈, 간헐 키프레임 리프레시 |
+| 20% 드랍 (중복률 12.5% 초과) | 끊김 빈발하나 **화면 깨짐 0** — 불완전 프레임은 제출되지 않고 폐기+IDR 요청되는 설계가 라이브로 성립 |
+| needs-IDR 복구 루프 | 서버 로그 "Requesting IDR frame on behalf of DR" — FEC 세션 2개에서 39+36회 순환 (디코더 백로그 IDR과 합산 수치; 분리 계수는 리그 몫) |
+| 손실 중 재접속 | clumsy 활성 상태에서 새 세션 ICE ~1.1 s 연결 |
+
+**남은 P2(리그 필요)**: 복구율 vs 중복률 정량화(Recovered/LossSpan 카운터),
+재정렬 하 ACK 윈도 슬라이드 검증, 적응 비율(P3). 대외 성능 주장 근거로는
+사용 불가 — 메커니즘 검증(로드맵 원칙)이다.
+
 ## 8. P1 구현 노트 (2026-07-14)
 
 - **활성화 프로토콜(설계 추가분)**: 서버는 채널을 항상 만들되 sender task는

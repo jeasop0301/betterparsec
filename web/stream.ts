@@ -668,6 +668,14 @@ class ViewerApp implements Component {
     }
 
     // Pointer Lock
+    //
+    // Learned once per page: when a browser rejects the unadjustedMovement
+    // options form, its rejection arrives ASYNC — by then the user gesture is
+    // consumed and the plain-call fallback throws "user gesture required",
+    // so every attempt fails forever. Remember the failure and issue the
+    // plain call synchronously (inside the gesture) from then on.
+    private pointerLockOptionsUnsupported = false
+
     async requestPointerLock(errorIfNotFound: boolean = false) {
         this.previousMouseMode = this.inputConfig.mouseMode
 
@@ -681,10 +689,18 @@ class ViewerApp implements Component {
 
             setSidebarExtended(false)
 
+            if (this.pointerLockOptionsUnsupported) {
+                inputElement.requestPointerLock()
+                return
+            }
+
             const onLockError = () => {
                 document.removeEventListener("pointerlockerror", onLockError)
+                this.pointerLockOptionsUnsupported = true
 
-                // Fallback: try to request pointer lock without options
+                // Fallback: try to request pointer lock without options.
+                // May be past the gesture window — the next click retakes
+                // the synchronous plain-call path above.
                 inputElement.requestPointerLock()
             }
 
@@ -701,8 +717,12 @@ class ViewerApp implements Component {
                     inputElement.requestPointerLock()
                 }
             } catch (error) {
+                console.warn("Pointer lock with unadjustedMovement failed", error)
+                this.pointerLockOptionsUnsupported = true
                 // Some platforms do not support unadjusted movement. If you
-                // would like PointerLock anyway, request again.
+                // would like PointerLock anyway, request again. This retry can
+                // land outside the gesture window; the next click uses the
+                // synchronous plain-call path above and succeeds.
                 if (error instanceof Error && error.name == "NotSupportedError") {
                     inputElement.requestPointerLock()
                 } else {

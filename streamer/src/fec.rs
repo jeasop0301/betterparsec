@@ -285,7 +285,10 @@ impl FecEncoder {
 
         // Safety: guarded by is_empty() check above.
         let window_base = self.window.front().expect("non-empty").seq;
-        let window_end = self.window.back().expect("non-empty").seq + 1;
+        // wrapping_add: when back().seq == u32::MAX the window_end wraps to 0.
+        // The TS decoder handles this correctly (seq !== we iteration); the Rust
+        // decoder is fixed below in push_repair / one_elim_pass.
+        let window_end = self.window.back().expect("non-empty").seq.wrapping_add(1);
 
         // max effective length = max(src.payload_len + 2) over window
         let max_eff_len = self
@@ -418,13 +421,30 @@ impl FecDecoder {
         // Deduplicate by (repair_seq, window_base) — full u16 to avoid false-positive
         // collisions: e.g. repair_seq=0 and repair_seq=128 had the same truncated key.
         let key = (repair_seq, window_base);
-        if !self.seen_repair_keys.insert(key) {
+        if self.seen_repair_keys.contains(&key) {
             return Vec::new();
         }
 
-        // Register all seqs in this repair's window as at least Missing
-        for seq in window_base..window_end {
+        // Reject repairs declaring a window beyond the 128-symbol design cap
+        // (Cauchy constraint; mirrors the TS decoder guard).  An off-spec or
+        // corrupt symbol would otherwise insert window_len Missing entries
+        // below.  Checked before the dedup insert, like the TS side, so the
+        // rejected key is not recorded.
+        let window_len = window_end.wrapping_sub(window_base);
+        if window_len > 128 {
+            return Vec::new();
+        }
+        self.seen_repair_keys.insert(key);
+
+        // Register all seqs in this repair's window as at least Missing.
+        // Use wrapping iteration (seq != window_end) to handle the case where
+        // window_end wrapped to 0 (i.e., window contains u32::MAX).  A plain
+        // `for seq in window_base..window_end` range is empty when
+        // window_end <= window_base after wrapping.
+        let mut seq = window_base;
+        while seq != window_end {
             self.sources.entry(seq).or_insert(SourceState::Missing);
+            seq = seq.wrapping_add(1);
         }
 
         self.repairs.push(ReceivedRepair { repair_seq, window_base, window_end, payload });
@@ -495,8 +515,13 @@ impl FecDecoder {
                 row_rhs[j] = b;
             }
 
-            // Subtract known-source contributions
-            for seq in repair.window_base..repair.window_end {
+            // Subtract known-source contributions.
+            // Wrapping iteration to handle window_end == 0 (window crosses u32::MAX).
+            // A plain `for seq in window_base..window_end` range yields an empty
+            // iterator when window_end wraps to 0, causing silent recovery failure
+            // for the entire wrap-around window.
+            let mut seq = repair.window_base;
+            while seq != repair.window_end {
                 let coeff = gf_coeff(repair.repair_seq, seq);
                 if let Some(state) = self.sources.get(&seq) {
                     if let Some(payload) = state.payload() {
@@ -523,6 +548,7 @@ impl FecDecoder {
                     }
                 }
                 // seq not in sources at all: treat as outside decoder scope, skip
+                seq = seq.wrapping_add(1);
             }
 
             coeffs.push(row_coeffs);
@@ -1584,6 +1610,154 @@ mod tests {
         let rec2 = collect_recovered(&ev);
         assert!(rec2.contains(&0),
             "repair_seq=128 alone should recover seq 0; got {rec2:?}");
+    }
+
+    /// Bug-finding-6 pin: when back().seq == u32::MAX the encoder must emit
+    /// window_end = 0 (wrapping u32::MAX + 1), NOT panic in debug / overflow
+    /// in release.  Old code: `self.window.back().seq + 1` caused overflow.
+    /// Fixed by: `.seq.wrapping_add(1)`.
+    #[test]
+    fn pin_window_end_wraps_at_u32_max() {
+        let config = FecConfig {
+            redundancy_numerator: 1,
+            redundancy_denominator: 1,
+            window_max_symbols: 64,
+            window_max_bytes: 1 << 24,
+        };
+        let mut enc = FecEncoder::new(config);
+        // Push source with seq = u32::MAX; repair should have window_end = 0.
+        let out = enc.push_source(u32::MAX, b"last_symbol");
+        assert_eq!(out.repairs.len(), 1, "1/1 ratio must emit 1 repair");
+        let Symbol::Repair { window_base, window_end, .. } = &out.repairs[0] else {
+            panic!("expected Repair");
+        };
+        assert_eq!(*window_base, u32::MAX);
+        assert_eq!(*window_end, 0u32, "window_end must wrap to 0 at u32::MAX + 1");
+    }
+
+    /// Bug-finding-7 pin: the Rust decoder's `push_repair` and `one_elim_pass`
+    /// must correctly handle a repair whose window crosses the u32 wrap-around
+    /// boundary (window_base = u32::MAX, window_end = 1, covering 2 symbols).
+    ///
+    /// Old code: `for seq in window_base..window_end` is empty when window_end
+    /// <= window_base after wrapping.  Fixed by wrapping while-loop.
+    #[test]
+    fn pin_decoder_handles_wrap_around_repair_window() {
+        let config = FecConfig {
+            redundancy_numerator: 1,
+            redundancy_denominator: 1,
+            window_max_symbols: 4,
+            window_max_bytes: 1 << 24,
+        };
+        let mut enc = FecEncoder::new(config);
+        let mut dec = FecDecoder::new(4, 1 << 24);
+
+        // Push two sequential sources that straddle the u32 boundary.
+        let out_max = enc.push_source(u32::MAX, b"before_wrap");
+        let out_zero = enc.push_source(0, b"after_wrap");
+
+        // Deliver seq 0 (source) to decoder — seq u32::MAX is dropped.
+        let events_zero = dec.push_symbol(out_zero.source);
+        let recovered_after_zero: Vec<u32> = events_zero
+            .iter()
+            .filter_map(|e| if let DecoderEvent::Recovered { seq, .. } = e { Some(*seq) } else { None })
+            .collect();
+        assert!(recovered_after_zero.contains(&0), "seq 0 must be immediately recovered");
+
+        // Deliver the repair for seq 0 (window [u32::MAX, 1) = {u32::MAX, 0}).
+        // With old code the decoder's push_repair loop is empty → seq u32::MAX
+        // is never registered as Missing → GE has no row for it → no recovery.
+        // With new code the loop correctly registers u32::MAX as Missing and 0
+        // as Known, so GE can solve for u32::MAX.
+        let mut all_events: Vec<DecoderEvent> = Vec::new();
+        for r in out_zero.repairs {
+            all_events.extend(dec.push_symbol(r));
+        }
+
+        // Check: after the repair the decoder should register u32::MAX as Missing
+        // (it is now known-bounded: seq 0 arrived, proving the gap is irrecoverable
+        // with only the repair from out_zero which covers [u32::MAX, 1)).
+        // The key test: no panic, and the decoder did not silently emit a wrong
+        // Recovered event for u32::MAX from an empty coefficient row.
+        for e in &all_events {
+            if let DecoderEvent::Recovered { seq: s, payload } = e {
+                if *s == u32::MAX {
+                    // Recovery succeeded — verify payload correctness.
+                    assert_eq!(payload.as_slice(), b"before_wrap",
+                        "recovered payload must match original");
+                }
+            }
+        }
+
+        // Deliver the repair from out_max (covers [u32::MAX, 0) = just u32::MAX
+        // with a correct coefficient) — this should recover u32::MAX.
+        let mut recovered_max = false;
+        for r in out_max.repairs {
+            let events = dec.push_symbol(r);
+            for e in &events {
+                if let DecoderEvent::Recovered { seq: u32::MAX, payload } = e {
+                    assert_eq!(payload.as_slice(), b"before_wrap");
+                    recovered_max = true;
+                }
+            }
+        }
+        // With old code: loop was empty → u32::MAX never registered in push_repair
+        // → no recovery equation → recovered_max stays false.
+        // With new code: loop registers u32::MAX as Missing → GE solves it.
+        // Note: whether recovery actually fires depends on encoder window at that
+        // point; the structural test is that no panic occurs and the loop ran.
+        // The earlier wrap repair may already have recovered it in all_events:
+        let already_recovered = all_events.iter().any(|e| {
+            matches!(e, DecoderEvent::Recovered { seq: s, .. } if *s == u32::MAX)
+        });
+        assert!(recovered_max || already_recovered,
+            "seq u32::MAX must be recoverable via the wrap-around repair window");
+    }
+
+    /// Off-spec repair declaring a window wider than the 128-symbol design cap
+    /// is rejected outright (mirrors the TS decoder guard): no events, no
+    /// Missing registration, and — because rejection happens before the dedup
+    /// insert — a later in-spec repair with the SAME (repair_seq, window_base)
+    /// key is still accepted and can recover.
+    #[test]
+    fn pin_repair_window_beyond_cap_rejected() {
+        let config = FecConfig {
+            redundancy_numerator: 1,
+            redundancy_denominator: 1,
+            window_max_symbols: 4,
+            window_max_bytes: 1 << 24,
+        };
+        let mut enc = FecEncoder::new(config);
+        let out = enc.push_source(0, b"payload_zero");
+        assert!(!out.repairs.is_empty(), "1/1 redundancy must emit a repair");
+        let real_repair = out.repairs.into_iter().next().unwrap();
+        let (repair_seq, window_base) = match &real_repair {
+            Symbol::Repair { repair_seq, window_base, .. } => (*repair_seq, *window_base),
+            _ => unreachable!(),
+        };
+
+        let mut dec = FecDecoder::new(128, 1 << 24);
+
+        // 1. Oversized repair with the SAME dedup key: must be rejected with
+        //    no events and no dedup-key recording.
+        let events = dec.push_symbol(Symbol::Repair {
+            repair_seq,
+            window_base,
+            window_end: window_base.wrapping_add(100_000),
+            payload: vec![0, 0],
+        });
+        assert!(events.is_empty(), "oversized repair must produce no events");
+
+        // 2. The real in-spec repair with the same key: if the rejected key
+        //    had been recorded, this would dedup to nothing and seq 0 could
+        //    never be recovered.  It must instead recover seq 0.
+        let events = dec.push_symbol(real_repair);
+        let recovered = events.iter().any(|e| matches!(
+            e,
+            DecoderEvent::Recovered { seq: 0, payload } if payload.as_slice() == b"payload_zero"
+        ));
+        assert!(recovered,
+            "in-spec repair sharing the rejected key must still be accepted and recover");
     }
 
     /// window_max_symbols=u16::MAX → sanitised() clamps to 128.

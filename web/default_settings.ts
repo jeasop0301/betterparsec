@@ -49,7 +49,9 @@ const trueDefaultSettings: Settings =
     // possible values: "standard", "old"
     "pageStyle": "standard",
     "hdr": false,
-    "useSelectElementPolyfill": false
+    "useSelectElementPolyfill": false,
+    // U2 P1 — FEC pipeline test mode, default off (zero hot-path cost when false)
+    "enableVideoFec": false
 }
 
 export default trueDefaultSettings as Settings

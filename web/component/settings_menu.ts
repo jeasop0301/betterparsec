@@ -35,6 +35,9 @@ export type Settings = {
     pageStyle: PageStyle
     hdr: boolean
     useSelectElementPolyfill: boolean
+    // U2 P1: enable Tetrys FEC pipeline over video_fec DataChannel.
+    // Default false (RTP videotrack path unchanged). Set true for test mode.
+    enableVideoFec: boolean
 }
 
 export type StreamCodec = "h264" | "auto" | "h265" | "av1"

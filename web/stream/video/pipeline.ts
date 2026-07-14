@@ -3,6 +3,7 @@ import { VideoMediaStreamTrackProcessorPipe } from "./media_stream_track_process
 import { TrackVideoRenderer, VideoRenderer } from "./index.js"
 import { VideoDecoderPipe } from "./video_decoder_pipe.js"
 import { DepacketizeVideoPipe } from "./depackitize_pipe.js"
+import { FecDecodePipe } from "./fec_decode_pipe.js"
 import { Logger } from "../log.js"
 import { andVideoCodecs, hasAnyCodec, VideoCodecSupport } from "../video.js"
 import { buildPipeline, gatherPipeInfo, OutputPipeStatic, PipeInfoStatic, PipeStatic } from "../pipeline/index.js"
@@ -79,6 +80,20 @@ const PIPELINES: Array<Pipeline> = [
     // Convert data -> MediaSourceDecoder -> video element, Default (should be supported everywhere)
     { input: "data", pipes: [DepacketizeVideoPipe, MediaSourceDecoder], renderer: UrlVideoElementRenderer },
 ]
+
+// ── FEC data pipelines (U2 P1) ────────────────────────────────────────────
+// These mirror every "data" pipeline above but substitute FecDecodePipe for
+// DepacketizeVideoPipe as the input head.  Used when settings.enableVideoFec
+// is true and the transport is WebRTC with video_fec channels present.
+// The RTP videotrack keeps flowing server-side but is not attached to a
+// renderer in this mode (P1 test path; toggled back by setting flag false).
+export const FEC_DATA_PIPELINES: Array<Pipeline> = PIPELINES
+    .filter(p => p.input === "data")
+    .map(p => ({
+        input: "data",
+        pipes: [FecDecodePipe, ...p.pipes.slice(1)],  // replace DepacketizeVideoPipe head
+        renderer: p.renderer,
+    }))
 
 const FORCE_CANVAS_PIPELINES: Array<Pipeline> = PIPELINES.filter(pipeline => pipeline.renderer.name.includes("Canvas"))
 
@@ -199,5 +214,49 @@ export async function buildVideoPipeline(type: string, settings: VideoPipelineOp
     }
 
     logger?.debug(message)
+    return { videoRenderer: null, supportedCodecs: null, error: true }
+}
+
+/**
+ * Build a FEC-headed data pipeline (U2 P1).
+ * Uses FEC_DATA_PIPELINES which substitutes FecDecodePipe for
+ * DepacketizeVideoPipe in every existing "data" pipeline variant.
+ * Returns the same PipelineResult shape as buildVideoPipeline("data", …).
+ */
+export async function buildFecVideoPipeline(
+    settings: VideoPipelineOptions,
+    logger?: Logger,
+): Promise<PipelineResult<DataPipe & VideoRenderer>> {
+    const pipesInfo = await gatherPipeInfo()
+    let pipelines = settings.canvasRenderer
+        ? FEC_DATA_PIPELINES.filter(p => p.renderer.name.includes("Canvas"))
+        : FEC_DATA_PIPELINES
+
+    fecPipelineLoop: for (const pipeline of pipelines) {
+        let supportedCodecs = settings.supportedVideoCodecs
+        for (const pipe of pipeline.pipes) {
+            const pipeInfo = pipesInfo.get(pipe)
+            if (!pipeInfo) continue fecPipelineLoop
+            if (!pipeInfo.environmentSupported) continue fecPipelineLoop
+            if (pipeInfo.supportedVideoCodecs) {
+                supportedCodecs = andVideoCodecs(supportedCodecs, pipeInfo.supportedVideoCodecs)
+            }
+        }
+        const rendererInfo = await pipeline.renderer.getInfo()
+        if (!rendererInfo?.environmentSupported) continue fecPipelineLoop
+        if (rendererInfo.supportedVideoCodecs) {
+            supportedCodecs = andVideoCodecs(supportedCodecs, rendererInfo.supportedVideoCodecs)
+        }
+        if (!hasAnyCodec(supportedCodecs)) continue fecPipelineLoop
+
+        const rendererOptions = { drawOnSubmit: !settings.canvasVsync }
+        const videoRenderer = buildPipeline(pipeline.renderer, { pipes: pipeline.pipes }, logger, rendererOptions)
+        if (!videoRenderer) continue fecPipelineLoop
+
+        logger?.debug(`FEC pipeline built: ${pipeline.pipes.map(p => p.name).join(" -> ")} -> ${pipeline.renderer.name}`)
+        return { videoRenderer: videoRenderer as DataPipe & VideoRenderer, supportedCodecs, error: false }
+    }
+
+    logger?.debug("No supported FEC video pipeline found")
     return { videoRenderer: null, supportedCodecs: null, error: true }
 }

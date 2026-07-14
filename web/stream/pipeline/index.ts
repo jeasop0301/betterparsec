@@ -8,7 +8,8 @@ import { Logger } from "../log.js";
 import { VideoCodecSupport } from "../video.js";
 import { OpenH264DecoderPipe } from "../video/openh264_decoder_pipe.js";
 import { CanvasFrameDrawPipe, CanvasRgbaFrameDrawPipe, CanvasYuv420FrameDrawPipe } from "../video/canvas_frame.js";
-import { DepacketizeVideoPipe } from "../video/depackitize_pipe.js";
+import { DepacketizeVideoPipe } from "../video/depackitize_pipe.js"
+import { FecDecodePipe } from "../video/fec_decode_pipe.js";
 import { VideoMediaStreamTrackGeneratorPipe } from "../video/media_stream_track_generator_pipe.js";
 import { VideoMediaStreamTrackProcessorPipe } from "../video/media_stream_track_processor_pipe.js";
 import { WorkerDataToCanvasGlRenderOpenH264Pipe, WorkerDataToVideoTrackPipe, WorkerVideoMediaStreamProcessorCanvasPipe, WorkerVideoMediaStreamProcessorPipe } from "../video/pipeline.js";
@@ -140,6 +141,10 @@ export function pipes(): Array<PipeStatic> {
         WorkerVideoDataReceivePipe,
         // Video
         DepacketizeVideoPipe,
+        // FEC decode pipe — P1 head for "data" pipelines over video_fec DataChannel.
+        // TODO(worker-slot): move GF math off main thread into WorkerVideoDataSendPipe
+        //   family once P2 profiling shows it is needed (design §7 item 4).
+        FecDecodePipe,
         VideoMediaStreamTrackGeneratorPipe,
         VideoMediaStreamTrackProcessorPipe,
         VideoDecoderPipe,

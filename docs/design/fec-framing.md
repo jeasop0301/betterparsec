@@ -1,7 +1,11 @@
 # Tetrys FEC transport framing (U2)
 
-**Status**: Design — attachment point decided, wire format specified,
-implementation phased. **Date**: 2026-07-14.
+**Status**: P1 구현 완료 (2026-07-14) — streamer 송신부
+(`transport/webrtc/fec_wire.rs`, `fec_sender.rs`, mod.rs 채널, video.rs 탭)
++ 웹 수신부(`web/stream/video/fec.ts` 코덱 미러, `fec_wire.ts`,
+`fec_decode_pipe.ts`, 전송/설정 배선) + Rust↔TS 교차 벡터
+(`tests/fixtures/fec_vectors.json`). §8 P1 구현 노트 참조. 라이브 손실
+복구 검증(P2)과 적응 비율(P3)은 게이트 순서대로. **Date**: 2026-07-14.
 **Source**: `streamer/src/fec.rs` (pure codec, 47 tests), transport survey of
 `streamer/src/transport/{web_socket,webrtc}`, web client
 `web/stream/video/pipeline.ts`.
@@ -136,13 +140,47 @@ etc. are transport-agnostic); this is part of phase 2, not a new mechanism.
 
 ## 7. Open items
 
-1. Symbol/generation guard for stream re-setup mirrors the CC ghost-writer
-   issue (cc-wiring.md): the `video_fec` sender task needs the same
-   generation-tag treatment from day one.
-2. Confirm the data-transport needs-IDR message shape (WS transport already
-   has one; reuse for the DataChannel path).
+1. [resolved P1] Symbol/generation guard for stream re-setup — implemented
+   day one: `fec_generation: AtomicU32`을 `WebRtcVideo::setup`이 bump하고,
+   sender task는 매 송신 전 자기 세대와 비교해 stale이면 종료 (cc-wiring.md
+   ghost-writer와 동일 계열; 테스트 핀).
+2. [resolved P1] needs-IDR 메시지: `video_fec_ack` 채널의 1-byte `0x00`
+   (아래 §8). 수신 시 호스트는 기존 `WebRtcVideo::needs_idr` AtomicBool을
+   세운다 — RTP 경로의 PLI 응답 메커니즘을 그대로 재사용.
 3. `video_fec` on Safari: DataChannel maxRetransmits support matrix — verify
    before advertising the path (pipeline negotiation already falls back to
    `videotrack`).
 4. Web worker placement: FEC decode belongs in the existing worker pipes
    (`WorkerVideoDataSendPipe` family) to keep GF math off the main thread.
+   P1은 main-thread `FecDecodePipe`로 출하(파이프 레지스트리에 등록돼 있어
+   worker 합성 슬롯은 준비됨).
+5. Rust `FecDecoder`의 `seen_repair_keys`는 무한 성장(테스트/M6 전용 —
+   프로덕션 디코더는 현재 TS뿐). TS 쪽은 256-엔트리 lazy pruning을 넣었다.
+   M6 cdylib이 fec.rs 디코더를 프로덕션 투입할 때 같은 pruning을 이식할 것.
+
+## 8. P1 구현 노트 (2026-07-14)
+
+- **활성화 프로토콜(설계 추가분)**: 서버는 채널을 항상 만들되 sender task는
+  휴면. `video_fec_ack`의 1-byte 메시지로 제어 — `0x01` SUBSCRIBE(활성화),
+  `0x00` NEEDS_IDR, 4-byte LE u32 = ACK(`highest_fully_decoded`). 클라 플래그
+  `enableVideoFec`(기본 false, `web/default_settings.ts`)가 SUBSCRIBE 송신을
+  게이트하므로 스트리머 쪽 권한/설정 변경 없이 기본-off가 성립한다. 휴면 시
+  호스트 오버헤드는 프레임당 AtomicBool 로드 1회.
+- **메시지 크기**: source 메시지 ≤ 1200 B (chunk 헤더 13 B + 단편 ≤ 1182 B).
+  repair 메시지는 내부 길이 프리픽스 때문에 수 바이트 초과 가능 — 허용.
+- **P1 모드의 클라 렌더링**: `enableVideoFec=true`면 FEC 파이프라인이
+  videotrack 파이프라인을 **대체**한다(RTP 트랙은 서버에서 계속 흐르지만
+  렌더러에 붙지 않음 — P1 검증 모드의 의도적 이중 송신). P3에서 기본 경로
+  판정 시 재검토.
+- **경계 가드(리뷰 산출)**: 디코더는 window 길이 > 128인 repair를 양쪽
+  언어 모두 거부(디덥 키 기록 전 — 테스트 핀). `window_end` 계산과 디코더
+  window 순회는 u32 wrap-safe (`wrapping_add`/`seq != end` 순회, 핀 테스트
+  2건). ACK 50 ms 암은 심볼 도착과 독립인 타이머로 발화. sink 송신 실패 시
+  sender task 즉시 종료(무한 스핀 방지).
+- **교차 벡터**: `tests/fixtures/fec_vectors.json` (LCG 시드 0x00C0FFEE,
+  redundancy 1/4, 프레임 [500, 2500, 1183, 0] B) — Rust 테스트가 재생성
+  일치를 핀하고, TS 테스트가 (a) 동일 시나리오 인코딩의 바이트 동일성,
+  (b) drop된 source를 repair로 복구해 4프레임 바이트 동일 복원을 검증.
+- **큐 의미론**: FEC sender 큐(용량 4)는 sender.rs와 동일하게 key frame이
+  큐 전체를 대체한다 — 최대 소실 4 프레임(전부 IDR로 대체되므로 화면
+  일관성 훼손 없음), 상한은 컴파일타임 상수.

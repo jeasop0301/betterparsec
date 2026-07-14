@@ -47,6 +47,8 @@ use crate::transport::{
     metrics::VideoTransportMetrics,
     webrtc::{
         WebRtcInner,
+        fec_sender::FecSenderHandle,
+        fec_wire::AckMsg,
         sender::{CcContext, SequencedTrackLocalStaticRTP, TrackLocalSender},
         video::{
             h264::{payloader::H264Payloader, reader::H264Reader},
@@ -93,6 +95,13 @@ pub struct WebRtcVideo {
     /// RR loss mailbox, frame interval. Composed with the ABR target by the
     /// runtime bitrate task (see `crate::cc::effective_target_kbps`).
     cc_shared: Arc<CcShared>,
+    /// Monotonic generation counter shared with every spawned FEC sender task.
+    /// Incremented in `setup()` to retire any still-running sender from a prior
+    /// stream generation (ghost-writer guard, fec-framing.md §7 item 1).
+    fec_generation: Arc<AtomicU32>,
+    /// FEC sender handle; `None` until the first `setup()` call.
+    /// Default state: dormant — one AtomicBool load per frame overhead only.
+    fec_handle: Option<FecSenderHandle>,
 }
 
 impl WebRtcVideo {
@@ -114,6 +123,8 @@ impl WebRtcVideo {
             configured_bitrate_kbps: 0,
             target_bitrate_kbps,
             cc_shared,
+            fec_generation: Arc::new(AtomicU32::new(0)),
+            fec_handle: None,
         }
     }
 
@@ -187,6 +198,19 @@ impl WebRtcVideo {
                 CcController::new(CcConfig::from_ceiling(self.configured_bitrate_kbps)),
                 self.cc_shared.clone(),
                 cc_generation,
+            ));
+        }
+
+        // FEC sender task: bump the generation counter to retire any still-running
+        // task from a previous setup call (ghost-writer guard, mirrors CC pattern).
+        {
+            let new_fec_gen =
+                self.fec_generation.fetch_add(1, Ordering::AcqRel) + 1;
+            self.fec_handle = Some(FecSenderHandle::spawn_for_channel(
+                new_fec_gen,
+                Arc::clone(&self.fec_generation),
+                inner.video_fec_channel.clone(),
+                Arc::clone(&self.needs_idr),
             ));
         }
 
@@ -319,6 +343,14 @@ impl WebRtcVideo {
         true
     }
 
+    /// Forward an ACK message received on `video_fec_ack` to the FEC sender task.
+    /// No-op before `setup()` (fec_handle is None).
+    pub(super) fn handle_fec_ack(&self, msg: AckMsg) {
+        if let Some(handle) = &self.fec_handle {
+            handle.forward_ack(msg);
+        }
+    }
+
     pub async fn send_decode_unit(&mut self, unit: &VideoDecodeUnit<&[u8]>) -> DecodeResult {
         let timestamp = (unit.timestamp.as_nanos() * 90000 / 1_000_000_000) as u32;
 
@@ -332,6 +364,18 @@ impl WebRtcVideo {
         // filler removal, or RTP packetization.
         if let Some(metrics) = self.sender.metrics() {
             metrics.record_encoded_frame(full_frame.len(), important);
+        }
+
+        // FEC tap: enqueue the pre-Annex-B full frame into the FEC sender.
+        // is_active() is one AtomicBool::load — the only per-frame overhead
+        // when the client has not yet subscribed (default dormant state).
+        // timestamp_us is truncated to u32, matching the existing WS data path.
+        if let Some(fec) = &self.fec_handle {
+            if fec.is_active() {
+                let ts_us = unit.timestamp.as_micros() as u32;
+                fec.enqueue(Bytes::copy_from_slice(&full_frame), important, ts_us)
+                    .await;
+            }
         }
 
         match &mut self.codec {

@@ -71,6 +71,8 @@ use crate::{
 };
 
 mod audio;
+mod fec_sender;
+pub mod fec_wire;
 mod sender;
 mod video;
 
@@ -80,6 +82,11 @@ struct WebRtcInner {
     general_channel: Arc<RTCDataChannel>,
     stats_channel: Arc<RTCDataChannel>,
     input_channels: Mutex<Vec<Arc<RTCDataChannel>>>,
+    /// Unreliable, unordered DataChannel carrying FEC source + repair symbols
+    /// from host to client (host → client only; no on_message handler needed).
+    video_fec_channel: Arc<RTCDataChannel>,
+    /// Reliable, ordered DataChannel carrying window ACKs from client to host.
+    video_fec_ack_channel: Arc<RTCDataChannel>,
     video: Mutex<WebRtcVideo>,
     target_bitrate_kbps: Arc<AtomicU32>,
     cc_shared: Arc<CcShared>,
@@ -160,6 +167,28 @@ pub async fn new(
     let general_channel = peer.create_data_channel("general", None).await?;
     let stats_channel = peer.create_data_channel("stats", None).await?;
 
+    // FEC symbol channel: unreliable (maxRetransmits=0), unordered — UDP semantics.
+    let video_fec_channel = peer
+        .create_data_channel(
+            "video_fec",
+            Some(RTCDataChannelInit {
+                ordered: Some(false),
+                max_retransmits: Some(0),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    // FEC ACK channel: reliable, ordered — window ACKs from client to host.
+    let video_fec_ack_channel = peer
+        .create_data_channel(
+            "video_fec_ack",
+            Some(RTCDataChannelInit {
+                ordered: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
     let runtime = Handle::current();
     let video_metrics = Arc::new(VideoTransportMetrics::new(video_frame_queue_size));
     let target_bitrate_kbps = Arc::new(AtomicU32::new(0));
@@ -170,6 +199,8 @@ pub async fn new(
         general_channel: general_channel.clone(),
         stats_channel,
         input_channels: Default::default(),
+        video_fec_channel: video_fec_channel.clone(),
+        video_fec_ack_channel: video_fec_ack_channel.clone(),
         video: Mutex::new(WebRtcVideo::new(
             runtime.clone(),
             Arc::downgrade(&peer),
@@ -193,6 +224,10 @@ pub async fn new(
     {
         let this = this_owned.clone();
         this.clone().on_data_channel(general_channel).await;
+        // FEC symbol channel (host→client; no on_message handler needed on host).
+        this.clone().on_data_channel(video_fec_channel).await;
+        // FEC ACK channel (client→host; on_message set up in on_data_channel).
+        this.clone().on_data_channel(video_fec_ack_channel).await;
 
         struct Options {
             reliable: bool,
@@ -548,6 +583,23 @@ impl WebRtcInner {
                 channel.on_message(create_channel_message_handler(
                     inner,
                     TransportChannel(TransportChannelId::CONTROLLERS),
+                ));
+            }
+            "video_fec" => {
+                // Host → client only; the host only sends on this channel.
+                // No on_message handler required on the host side.
+                debug!("video_fec channel open (host-to-client FEC symbols)");
+            }
+            "video_fec_ack" => {
+                // Client → host ACK messages: Subscribe / NeedsIdr / Ack(seq).
+                channel.on_message(create_event_handler(
+                    inner,
+                    async move |inner, msg: DataChannelMessage| {
+                        let Some(ack_msg) = fec_wire::parse_ack_msg(&msg.data) else {
+                            return;
+                        };
+                        inner.video.lock().await.handle_fec_ack(ack_msg);
+                    },
                 ));
             }
             _ => {

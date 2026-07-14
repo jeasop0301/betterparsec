@@ -15,7 +15,9 @@ import { WebSocketTransport } from "./transport/web_socket.js"
 import { WebRTCTransport } from "./transport/webrtc.js"
 import { allVideoCodecs, andVideoCodecs, createSupportedVideoFormatsBits, emptyVideoCodecs, getSelectedVideoCodec, hasAnyCodec, VideoCodecSupport } from "./video.js"
 import { VideoRenderer } from "./video/index.js"
-import { buildVideoPipeline, VideoPipelineOptions } from "./video/pipeline.js"
+import { buildFecVideoPipeline, buildVideoPipeline, VideoPipelineOptions } from "./video/pipeline.js"
+import { FecDecodePipe } from "./video/fec_decode_pipe.js"
+import { encodeAck, SUBSCRIBE_MESSAGE, NEEDS_IDR_MESSAGE } from "./video/fec_wire.js"
 
 export type ExecutionEnvironment = {
     main: boolean
@@ -678,21 +680,99 @@ export class Stream implements Component {
         let pipelineCodecSupport
         const video = this.transport.getChannel(TransportChannelId.HOST_VIDEO)
         if (video.type == "videotrack") {
-            const { videoRenderer, supportedCodecs, error } = await buildVideoPipeline("videotrack", videoSettings, this.logger)
+            // ── U2 P1: FEC pipeline over video_fec DataChannel ──────────────
+            // When enableVideoFec is true and we have a WebRTC transport with
+            // FEC channels ready, use FecDecodePipe as the head. The host RTP
+            // videotrack keeps flowing but is not attached to any renderer in
+            // this mode (P1 test path). The check must live inside the
+            // "videotrack" branch because WebRTC always yields type="videotrack"
+            // for HOST_VIDEO — the old "data" branch was dead code.
+            if (this.settings.enableVideoFec && this.transport instanceof WebRTCTransport) {
+                const fecChannels = this.transport.getFecChannels()
+                if (fecChannels) {
+                    const { data: fecData, ack: fecAck } = fecChannels
 
-            if (error) {
-                return null
+                    // Build FEC pipeline (FecDecodePipe head + remainder of data chain)
+                    const { videoRenderer, supportedCodecs, error } = await buildFecVideoPipeline(videoSettings, this.logger)
+                    if (error) return null
+                    pipelineCodecSupport = supportedCodecs
+
+                    // Pull the FecDecodePipe instance from the renderer chain so we
+                    // can configure its onAck callback.
+                    let fecPipe: FecDecodePipe | null = null
+                    let cursor: import("./pipeline/index.js").Pipe | null = videoRenderer
+                    while (cursor) {
+                        if (cursor instanceof FecDecodePipe) { fecPipe = cursor; break }
+                        cursor = cursor.getBase()
+                    }
+
+                    if (fecPipe) {
+                        // Wire ack: send encodeAck on the ack channel
+                        fecPipe.setOnAck((highest: number) => {
+                            fecAck.send(encodeAck(highest))
+                        })
+                    }
+
+                    videoRenderer.mount(this.divElement)
+
+                    // Send SUBSCRIBE to activate the host FEC sender.
+                    // Guard: check readyState in addition to the open event so
+                    // that re-setup calls (e.g. codec renegotiation) also send
+                    // SUBSCRIBE when the channel is already open.
+                    fecAck.addEventListener("open", () => {
+                        fecAck.send(SUBSCRIBE_MESSAGE)
+                    })
+                    if (fecAck.readyState === "open") {
+                        fecAck.send(SUBSCRIBE_MESSAGE)
+                    }
+
+                    // Receive FEC symbols from video_fec DataChannel
+                    fecData.addEventListener("message", (event: MessageEvent) => {
+                        const buf: ArrayBuffer = event.data instanceof ArrayBuffer
+                            ? event.data
+                            : event.data.buffer
+                        this.markVideoReady()
+                        videoRenderer.submitPacket(buf)
+
+                        // After each symbol, check if IDR is needed
+                        if (videoRenderer.pollRequestIdr()) {
+                            fecAck.send(NEEDS_IDR_MESSAGE)
+                        }
+                    })
+
+                    this.videoRenderer = videoRenderer
+                } else {
+                    // FEC channels not yet received — fall back to the normal
+                    // videotrack pipeline so the stream still plays.
+                    this.debugLog("enableVideoFec=true but video_fec channels not yet received; falling back to videotrack pipeline", { type: "ifErrorDescription" })
+                    const { videoRenderer, supportedCodecs, error } = await buildVideoPipeline("videotrack", videoSettings, this.logger)
+                    if (error) return null
+                    pipelineCodecSupport = supportedCodecs
+                    videoRenderer.mount(this.divElement)
+                    video.addTrackListener((track) => {
+                        this.markVideoReady()
+                        videoRenderer.setTrack(track)
+                    })
+                    this.videoRenderer = videoRenderer
+                }
+            } else {
+                // Normal WebRTC videotrack pipeline (FEC disabled or non-WebRTC transport).
+                const { videoRenderer, supportedCodecs, error } = await buildVideoPipeline("videotrack", videoSettings, this.logger)
+
+                if (error) {
+                    return null
+                }
+                pipelineCodecSupport = supportedCodecs
+
+                videoRenderer.mount(this.divElement)
+
+                video.addTrackListener((track) => {
+                    this.markVideoReady()
+                    videoRenderer.setTrack(track)
+                })
+
+                this.videoRenderer = videoRenderer
             }
-            pipelineCodecSupport = supportedCodecs
-
-            videoRenderer.mount(this.divElement)
-
-            video.addTrackListener((track) => {
-                this.markVideoReady()
-                videoRenderer.setTrack(track)
-            })
-
-            this.videoRenderer = videoRenderer
         } else if (video.type == "data") {
             const { videoRenderer, supportedCodecs, error } = await buildVideoPipeline("data", videoSettings, this.logger)
 

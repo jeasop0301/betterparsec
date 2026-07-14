@@ -267,6 +267,19 @@ export class WebRTCTransport implements Transport {
         }
     }
 
+    // video_fec DataChannels (host→client data, client→host ack).
+    // Populated by onDataChannel when the remote peer opens these labels.
+    private fecDataChannel: RTCDataChannel | null = null
+    private fecAckChannel: RTCDataChannel | null = null
+
+    /** Returns the raw FEC DataChannels, or null if not yet received. */
+    getFecChannels(): { data: RTCDataChannel; ack: RTCDataChannel } | null {
+        if (this.fecDataChannel && this.fecAckChannel) {
+            return { data: this.fecDataChannel, ack: this.fecAckChannel }
+        }
+        return null
+    }
+
     private channels: Array<TransportChannel | null> = []
     private initChannels() {
         if (!this.peer) {
@@ -343,6 +356,20 @@ export class WebRTCTransport implements Transport {
         const label = remoteChannel.label
 
         this.logger?.debug(`Received remote data channel: ${label}`)
+
+        // Intercept FEC channels BEFORE the TransportChannelId lookup so they
+        // are never forwarded into the existing channel table (they are raw
+        // RTCDataChannels consumed directly by the FEC pipeline in stream/index).
+        if (label === "video_fec") {
+            this.logger?.debug("Stashing video_fec DataChannel")
+            this.fecDataChannel = remoteChannel
+            return
+        }
+        if (label === "video_fec_ack") {
+            this.logger?.debug("Stashing video_fec_ack DataChannel")
+            this.fecAckChannel = remoteChannel
+            return
+        }
 
         // Map the channel label to the corresponding TransportChannelId
         const channelKey = label.toUpperCase() as TransportChannelIdKey

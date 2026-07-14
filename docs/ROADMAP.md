@@ -24,7 +24,7 @@ Tetrys FEC · 서브프레임 슬라이스 · QU · 네이티브 클라이언트
 
 | 게이트 | 내용 | 상태 |
 |---|---|---|
-| A. 보안·진실 기반 | TLS pin 통합, paired 회귀, analyzer 통합, strict profile | TLS pin [x] · analyzer 통합 [x] · strict profiles [x] · stock/Foundation paired 라이브 회귀 [ ] (사용자 참석 필요) · 워킹트리 커밋 [ ] (리서치 05 §4-5 블로커) |
+| A. 보안·진실 기반 | TLS pin 통합, paired 회귀, analyzer 통합, strict profile | TLS pin [x] · analyzer 통합 [x] · strict profiles [x] · **stock/Foundation paired 라이브 회귀 [x]** (2026-07-14: stock 상대 capability 게이트 `unsupported` 정상 + Foundation ACK 빌드 상대 paired H.264 스트림·0x5509 왕복 5회, 재페어링 없음) · 워킹트리 커밋 [x] |
 | B. 첫 신뢰 베이스라인 | 분리된 host/client/router, H.264 1080p60 direct UDP, 결정적 트레이스, clean LAN + 20→8→15 Mbps, ABBA 5회, 무효 run 거부 | [ ] 전부 (2-machine 셋업 필요) |
 | C. 지연 분리 | sender/PCAP/browser/decode/present 상관, 렌더 경로 비교, 지터버퍼 제어, 외부 input-to-photon | [ ] |
 | D. 컨트롤러·인코더 최적화 | ABR에 queue/write/freshness 피드백, TWCC(재생 가능 트레이스 후), NVENC LL 매트릭스, Pareto 선택 | CC 기계는 완성(U1) — 튜닝·판정은 Gate B/C 이후 |
@@ -52,9 +52,10 @@ Tetrys FEC · 서브프레임 슬라이스 · QU · 네이티브 클라이언트
 완료: 워킹트리 커밋(1), U2 설계+P1 배선(3), U3 조사(4), U4 프로토콜 설계,
 U5/M6 스파이크, f1-ack 소스 확인+0x5509 호스트 패치.
 
-1. 라이브 paired 회귀(stock + Foundation) — 사용자 참석 세션 (Gate A 잔여).
-   같은 세션에서 U2 P1 루프백 스모크(enableVideoFec=true, 손실 0 환경 프레임
-   동일성)와 0x5509 ACK 패치 포크 빌드까지 겸하면 효율적.
+1. ~~라이브 paired 회귀~~ — 2026-07-14 완료 (stock + Foundation ACK 빌드,
+   0x5509 왕복 5회 3면 교차 검증 — f1-ack.md step 4). 잔여 라이브 항목:
+   U2 P1 손실-0 프레임 동일성 스모크(enableVideoFec=true)는 다음 세션에
+   5분 항목으로.
 2. f1-ack 클라 플러밍 — moonlight-common-c/rust 패치에 0x5509 수신 훅 +
    상태머신 arming (헤드리스 가능; vendor 재생성 필요).
 3. U4 P1 — `video_qu` 채널 + localhost 릴레이 + 클라 오버레이(스트리머 단독,
@@ -115,13 +116,14 @@ Parsec web app 문서
   3단 truth table로 만들고 실제로 끝까지 동작하는 조합만 광고한다.
 - [x] encoder bitrate 요청의 client state를 `sent_unacknowledged`로 제한하고 Foundation
   host log와 대조해 실제 NVENC apply를 별도로 증명한다.
-- [~] request-id 기반 protocol ACK: 설계·클라 상태머신·0x5509 수신 훅/arming
-  (88bf433)·호스트 패치·**Foundation 포크 빌드/스테이징까지 완료** —
-  2026-07-14 컴파일 검증 통과(e110872d+양 패치, MSYS2 UCRT64), staged
-  바이너리가 stock identity로 기동·0x40|0x80 광고, 스왑/워치독 원복 3회
-  검증 (C:\tmp\foundation-build\stage, f1-ack.md step 4). 잔여: 라이브
-  0x5506→0x5509 왕복 1회 관측(사용자 브라우저 세션 5분) + step 5
-  ack_latency 벤치 상관.
+- [~] request-id 기반 protocol ACK: **라이브 검증 통과** (2026-07-14) —
+  Foundation ACK 빌드(e110872d+양 패치, MSYS2 UCRT64 컴파일)로 paired
+  H.264 세션에서 0x5506→0x5509 왕복 5회 연속: 클라
+  `Applied{Dispatched}` (8500/6141/5219/3770/1000 Kbps) ↔ 호스트 로그
+  capture-thread apply + NVENC 재설정 (6800/4912/4175/3016/800, FEC 20%
+  차감) 3면 일치. Tier A 시맨틱 확인: ACK는 검증·디스패치 증명이며
+  NVENC 실측은 호스트 로그가 담당. 잔여: step 5 ack_latency 벤치 상관 +
+  step 6 Tier B 판정 (f1-ack.md).
 - [x] patched Moonlight dependency를 고정 revision + repository-owned patch + bootstrap/CI
   구조로 전환해 외부 로컬 작업 트리 없이 clean clone을 재현한다.
 - [ ] RTX 4070 ULL/슬라이스 인코드 지연 자체 실측(리서치 04 §3-1 문헌 상충 해소;
@@ -169,7 +171,9 @@ Parsec web app 문서
 - [x] Foundation Sunshine에 capability patch 적용 후 Windows host build/stage
 - [x] staged Foundation으로 실제 BetterParsec paired stream을 연결하고 H.264 NVENC dynamic bitrate 적용 검증
 - [x] benchmark runner가 Foundation start/host/stdout/stderr/cleanup log를 run artifact로 수집
-- [ ] encoder request-id ACK로 client telemetry에서 applied 결과를 직접 확인
+- [x] encoder request-id ACK로 client telemetry에서 dispatch 결과를 직접
+  확인 — 2026-07-14 라이브 왕복 5회 (Tier A: 인코더 apply 실측은 여전히
+  호스트 로그 대조; Tier B 판정은 f1-ack step 6)
 - **검증:** 호스트에서 `tc netem`으로 대역/지터/손실 주입 → target 그래프 추종 + frame drop 억제. 동일 조건 Parsec과 뭉개짐 A/B.
 
 ## M3 — 코덱 / 화질 (feature #3)

@@ -335,15 +335,18 @@ for the residual multi-request edge.
    with step 1's callback.
 3. [x] Foundation source access; R-1/R-2/R-5/R-6 confirmed (§6). Opcode moved
    to `0x5509`.
-4. [~] Host patch written, apply-verified, and **compile-verified** — full
-   Foundation build (e110872d + capability + ack patches, MSYS2 UCRT64,
-   gcc 16.1.0) succeeded 2026-07-14; staged binary launches with stock
-   pairing identity and advertises 0x40|0x80
-   (`docs/host-patches/foundation-sunshine-dynamic-bitrate-ack.patch`,
-   stage/swap/watchdog-restore machinery validated 3×). Remaining: live
-   paired stream with a 0x5506→0x5509 round-trip observed in the streamer
-   log (client logs receipt at info since 005496c) — needs one user browser
-   session against the swapped host.
+4. [x] Host patch compile-verified AND **live-verified** (2026-07-14):
+   full Foundation build (e110872d + capability + ack patches, MSYS2
+   UCRT64, gcc 16.1.0) staged with stock pairing identity, advertised
+   0x40|0x80, and a paired H.264 browser session produced five consecutive
+   0x5506→0x5509 round-trips — client logged
+   `Applied { tier: Dispatched }` for requests 8500/6141/5219/3770/1000
+   Kbps while the host log independently recorded matching capture-thread
+   applies and NVENC reconfigures (6800/4912/4175/3016/800 Kbps after the
+   20% FEC deduction). Tier A semantics confirmed on the wire:
+   `applied_kbps` echoes the validated pre-FEC request; encoder-level
+   truth stays host-log-only until a Tier B decision (step 6).
+   Swap/watchdog-restore machinery validated across 4 sessions.
 5. [ ] Measure `ack_latency_ms` in the benchmark runner; correlate with
    host-log NVENC apply records.
 6. [ ] Decide whether Tier B is required based on step 5 correlation quality.

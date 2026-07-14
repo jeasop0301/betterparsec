@@ -23,10 +23,9 @@ use tokio::{
 use tracing::debug;
 use webrtc::data_channel::RTCDataChannel;
 
-use crate::{
-    fec::{FecConfig, FecEncoder},
-    transport::webrtc::fec_wire::{self, AckMsg},
-};
+use transport_core::fec::{FecConfig, FecEncoder};
+
+use crate::transport::webrtc::fec_wire::{self, AckMsg};
 
 // ── Sink abstraction ──────────────────────────────────────────────────────
 

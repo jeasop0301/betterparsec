@@ -2,8 +2,8 @@ cargo-features = ["profile-rustflags"]
 
 [workspace]
 resolver = "3"
-members = ["common", "streamer", "./"]
-default-members = ["streamer", "./"]
+members = ["common", "streamer", "transport-core", "./"]
+default-members = ["streamer", "transport-core", "./"]
 
 [profile.release]
 # strip release information
@@ -22,6 +22,7 @@ moonlight-common = { git = "https://github.com/MrCreativ3001/moonlight-common-ru
     "serde",
 ], default-features = false }
 common = { path = "./common" }
+transport-core = { path = "./transport-core" }
 
 # Log
 log = "0.4.28"

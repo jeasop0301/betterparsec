@@ -83,7 +83,6 @@ mod buffer;
 mod cc;
 mod convert;
 mod dynamic_ice_servers;
-mod fec;
 mod transport;
 mod video;
 

@@ -72,7 +72,9 @@ use crate::{
 
 mod audio;
 mod fec_sender;
-pub mod fec_wire;
+// Wire/framing moved to the shared transport-core crate (M6 W1); re-exported
+// here so `crate::transport::webrtc::fec_wire::*` call sites stay unchanged.
+pub use transport_core::fec_wire;
 pub(crate) mod qu_wire;
 mod qu_relay;
 mod sender;

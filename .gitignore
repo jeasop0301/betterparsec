@@ -3,6 +3,11 @@
 /vendor
 finalOutput
 ignore
+# Release-mode local web asset copy (built from dist/, see README "release mode")
+/static
+
+# GJC runtime state
+/.gjc
 
 # VsCode
 .vscode

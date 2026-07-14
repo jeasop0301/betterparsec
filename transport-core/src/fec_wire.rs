@@ -693,7 +693,7 @@ mod cross_vector_tests {
     // ── Tests ─────────────────────────────────────────────────────────────
 
     /// Re-generate the fixture in memory and write it to tests/fixtures/fec_vectors.json.
-    /// Run once with: cargo test -p streamer write_fec_cross_vectors_fixture -- --ignored
+    /// Run once with: cargo test -p transport-core write_fec_cross_vectors_fixture -- --ignored
     /// then commit the generated file.
     #[test]
     #[ignore]
@@ -701,7 +701,7 @@ mod cross_vector_tests {
         let json = build_fixture_json();
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
-            .expect("streamer/ must have a parent (repo root)")
+            .expect("transport-core/ must have a parent (repo root)")
             .join("tests/fixtures/fec_vectors.json");
         std::fs::create_dir_all(path.parent().expect("fixtures/ dir")).expect("mkdir fixtures");
         std::fs::write(&path, &json).expect("write fec_vectors.json");
@@ -720,16 +720,16 @@ mod cross_vector_tests {
     /// file committed at tests/fixtures/fec_vectors.json (include_str! at compile
     /// time).  Fails immediately if the generator changes without re-committing.
     ///
-    /// include_str! path: from streamer/src/transport/webrtc/fec_wire.rs,
-    /// four levels up reaches repo root, then tests/fixtures/fec_vectors.json.
+    /// include_str! path: from transport-core/src/fec_wire.rs,
+    /// two levels up reaches repo root, then tests/fixtures/fec_vectors.json.
     #[test]
     fn cross_vectors_match_committed_fixture() {
         let generated = build_fixture_json();
-        let committed = include_str!("../../../../tests/fixtures/fec_vectors.json");
+        let committed = include_str!("../../tests/fixtures/fec_vectors.json");
         assert_eq!(
             generated, committed,
             "regenerated fixture does not match committed tests/fixtures/fec_vectors.json; \
-             re-run `cargo test -p streamer write_fec_cross_vectors_fixture -- --ignored` and commit"
+             re-run `cargo test -p transport-core write_fec_cross_vectors_fixture -- --ignored` and commit"
         );
     }
 }

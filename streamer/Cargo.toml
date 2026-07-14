@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 moonlight-common = { workspace = true }
 common = { workspace = true }
+transport-core = { workspace = true }
 
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 webrtc = { workspace = true }

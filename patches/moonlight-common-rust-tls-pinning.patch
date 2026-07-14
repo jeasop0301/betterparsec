@@ -1,0 +1,276 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 9b74e04..1f05827 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -143,5 +143,6 @@ tokio-hyper = [
+     "dep:http-body-util",
+     "dep:hyper-rustls",
++    "dep:openssl",
+     "tokio",
+ ]
+ 
+diff --git a/src/http/client/tokio_hyper.rs b/src/http/client/tokio_hyper.rs
+index cdf851b..b80b652 100644
+--- a/src/http/client/tokio_hyper.rs
++++ b/src/http/client/tokio_hyper.rs
+@@ -1,45 +1,55 @@
+-use std::{str::FromStr, sync::Arc, time::Duration};
++use std::{fmt, str::FromStr, sync::Arc, time::Duration};
+ 
+ use bytes::Bytes;
+ use http_body_util::{BodyExt, Empty};
+ use hyper::{Response, body::Incoming};
+ use hyper_rustls::HttpsConnector;
+ use hyper_util::{
+     client::legacy::{Client, connect::HttpConnector},
+     rt::TokioExecutor,
+ };
++use openssl::{
++    error::ErrorStack,
++    hash::MessageDigest,
++    pkey::{PKey, Public},
++    rsa::Padding,
++    sign::{RsaPssSaltlen, Verifier},
++    x509::X509,
++};
+ use rustls::{
+-    ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
++    CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
+     client::{
+         Resumption, WebPkiServerVerifier,
+         danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+     },
+     pki_types::{
+         CertificateDer, PrivateKeyDer, ServerName, UnixTime,
+         pem::{PemObject, SectionKind},
+     },
+     server::VerifierBuilderError,
+ };
+ use thiserror::Error;
+ use tracing::{Level, debug, instrument};
+ 
+ use crate::http::{
+     ClientInfo, Endpoint, ParseError, TextResponse,
+     client::{
+         DEFAULT_LONG_TIMEOUT, DEFAULT_TIMEOUT, RequestError, async_client::RequestClient,
+         hyperlike::build_url,
+     },
+ };
+ 
+ #[derive(Debug, Error)]
+ pub enum HyperError {
+     #[error("hyper client: {0}")]
+     HyperClient(#[from] hyper_util::client::legacy::Error),
+     #[error("hyper: {0}")]
+     Hyper(#[from] hyper::Error),
+     #[error("rustls: {0}")]
+     Rustls(#[from] rustls::Error),
+     #[error("webpki build server certificate verifier: {0}")]
+     WebPkiBuildVerifier(#[from] VerifierBuilderError),
++    #[error("openssl: {0}")]
++    OpenSsl(#[from] ErrorStack),
+     #[error("awc client tried to use an invalid private key")]
+     InvalidPrivateKey,
+@@ -86,12 +96,123 @@ impl TryInto<ParseError> for HyperError {
+     }
+ }
+ 
+-#[derive(Debug)]
+-struct NoHostnameVerifier<Base> {
++#[derive(Clone)]
++struct PinnedTlsIdentity {
++    expected_certificate_der: Vec<u8>,
++    public_key: PKey<Public>,
++}
++
++impl fmt::Debug for PinnedTlsIdentity {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter
++            .debug_struct("PinnedTlsIdentity")
++            .field("certificate_length", &self.expected_certificate_der.len())
++            .finish_non_exhaustive()
++    }
++}
++
++impl PinnedTlsIdentity {
++    fn from_certificate_der(certificate_der: &[u8]) -> Result<Self, ErrorStack> {
++        // OpenSSL accepts Sunshine's historical zero-serial self-signed
++        // certificate while webpki rejects the whole certificate before it can
++        // verify the TLS CertificateVerify signature. Parse with OpenSSL, but
++        // still require the exact paired certificate bytes below.
++        let certificate = X509::from_der(certificate_der)?;
++        let public_key = certificate.public_key()?;
++        Ok(Self {
++            expected_certificate_der: certificate_der.to_vec(),
++            public_key,
++        })
++    }
++
++    fn certificate_matches(&self, presented_certificate_der: &[u8]) -> bool {
++        self.expected_certificate_der == presented_certificate_der
++    }
++
++    fn verify_handshake_signature(
++        &self,
++        message: &[u8],
++        scheme: SignatureScheme,
++        signature: &[u8],
++    ) -> Result<bool, ErrorStack> {
++        let Some((digest, padding)) = signature_parameters(scheme) else {
++            return Ok(false);
++        };
++        let mut verifier = match digest {
++            Some(digest) => Verifier::new(digest, &self.public_key)?,
++            None => Verifier::new_without_digest(&self.public_key)?,
++        };
++
++        if let Some(padding) = padding {
++            verifier.set_rsa_padding(padding)?;
++            if padding == Padding::PKCS1_PSS {
++                let digest = digest.expect("RSA-PSS always has a digest");
++                verifier.set_rsa_mgf1_md(digest)?;
++                verifier.set_rsa_pss_saltlen(RsaPssSaltlen::DIGEST_LENGTH)?;
++            }
++        }
++
++        verifier.verify_oneshot(signature, message)
++    }
++}
++
++fn signature_parameters(
++    scheme: SignatureScheme,
++) -> Option<(Option<MessageDigest>, Option<Padding>)> {
++    use SignatureScheme::*;
++
++    match scheme {
++        RSA_PKCS1_SHA1 => Some((Some(MessageDigest::sha1()), Some(Padding::PKCS1))),
++        RSA_PKCS1_SHA256 => Some((Some(MessageDigest::sha256()), Some(Padding::PKCS1))),
++        RSA_PKCS1_SHA384 => Some((Some(MessageDigest::sha384()), Some(Padding::PKCS1))),
++        RSA_PKCS1_SHA512 => Some((Some(MessageDigest::sha512()), Some(Padding::PKCS1))),
++        RSA_PSS_SHA256 => Some((Some(MessageDigest::sha256()), Some(Padding::PKCS1_PSS))),
++        RSA_PSS_SHA384 => Some((Some(MessageDigest::sha384()), Some(Padding::PKCS1_PSS))),
++        RSA_PSS_SHA512 => Some((Some(MessageDigest::sha512()), Some(Padding::PKCS1_PSS))),
++        ECDSA_SHA1_Legacy => Some((Some(MessageDigest::sha1()), None)),
++        ECDSA_NISTP256_SHA256 => Some((Some(MessageDigest::sha256()), None)),
++        ECDSA_NISTP384_SHA384 => Some((Some(MessageDigest::sha384()), None)),
++        ECDSA_NISTP521_SHA512 => Some((Some(MessageDigest::sha512()), None)),
++        ED25519 | ED448 => Some((None, None)),
++        _ => None,
++    }
++}
++
++#[derive(Debug)]
++struct PinnedServerVerifier<Base> {
+     base: Base,
++    identity: PinnedTlsIdentity,
+ }
+ 
+-impl<Base> ServerCertVerifier for NoHostnameVerifier<Base>
++impl<Base> PinnedServerVerifier<Base> {
++    fn verify_signature(
++        &self,
++        message: &[u8],
++        cert: &CertificateDer<'_>,
++        dss: &DigitallySignedStruct,
++    ) -> Result<HandshakeSignatureValid, rustls::Error> {
++        if !self.identity.certificate_matches(cert.as_ref()) {
++            return Err(rustls::Error::InvalidCertificate(
++                CertificateError::ApplicationVerificationFailure,
++            ));
++        }
++
++        match self
++            .identity
++            .verify_handshake_signature(message, dss.scheme, dss.signature())
++        {
++            Ok(true) => Ok(HandshakeSignatureValid::assertion()),
++            Ok(false) => Err(rustls::Error::InvalidCertificate(
++                CertificateError::BadSignature,
++            )),
++            Err(error) => Err(rustls::Error::General(format!(
++                "OpenSSL handshake signature verification failed: {error}"
++            ))),
++        }
++    }
++}
++
++impl<Base> ServerCertVerifier for PinnedServerVerifier<Base>
+ where
+     Base: ServerCertVerifier,
+ {
+@@ -110,36 +231,33 @@ where
+         &self,
+-        _end_entity: &CertificateDer<'_>,
++        end_entity: &CertificateDer<'_>,
+         _intermediates: &[CertificateDer<'_>],
+         _server_name: &ServerName<'_>,
+         _ocsp_response: &[u8],
+         _now: UnixTime,
+     ) -> Result<ServerCertVerified, rustls::Error> {
+-        Ok(ServerCertVerified::assertion())
++        if self.identity.certificate_matches(end_entity.as_ref()) {
++            Ok(ServerCertVerified::assertion())
++        } else {
++            Err(rustls::Error::InvalidCertificate(
++                CertificateError::ApplicationVerificationFailure,
++            ))
++        }
+     }
+ 
+     fn verify_tls12_signature(
+         &self,
+-        _message: &[u8],
+-        _cert: &CertificateDer<'_>,
+-        _dss: &DigitallySignedStruct,
++        message: &[u8],
++        cert: &CertificateDer<'_>,
++        dss: &DigitallySignedStruct,
+     ) -> Result<HandshakeSignatureValid, rustls::Error> {
+-        // betterparsec fix: Moonlight authenticates the host via the pairing crypto
+-        // (PIN challenge, phases 1-4) over a LOCALHOST bridge↔Sunshine link, not via TLS
+-        // PKI. Delegating here to WebPkiServerVerifier made webpki parse+verify Sunshine's
+-        // self-signed server cert (serial=0, no SAN), which webpki's strict DER parser
+-        // rejects — aborting the phase-5 mTLS handshake client-side and surfacing as hyper
+-        // IncompleteMessage. The reference C client (libcurl/OpenSSL, VERIFYHOST=0) never
+-        // invokes webpki. `verify_server_cert` above is already a no-op, so no-op'ing the
+-        // handshake-signature checks is consistent (no auth is lost — server auth is the
+-        // pairing handshake, and the link is 127.0.0.1).
+-        Ok(HandshakeSignatureValid::assertion())
++        self.verify_signature(message, cert, dss)
+     }
+ 
+     fn verify_tls13_signature(
+         &self,
+-        _message: &[u8],
+-        _cert: &CertificateDer<'_>,
+-        _dss: &rustls::DigitallySignedStruct,
++        message: &[u8],
++        cert: &CertificateDer<'_>,
++        dss: &rustls::DigitallySignedStruct,
+     ) -> Result<HandshakeSignatureValid, rustls::Error> {
+-        Ok(HandshakeSignatureValid::assertion())
++        self.verify_signature(message, cert, dss)
+     }
+@@ -227,5 +344,7 @@ impl RequestClient for TokioHyperClient {
+         let certificate = CertificateDer::from_slice(client_certificate.contents()).into_owned();
+ 
+         // Server
++        let identity = PinnedTlsIdentity::from_certificate_der(server_certificate.contents())?;
++
+         let mut root_certificates = RootCertStore::empty();
+         root_certificates.add(CertificateDer::from_slice(server_certificate.contents()))?;
+@@ -246,9 +365,12 @@ impl RequestClient for TokioHyperClient {
+         config.resumption = Resumption::disabled();
+ 
+-        // Create custom server verifier that doesn't care about host names
+-        let verifier = NoHostnameVerifier {
++        // Sunshine certificates historically omit SAN and may use serial zero.
++        // Skip PKI/name validation, but require exact certificate pinning and
++        // verify CertificateVerify with the public key from the paired cert.
++        let verifier = PinnedServerVerifier {
+             // The builder doesn't store the Arc reference anywhere so we can move the value out of the Arc
+             #[allow(clippy::unwrap_used)]
+             base: Arc::try_unwrap(WebPkiServerVerifier::builder(root_certificates).build()?)
+                 .unwrap(),
++            identity,
+         };

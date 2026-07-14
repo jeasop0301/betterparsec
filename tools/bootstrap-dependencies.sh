@@ -14,6 +14,7 @@ vendor_root="$repo_root/vendor"
 target="$vendor_root/moonlight-common-rust"
 common_c="$target/moonlight-common-sys/moonlight-common-c"
 rust_patch="$repo_root/patches/moonlight-common-rust.patch"
+tls_patch="$repo_root/patches/moonlight-common-rust-tls-pinning.patch"
 common_c_patch="$repo_root/patches/moonlight-common-c.patch"
 
 rust_url="https://github.com/MrCreativ3001/moonlight-common-rust.git"
@@ -29,6 +30,8 @@ patch_applied() {
 apply_patches() {
   git -C "$target" apply --check --ignore-space-change --ignore-whitespace "$rust_patch"
   git -C "$target" apply --ignore-space-change --ignore-whitespace --whitespace=nowarn "$rust_patch"
+  git -C "$target" apply --check --ignore-space-change --ignore-whitespace "$tls_patch"
+  git -C "$target" apply --ignore-space-change --ignore-whitespace --whitespace=nowarn "$tls_patch"
   git -C "$common_c" apply --check --ignore-space-change --ignore-whitespace "$common_c_patch"
   git -C "$common_c" apply --ignore-space-change --ignore-whitespace --whitespace=nowarn "$common_c_patch"
 }
@@ -45,7 +48,13 @@ ready() {
   [[ "$(git -C "$target" rev-parse HEAD 2>/dev/null || true)" == "$rust_revision" ]] || return 1
   [[ -d "$common_c/.git" || -f "$common_c/.git" ]] || return 1
   [[ "$(git -C "$common_c" rev-parse HEAD 2>/dev/null || true)" == "$common_c_revision" ]] || return 1
-  patch_applied "$target" "$rust_patch" || return 1
+  # rust_patch and tls_patch both modify src/http/client/tokio_hyper.rs, so an
+  # independent `git apply --reverse --check` of the lower patch fails once the
+  # other is layered on top (shifted context). apply_patches already forward
+  # --check's each patch before applying; here we detect the applied state by a
+  # stable marker each patch introduces, which composes across layered patches.
+  grep -q "fn change_bitrate" "$target/src/stream/c/mod.rs" || return 1
+  grep -q "PinnedServerVerifier" "$target/src/http/client/tokio_hyper.rs" || return 1
   patch_applied "$common_c" "$common_c_patch" || return 1
 }
 
@@ -87,4 +96,5 @@ fi
 
 echo "Bootstrapped pinned BetterParsec dependency: $target"
 echo "  moonlight-common-rust: $rust_revision + patches/moonlight-common-rust.patch"
+echo "                         + patches/moonlight-common-rust-tls-pinning.patch"
 echo "  moonlight-common-c:    $common_c_revision + patches/moonlight-common-c.patch"

@@ -11,7 +11,13 @@ $vendorRoot = Join-Path $repoRoot 'vendor'
 $target = Join-Path $vendorRoot 'moonlight-common-rust'
 $commonC = Join-Path $target 'moonlight-common-sys\moonlight-common-c'
 $rustPatch = Join-Path $repoRoot 'patches\moonlight-common-rust.patch'
+$tlsPatch = Join-Path $repoRoot 'patches\moonlight-common-rust-tls-pinning.patch'
 $commonCPatch = Join-Path $repoRoot 'patches\moonlight-common-c.patch'
+
+# Ensure Strawberry Perl is found before MSVC tools when git invokes it during patch apply.
+if (Test-Path 'C:\Strawberry\perl\bin\perl.exe') {
+    $env:PATH = 'C:\Strawberry\perl\bin' + [System.IO.Path]::PathSeparator + $env:PATH
+}
 
 $rustUrl = 'https://github.com/MrCreativ3001/moonlight-common-rust.git'
 $rustRevision = 'df9f1e3003fb4834dbb17a4bd4d3cf25d2fea3d9'
@@ -49,6 +55,8 @@ function Test-PatchApplied {
 function Apply-BetterParsecPatches {
     Invoke-Git @('-C', $target, 'apply', '--check', '--ignore-space-change', '--ignore-whitespace', $rustPatch)
     Invoke-Git @('-C', $target, 'apply', '--ignore-space-change', '--ignore-whitespace', '--whitespace=nowarn', $rustPatch)
+    Invoke-Git @('-C', $target, 'apply', '--check', '--ignore-space-change', '--ignore-whitespace', $tlsPatch)
+    Invoke-Git @('-C', $target, 'apply', '--ignore-space-change', '--ignore-whitespace', '--whitespace=nowarn', $tlsPatch)
     Invoke-Git @('-C', $commonC, 'apply', '--check', '--ignore-space-change', '--ignore-whitespace', $commonCPatch)
     Invoke-Git @('-C', $commonC, 'apply', '--ignore-space-change', '--ignore-whitespace', '--whitespace=nowarn', $commonCPatch)
 }
@@ -77,8 +85,16 @@ function Test-Ready {
     if ((Get-GitHead $commonC) -ne $commonCRevision) {
         return $false
     }
-    return (Test-PatchApplied -Repository $target -Patch $rustPatch) -and
-        (Test-PatchApplied -Repository $commonC -Patch $commonCPatch)
+    # Both rust_patch and tls_patch modify src/http/client/tokio_hyper.rs, so an
+    # independent reverse-check of the lower patch fails once both are layered.
+    # Detect applied state by stable markers each patch introduces, which compose
+    # correctly across layered patches.
+    $changeBitratePresent = (Get-Content (Join-Path $target 'src\stream\c\mod.rs') -ErrorAction SilentlyContinue) -match 'fn change_bitrate'
+    $pinnedVerifierPresent = (Get-Content (Join-Path $target 'src\http\client\tokio_hyper.rs') -ErrorAction SilentlyContinue) -match 'PinnedServerVerifier'
+    if (-not $changeBitratePresent -or -not $pinnedVerifierPresent) {
+        return $false
+    }
+    return (Test-PatchApplied -Repository $commonC -Patch $commonCPatch)
 }
 
 if (Test-Ready) {
@@ -119,4 +135,5 @@ if (-not (Test-Ready)) {
 
 Write-Host "Bootstrapped pinned BetterParsec dependency: $target"
 Write-Host "  moonlight-common-rust: $rustRevision + patches/moonlight-common-rust.patch"
+Write-Host "                         + patches/moonlight-common-rust-tls-pinning.patch"
 Write-Host "  moonlight-common-c:    $commonCRevision + patches/moonlight-common-c.patch"

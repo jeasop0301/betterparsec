@@ -1,0 +1,11 @@
+[package]
+name = "betterparsec-tls-pinning-prototype"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+openssl = "=0.10.73"
+rustls = { version = "=0.23.37", default-features = false }

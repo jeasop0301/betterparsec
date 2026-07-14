@@ -1,0 +1,16 @@
+[package]
+name = "client-transport"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+
+[lib]
+# cdylib: linked by the moonlight-qt fork's our_transport.cpp shim
+# (m6-native-spike.md Option-3). rlib: workspace unit tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+transport-core = { workspace = true }
+
+[lints]
+workspace = true

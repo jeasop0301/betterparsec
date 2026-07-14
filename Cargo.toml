@@ -2,7 +2,7 @@ cargo-features = ["profile-rustflags"]
 
 [workspace]
 resolver = "3"
-members = ["common", "streamer", "transport-core", "./"]
+members = ["common", "streamer", "transport-core", "client-transport", "./"]
 default-members = ["streamer", "transport-core", "./"]
 
 [profile.release]

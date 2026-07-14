@@ -112,6 +112,21 @@ function parseSettingsFromQuery(queryParams: URLSearchParams): Partial<Settings>
         settings.dataTransport = dataTransport as TransportType
     }
 
+    // Experimental FEC video path (fec-framing.md §8) — URL-toggleable so
+    // loss-injection tests and remote sessions can flip it per-connection
+    // without touching persisted settings.
+    const enableVideoFec = queryParams.get("enableVideoFec")
+    if (enableVideoFec != null) {
+        settings.enableVideoFec = enableVideoFec === "true"
+    }
+
+    // U4 P1 QU lossless overlay (qu-protocol.md §7 P1) — URL-toggleable for
+    // injector tests and per-connection activation without persisted settings.
+    const enableVideoQu = queryParams.get("enableVideoQu")
+    if (enableVideoQu != null) {
+        settings.enableVideoQu = enableVideoQu === "true"
+    }
+
     return settings
 }
 

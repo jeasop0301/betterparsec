@@ -1,0 +1,24 @@
+[package]
+name = "app-native"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+
+[[bin]]
+name = "betterparsec"
+path = "src/main.rs"
+
+[dependencies]
+client-transport = { path = "../client-transport" }
+transport-core = { workspace = true }
+
+# A0 shell: egui via eframe (glow backend — the stream surface will live on
+# its own raw D3D11 HWND per unified-app-architecture.md D5/D9, so the
+# chrome renderer stays lightweight and independent).
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[lints]
+workspace = true

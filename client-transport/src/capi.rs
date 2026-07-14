@@ -12,6 +12,7 @@
 //! The mirror C header lives at `client-transport/include/client_transport.h`
 //! and must stay in sync with this file.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,6 +32,10 @@ pub struct RxCore {
     /// (highest_fully_decoded), so newest-wins collapsing is lossless for
     /// the host window — see fec-framing.md §2.
     pending_ack: Mutex<Option<u32>>,
+    /// Latched by the decoder when it hits an unrecoverable bitstream
+    /// error (e.g. missing reference after frame-queue eviction); drained
+    /// through [`RxCore::poll_needs_idr`] like the receiver-side flags.
+    decode_needs_idr: AtomicBool,
 }
 
 impl RxCore {
@@ -39,6 +44,7 @@ impl RxCore {
             rx: Mutex::new(VideoReceiver::new(now_ms)),
             queue: FrameQueue::new(DEFAULT_FRAME_CAP),
             pending_ack: Mutex::new(None),
+            decode_needs_idr: AtomicBool::new(false),
         }
     }
 
@@ -66,10 +72,17 @@ impl RxCore {
         lock_ignore_poison(&self.pending_ack).take()
     }
 
+    /// Latch a needs-IDR request from the decode side. Collapses with the
+    /// receiver/overflow flags into the next [`RxCore::poll_needs_idr`].
+    pub fn request_idr(&self) {
+        self.decode_needs_idr.store(true, Ordering::Release);
+    }
+
     pub fn poll_needs_idr(&self) -> bool {
         let rx_flag = lock_ignore_poison(&self.rx).poll_needs_idr();
         let overflow = self.queue.take_overflowed();
-        rx_flag || overflow
+        let decode = self.decode_needs_idr.swap(false, Ordering::AcqRel);
+        rx_flag || overflow || decode
     }
 
     pub fn wait_frame(&self, timeout: Duration) -> Option<DecodeUnit> {
@@ -456,6 +469,16 @@ mod tests {
                 msg
             })
             .collect()
+    }
+
+    #[test]
+    fn decode_side_idr_request_latches_once() {
+        let core = RxCore::new(0);
+        assert!(!core.poll_needs_idr());
+        core.request_idr();
+        core.request_idr(); // collapses — cumulative like the other flags
+        assert!(core.poll_needs_idr());
+        assert!(!core.poll_needs_idr());
     }
 
     fn pop_frame(rx: &Rx, timeout_ms: u64) -> Option<(CtDecodeUnit, Vec<u8>, *mut CtFrame)> {

@@ -6,6 +6,9 @@ ignore
 # Release-mode local web asset copy (built from dist/, see README "release mode")
 /static
 
+# Pinned prebuilt third-party (bootstrap scripts recreate; see tools/)
+/third-party
+
 # GJC runtime state
 /.gjc
 

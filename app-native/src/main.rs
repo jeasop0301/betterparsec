@@ -1,14 +1,18 @@
 //! BetterParsec unified app — A0 client first light
 //! (docs/design/unified-app-architecture.md §6).
 //!
-//! This slice: native shell (egui chrome) + client-transport session +
-//! live receive panel driven by the shared RxCore. The video surface
-//! (raw D3D11 child HWND, FFmpeg D3D11VA decode) is the next A0 slice;
-//! until then received frames are counted and dropped so the whole
-//! session pipeline (signaling → WebRTC → video_fec → FEC decode →
-//! FrameQueue) runs for real.
+//! Slices 1+2: native shell (egui chrome) + client-transport session +
+//! FFmpeg H.264 decode (`video` feature: D3D11VA hwaccel, software
+//! fallback) painted through an interim egui texture. The dedicated raw
+//! D3D11 FLIP_DISCARD surface (child HWND) is slice 3 (design D5); built
+//! without `video`, received frames are counted and dropped, which still
+//! runs the whole session pipeline (signaling → WebRTC → video_fec →
+//! FEC decode → FrameQueue) for real.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+#[cfg(feature = "video")]
+mod video;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -18,6 +22,8 @@ use client_transport::capi::RxCore;
 use client_transport::flow::FlowConfig;
 use client_transport::session::{H264_BIT, Session, SessionConfig, SessionState};
 use client_transport::tls::ServerTrust;
+#[cfg(feature = "video")]
+use transport_core::video_rx::DecodeUnit;
 
 fn main() -> eframe::Result {
     tracing_subscriber::fmt()
@@ -29,7 +35,7 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([560.0, 480.0])
+            .with_inner_size([960.0, 640.0])
             .with_title("BetterParsec"),
         ..Default::default()
     };
@@ -70,6 +76,80 @@ impl FpsWindow {
     }
 }
 
+/// Decode output shared pump → UI (`video` feature).
+#[cfg(feature = "video")]
+#[derive(Default)]
+struct VideoShared {
+    /// Newest decoded picture; the UI takes it (newest-wins).
+    frame: Mutex<Option<video::RgbaFrame>>,
+    /// Bumped once per stored frame so the UI knows when to re-upload.
+    generation: AtomicU64,
+    decoded: AtomicU64,
+    decode_errors: AtomicU64,
+    hw_device: AtomicBool,
+}
+
+/// Per-pump decoder state: FFmpeg decoder + IDR gating.
+#[cfg(feature = "video")]
+struct DecodeState {
+    decoder: Option<video::Decoder>,
+    /// Skip deltas until the first IDR (re-armed after a decode error) so
+    /// the decoder never chews frames whose references it cannot have.
+    wait_for_key: bool,
+}
+
+#[cfg(feature = "video")]
+impl DecodeState {
+    fn new(shared: &VideoShared) -> Self {
+        let decoder = match video::Decoder::new() {
+            Ok(d) => {
+                shared.hw_device.store(d.hw_device, Ordering::Relaxed);
+                tracing::info!(hw = d.hw_device, "video decoder ready");
+                Some(d)
+            }
+            Err(e) => {
+                tracing::error!(err = %e, "video decoder init failed — receive-only mode");
+                None
+            }
+        };
+        Self {
+            decoder,
+            wait_for_key: true,
+        }
+    }
+
+    fn on_unit(
+        &mut self,
+        core: &RxCore,
+        shared: &VideoShared,
+        egui_ctx: &eframe::egui::Context,
+        unit: &DecodeUnit,
+    ) {
+        let Some(dec) = self.decoder.as_mut() else {
+            return;
+        };
+        if self.wait_for_key && !unit.is_key {
+            return;
+        }
+        self.wait_for_key = false;
+        match dec.decode(&unit.data) {
+            Ok(Some(frame)) => {
+                *shared.frame.lock().unwrap_or_else(PoisonError::into_inner) = Some(frame);
+                shared.generation.fetch_add(1, Ordering::Release);
+                shared.decoded.fetch_add(1, Ordering::Relaxed);
+                egui_ctx.request_repaint();
+            }
+            Ok(None) => {}
+            Err(e) => {
+                shared.decode_errors.fetch_add(1, Ordering::Relaxed);
+                self.wait_for_key = true;
+                core.request_idr();
+                tracing::warn!(err = %e, frame_id = unit.frame_id, "decode failed — requesting IDR");
+            }
+        }
+    }
+}
+
 struct Running {
     session: Session,
     core: Arc<RxCore>,
@@ -77,14 +157,18 @@ struct Running {
     fps: Arc<FpsWindow>,
     started: Instant,
     pump: Option<std::thread::JoinHandle<()>>,
+    #[cfg(feature = "video")]
+    video: Arc<VideoShared>,
 }
 
 impl Running {
-    fn start(cfg: ConnectForm) -> Self {
+    fn start(cfg: ConnectForm, egui_ctx: eframe::egui::Context) -> Self {
         let core = Arc::new(RxCore::new(0));
         let stats = Arc::new(RxStats::default());
         let fps = Arc::new(FpsWindow::default());
         let started = Instant::now();
+        #[cfg(feature = "video")]
+        let video_shared = Arc::new(VideoShared::default());
 
         let session = Session::start(
             SessionConfig {
@@ -109,15 +193,23 @@ impl Running {
             core.clone(),
         );
 
-        // Decoder-thread stand-in: pull frames exactly like the future
-        // D3D11VA pipeline will, count them, drop the bytes.
+        // Frame pump == the decoder thread: pulls complete access units
+        // from the shared RxCore. With the `video` feature each unit goes
+        // through FFmpeg (D3D11VA, sw fallback) and the newest picture is
+        // published for the UI; without it, frames are counted and dropped.
         let pump = {
             let core = core.clone();
             let stats = stats.clone();
             let fps = fps.clone();
+            #[cfg(feature = "video")]
+            let video = video_shared.clone();
             std::thread::Builder::new()
                 .name("a0-frame-pump".into())
                 .spawn(move || {
+                    #[cfg(feature = "video")]
+                    let mut decode = DecodeState::new(&video);
+                    #[cfg(not(feature = "video"))]
+                    let _ = &egui_ctx;
                     loop {
                         match core.wait_frame(Duration::from_millis(250)) {
                             Some(unit) => {
@@ -134,6 +226,8 @@ impl Running {
                                     Ordering::Relaxed,
                                 );
                                 fps.push(now);
+                                #[cfg(feature = "video")]
+                                decode.on_unit(&core, &video, &egui_ctx, &unit);
                             }
                             None => {
                                 if stats.stopped.load(Ordering::Acquire) {
@@ -153,6 +247,8 @@ impl Running {
             fps,
             started,
             pump: Some(pump),
+            #[cfg(feature = "video")]
+            video: video_shared,
         }
     }
 
@@ -200,6 +296,12 @@ struct App {
     host_id_text: String,
     app_id_text: String,
     running: Option<Running>,
+    /// Uploaded stream texture (interim egui present, slice 2).
+    #[cfg(feature = "video")]
+    video_tex: Option<eframe::egui::TextureHandle>,
+    /// Generation of the frame currently in `video_tex`.
+    #[cfg(feature = "video")]
+    video_gen: u64,
 }
 
 impl App {
@@ -210,6 +312,10 @@ impl App {
             app_id_text: form.app_id.to_string(),
             form,
             running: None,
+            #[cfg(feature = "video")]
+            video_tex: None,
+            #[cfg(feature = "video")]
+            video_gen: 0,
         }
     }
 }
@@ -255,7 +361,7 @@ impl eframe::App for App {
                     if ui.button("Connect").clicked() {
                         self.form.host_id = self.host_id_text.trim().parse().unwrap_or(0);
                         self.form.app_id = self.app_id_text.trim().parse().unwrap_or(0);
-                        self.running = Some(Running::start(self.form.clone()));
+                        self.running = Some(Running::start(self.form.clone(), ctx.clone()));
                     }
                     ui.add_space(4.0);
                     ui.small("dev TLS: accepts any certificate (localhost testing)");
@@ -300,14 +406,66 @@ impl eframe::App for App {
                     if state == SessionState::Failed {
                         ui.colored_label(egui::Color32::RED, "session failed — see log");
                     }
+                    #[cfg(feature = "video")]
+                    {
+                        let generation = run.video.generation.load(Ordering::Acquire);
+                        if generation != self.video_gen
+                            && let Some(f) = run
+                                .video
+                                .frame
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .take()
+                        {
+                            let img = egui::ColorImage::from_rgba_unmultiplied(
+                                [f.width, f.height],
+                                &f.rgba,
+                            );
+                            match self.video_tex.as_mut() {
+                                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                                None => {
+                                    self.video_tex = Some(ctx.load_texture(
+                                        "stream",
+                                        img,
+                                        egui::TextureOptions::LINEAR,
+                                    ));
+                                }
+                            }
+                            self.video_gen = generation;
+                        }
+                        ui.separator();
+                        ui.label(format!(
+                            "decoded: {} ({}, errors: {})",
+                            run.video.decoded.load(Ordering::Relaxed),
+                            if run.video.hw_device.load(Ordering::Relaxed) {
+                                "d3d11va"
+                            } else {
+                                "sw decode"
+                            },
+                            run.video.decode_errors.load(Ordering::Relaxed),
+                        ));
+                        if let Some(tex) = &self.video_tex {
+                            let size = tex.size_vec2();
+                            let scale = (ui.available_width() / size.x).min(1.0);
+                            ui.image((tex.id(), size * scale));
+                        }
+                    }
                     ui.add_space(8.0);
                     if ui.button("Disconnect").clicked()
                         && let Some(run) = self.running.take()
                     {
                         run.stop();
+                        #[cfg(feature = "video")]
+                        {
+                            self.video_tex = None;
+                            self.video_gen = 0;
+                        }
                     }
                     ui.add_space(4.0);
-                    ui.small("A0: frames are received and counted; the D3D11 video surface is the next slice");
+                    #[cfg(feature = "video")]
+                    ui.small("A0 slice 2: FFmpeg decode + interim egui present; the raw D3D11 surface is slice 3");
+                    #[cfg(not(feature = "video"))]
+                    ui.small("built without the `video` feature — frames are received and counted only");
                 }
             }
         });

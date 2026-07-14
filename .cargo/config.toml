@@ -1,0 +1,10 @@
+# FFMPEG_DIR for ffmpeg-sys-next (app-native `video` feature).
+# Populated by tools/bootstrap-ffmpeg.ps1; harmless when the feature is off
+# or the directory is absent on non-video builds.
+[env]
+FFMPEG_DIR = { value = "third-party/ffmpeg", relative = true, force = false }
+# bindgen (ffmpeg-sys-next) loads libclang at build time. Machine-wide
+# LLVM can be too new for the pinned bindgen (22.x breaks 0.70 → opaque
+# structs), so tools/bootstrap-libclang.ps1 pins 18.1.1 here; force = false
+# lets a machine-specific env win.
+LIBCLANG_PATH = { value = "third-party/libclang", relative = true, force = false }

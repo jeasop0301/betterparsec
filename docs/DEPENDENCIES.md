@@ -33,6 +33,22 @@ BetterParsec의 동작에 필요한 Moonlight 변경은 더 이상 저장소 밖
 Foundation Sunshine host-side capability patch는 별도로
 `docs/host-patches/foundation-sunshine-dynamic-bitrate-capability.patch`에 있다.
 
+## prebuilt binary pins (URL + SHA-256)
+
+vendor 소스 패치와 별개로, app-native `video` 피처는 두 개의 prebuilt
+바이너리를 핀한다. 둘 다 `third-party/`(gitignored)에 풀리고, URL +
+SHA-256이 스크립트에 고정돼 있다.
+
+| Pin | Script | 내용 |
+| --- | --- | --- |
+| FFmpeg n7.1 (BtbN lgpl-shared) | `tools/bootstrap-ffmpeg.ps1` | `third-party/ffmpeg` — libavcodec/swscale 헤더·import lib·DLL. LGPL 동적링크 유지(unified-app-architecture.md §4-1). `.cargo/config.toml`이 `FFMPEG_DIR`로 지정 |
+| libclang 18.1.1 (PyPI `libclang` 휠, LLVM org 소유) | `tools/bootstrap-libclang.ps1` | `third-party/libclang/libclang.dll` — bindgen(ffmpeg-sys-next)용. 머신 전역 LLVM 22는 bindgen 0.70에서 구조체가 opaque로 생성되는 비호환이 있어 핀 버전을 사용. `.cargo/config.toml`이 `LIBCLANG_PATH`로 지정 |
+
+`app-native/build.rs`는 `video` 피처 빌드 시 FFmpeg DLL을
+`target/<profile>/`와 `target/<profile>/deps/`로 스테이징해 `cargo run`
+/ `cargo test`가 PATH 조작 없이 동작하게 한다. `video` 피처를 켜지
+않는 빌드는 두 핀 없이도 그대로 성립한다.
+
 ## bootstrap
 
 Windows PowerShell:

@@ -89,9 +89,19 @@ U5/M6 스파이크, f1-ack 소스 확인+0x5509 호스트 패치.
    디코드로 699프레임/15s(~58fps) 수신. **후속 설계 완료**:
    docs/design/unified-app-architecture.md — 통합 양방향 앱 D1–D10 결정
    (단일 바이너리 역할 스위치, Sunshine 서브프로세스 유지, web-server
-   임베드, raw D3D11 프레젠트, 포크 W2 보류). 다음 실행 = **A0 클라
-   first light** (app-native: 창+egui+client-transport+FFmpeg
-   D3D11VA+FLIP_DISCARD, ~1.5–2k LOC).
+   임베드, raw D3D11 프레젠트, 포크 W2 보류). **A0 슬라이스 1 라이브 검증**
+   (2026-07-14, owner 확인): `betterparsec.exe`(app-native, egui 셸 +
+   client-transport 세션 + 프레임 펌프)가 실스트림에서 프레임 카운트
+   정상 상승. **슬라이스 2 기계 완성** (2026-07-14, 헤드리스 검증):
+   FFmpeg 조달 핀(tools/bootstrap-ffmpeg.ps1, BtbN n7.1 lgpl-shared
+   SHA-256) + libclang 핀(tools/bootstrap-libclang.ps1, PyPI 18.1.1 휠;
+   머신 LLVM 22 아래서 bindgen 0.70이 opaque 구조체를 뱉는 문제 우회) +
+   app-native `video` 피처: ffmpeg-sys-next D3D11VA hwaccel(+sw 폴백),
+   NV12/YUV420P→RGBA, 디코드 실패→RxCore needs-IDR 래치, interim egui
+   프레젠트(첫 IDR 게이트 포함). 검증 = openh264 합성 스트림 30 AU
+   헤드리스 디코드 + 픽셀 비균일 assert(3 tests 그린), non-video 빌드
+   무손상, clippy 클린. 잔여 = **라이브 첫 픽셀**(owner 스모크, 5분) →
+   슬라이스 3: raw FLIP_DISCARD 표면(D5).
 5. Gate B 2-machine 첫 신뢰 run — 이후 U1 CC 신호 판정, U2 P2 손실 복구
    실측·비율 튜닝, U3/U5 지연 계측이 전부 이 위에서 순차 판정된다.
 

@@ -20,5 +20,18 @@ eframe = { version = "0.29", default-features = false, features = ["glow", "defa
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
+# A0 slice 2: H.264 decode via FFmpeg (BtbN LGPL shared pin,
+# tools/bootstrap-ffmpeg.ps1 -> third-party/ffmpeg -> FFMPEG_DIR from
+# .cargo/config.toml). Optional so builds work without FFmpeg present.
+ffmpeg-sys-next = { version = "7.1", optional = true, default-features = false, features = [
+    "avcodec",
+    "swscale",
+] }
+libc = { version = "0.2", optional = true }
+
+[features]
+default = []
+video = ["dep:ffmpeg-sys-next", "dep:libc"]
+
 [lints]
 workspace = true

@@ -73,6 +73,8 @@ use crate::{
 mod audio;
 mod fec_sender;
 pub mod fec_wire;
+pub(crate) mod qu_wire;
+mod qu_relay;
 mod sender;
 mod video;
 
@@ -85,6 +87,9 @@ struct WebRtcInner {
     /// Unreliable, unordered DataChannel carrying FEC source + repair symbols
     /// from host to client (host → client only; no on_message handler needed).
     video_fec_channel: Arc<RTCDataChannel>,
+    /// Reliable, ordered DataChannel carrying QU tile messages (bidirectional:
+    /// host → client config/tile/invalidate, client → host subscribe/budget).
+    video_qu_channel: Arc<RTCDataChannel>,
     video: Mutex<WebRtcVideo>,
     target_bitrate_kbps: Arc<AtomicU32>,
     cc_shared: Arc<CcShared>,
@@ -186,6 +191,16 @@ pub async fn new(
             }),
         )
         .await?;
+    // QU tile channel: reliable, ordered — host→client tiles + client→host sub/budget.
+    let video_qu_channel = peer
+        .create_data_channel(
+            "video_qu",
+            Some(RTCDataChannelInit {
+                ordered: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await?;
 
     let runtime = Handle::current();
     let video_metrics = Arc::new(VideoTransportMetrics::new(video_frame_queue_size));
@@ -198,6 +213,7 @@ pub async fn new(
         stats_channel,
         input_channels: Default::default(),
         video_fec_channel: video_fec_channel.clone(),
+        video_qu_channel: video_qu_channel.clone(),
         video: Mutex::new(WebRtcVideo::new(
             runtime.clone(),
             Arc::downgrade(&peer),
@@ -225,6 +241,8 @@ pub async fn new(
         this.clone().on_data_channel(video_fec_channel).await;
         // FEC ACK channel (client→host; on_message set up in on_data_channel).
         this.clone().on_data_channel(video_fec_ack_channel).await;
+        // QU tile channel (bidirectional; on_message set up in on_data_channel).
+        this.clone().on_data_channel(video_qu_channel).await;
 
         struct Options {
             reliable: bool,
@@ -596,6 +614,17 @@ impl WebRtcInner {
                             return;
                         };
                         inner.video.lock().await.handle_fec_ack(ack_msg);
+                    },
+                ));
+            }
+            "video_qu" => {
+                // Bidirectional QU channel: forward client messages to the relay handle.
+                // (host→client tile messages are sent directly on `video_qu_channel` by
+                // the relay task; this handler only processes the client→host direction.)
+                channel.on_message(create_event_handler(
+                    inner,
+                    async move |inner, msg: DataChannelMessage| {
+                        inner.video.lock().await.handle_qu_msg(msg.data);
                     },
                 ));
             }

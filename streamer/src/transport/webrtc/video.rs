@@ -49,6 +49,7 @@ use crate::transport::{
         WebRtcInner,
         fec_sender::FecSenderHandle,
         fec_wire::AckMsg,
+        qu_relay::{DataChannelSink, QuRelayHandle},
         sender::{CcContext, SequencedTrackLocalStaticRTP, TrackLocalSender},
         video::{
             h264::{payloader::H264Payloader, reader::H264Reader},
@@ -102,6 +103,12 @@ pub struct WebRtcVideo {
     /// FEC sender handle; `None` until the first `setup()` call.
     /// Default state: dormant — one AtomicBool load per frame overhead only.
     fec_handle: Option<FecSenderHandle>,
+    /// Monotonic generation counter shared with every spawned QU relay task.
+    /// Same ghost-writer guard pattern as `fec_generation`.
+    qu_generation: Arc<AtomicU32>,
+    /// QU relay handle; `None` until the first `setup()` call.
+    /// Dormant cost: idle TcpListener + epoch tracking only (no channel traffic).
+    qu_handle: Option<QuRelayHandle>,
 }
 
 impl WebRtcVideo {
@@ -125,6 +132,8 @@ impl WebRtcVideo {
             cc_shared,
             fec_generation: Arc::new(AtomicU32::new(0)),
             fec_handle: None,
+            qu_generation: Arc::new(AtomicU32::new(0)),
+            qu_handle: None,
         }
     }
 
@@ -212,6 +221,29 @@ impl WebRtcVideo {
                 inner.video_fec_channel.clone(),
                 Arc::clone(&self.needs_idr),
             ));
+        }
+
+        // QU relay task: same ghost-writer guard pattern — bump generation to retire
+        // any prior relay task, bind a new listener, and spawn dormant.
+        // Dormant cost: idle TcpListener + epoch tracking only (zero DataChannel
+        // traffic until the client sends QU_SUBSCRIBE).
+        {
+            let new_qu_gen = self.qu_generation.fetch_add(1, Ordering::AcqRel) + 1;
+            match QuRelayHandle::spawn(
+                new_qu_gen,
+                Arc::clone(&self.qu_generation),
+                Arc::new(DataChannelSink(inner.video_qu_channel.clone())),
+            )
+            .await
+            {
+                Ok(handle) => {
+                    info!("[QuRelay] relay bound at {}", handle.local_addr());
+                    self.qu_handle = Some(handle);
+                }
+                Err(e) => {
+                    error!("[QuRelay] failed to bind relay listener: {e}");
+                }
+            }
         }
 
         let needs_idr = self.needs_idr.clone();
@@ -348,6 +380,14 @@ impl WebRtcVideo {
     pub(super) fn handle_fec_ack(&self, msg: AckMsg) {
         if let Some(handle) = &self.fec_handle {
             handle.forward_ack(msg);
+        }
+    }
+
+    /// Forward a raw `video_qu` DataChannel message from the client to the QU relay.
+    /// No-op before `setup()` (qu_handle is None).
+    pub(super) fn handle_qu_msg(&self, data: Bytes) {
+        if let Some(handle) = &self.qu_handle {
+            handle.forward_client_msg(data);
         }
     }
 

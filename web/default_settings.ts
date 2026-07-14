@@ -51,7 +51,9 @@ const trueDefaultSettings: Settings =
     "hdr": false,
     "useSelectElementPolyfill": false,
     // U2 P1 — FEC pipeline test mode, default off (zero hot-path cost when false)
-    "enableVideoFec": false
+    "enableVideoFec": false,
+    // U4 P1 — QU lossless overlay test mode, default off (zero hot-path cost when false)
+    "enableVideoQu": false
 }
 
 export default trueDefaultSettings as Settings

@@ -280,6 +280,27 @@ export class WebRTCTransport implements Transport {
         return null
     }
 
+    // video_qu DataChannel (U4 P1): reliable + ordered, bidirectional.
+    // Intercepted in onDataChannel before the TransportChannelId lookup.
+    private quDataChannel: RTCDataChannel | null = null
+    private onQuChannelCallback: ((ch: RTCDataChannel) => void) | null = null
+
+    /** Returns the raw QU DataChannel, or null if not yet received. */
+    getQuChannel(): RTCDataChannel | null {
+        return this.quDataChannel
+    }
+
+    /**
+     * Register a callback that fires when the video_qu channel arrives.
+     * If the channel was already received, the callback fires immediately.
+     */
+    setOnQuChannel(cb: (ch: RTCDataChannel) => void): void {
+        this.onQuChannelCallback = cb
+        if (this.quDataChannel) {
+            cb(this.quDataChannel)
+        }
+    }
+
     private channels: Array<TransportChannel | null> = []
     private initChannels() {
         if (!this.peer) {
@@ -368,6 +389,12 @@ export class WebRTCTransport implements Transport {
         if (label === "video_fec_ack") {
             this.logger?.debug("Stashing video_fec_ack DataChannel")
             this.fecAckChannel = remoteChannel
+            return
+        }
+        if (label === "video_qu") {
+            this.logger?.debug("Stashing video_qu DataChannel")
+            this.quDataChannel = remoteChannel
+            this.onQuChannelCallback?.(remoteChannel)
             return
         }
 

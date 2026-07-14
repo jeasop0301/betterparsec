@@ -38,6 +38,9 @@ export type Settings = {
     // U2 P1: enable Tetrys FEC pipeline over video_fec DataChannel.
     // Default false (RTP videotrack path unchanged). Set true for test mode.
     enableVideoFec: boolean
+    // U4 P1: enable QU lossless overlay over video_qu DataChannel.
+    // Default false (zero hot-path cost). Set true to receive QU_TILE overlays.
+    enableVideoQu: boolean
 }
 
 export type StreamCodec = "h264" | "auto" | "h265" | "av1"

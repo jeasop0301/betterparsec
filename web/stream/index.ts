@@ -18,6 +18,8 @@ import { VideoRenderer } from "./video/index.js"
 import { buildFecVideoPipeline, buildVideoPipeline, VideoPipelineOptions } from "./video/pipeline.js"
 import { FecDecodePipe } from "./video/fec_decode_pipe.js"
 import { encodeAck, SUBSCRIBE_MESSAGE, NEEDS_IDR_MESSAGE } from "./video/fec_wire.js"
+import { QuOverlayDom } from "./video/qu_overlay.js"
+import { parseQuMessage, encodeSubscribe } from "./video/qu_wire.js"
 
 export type ExecutionEnvironment = {
     main: boolean
@@ -811,6 +813,42 @@ export class Stream implements Component {
         } else {
             this.debugLog(`Failed to create video pipeline with transport channel of type ${video.type} (${this.transport.implementationName})`)
             return null
+        }
+
+        // ── U4 P1: QU lossless overlay ────────────────────────────────────────
+        // When enableVideoQu is true and a WebRTC transport is active, register a
+        // callback that attaches a QuOverlayDom over the renderer element as soon
+        // as the video_qu DataChannel arrives (reliable + ordered, bidirectional).
+        // Flag-off (default) = zero new work on the hot path.
+        if (this.settings.enableVideoQu && this.transport instanceof WebRTCTransport) {
+            const quTransport = this.transport
+            // The renderer element is the first child of divElement after mount().
+            const rendererEl = this.divElement.firstElementChild as HTMLElement | null
+            if (rendererEl) {
+                const overlay = new QuOverlayDom(
+                    rendererEl,
+                    this.divElement,
+                    this.streamerSize[0],
+                    this.streamerSize[1],
+                )
+                quTransport.setOnQuChannel((quCh: RTCDataChannel) => {
+                    // Send QU_SUBSCRIBE to activate the host QU sender (dormant by default).
+                    const sub = encodeSubscribe()
+                    if (quCh.readyState === 'open') {
+                        quCh.send(sub)
+                    }
+                    quCh.addEventListener('open', () => quCh.send(encodeSubscribe()))
+                    // Feed all incoming ArrayBuffers through the overlay state machine.
+                    quCh.addEventListener('message', (ev: MessageEvent) => {
+                        const buf: ArrayBuffer = ev.data instanceof ArrayBuffer
+                            ? ev.data : ev.data.buffer
+                        const msg = parseQuMessage(buf)
+                        if (msg) overlay.apply(msg)
+                    })
+                })
+            } else {
+                this.debugLog('enableVideoQu=true but renderer element not found in divElement; overlay skipped', { type: 'ifErrorDescription' })
+            }
         }
 
         return pipelineCodecSupport

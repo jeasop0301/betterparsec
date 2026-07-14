@@ -80,10 +80,14 @@ U5/M6 스파이크, f1-ack 소스 확인+0x5509 호스트 패치.
    0x5509 왕복 5회 3면 교차 검증 — f1-ack.md step 4). 잔여 라이브 항목:
    U2 P1 손실-0 프레임 동일성 스모크(enableVideoFec=true)는 다음 세션에
    5분 항목으로.
-2. f1-ack 클라 플러밍 — moonlight-common-c/rust 패치에 0x5509 수신 훅 +
-   상태머신 arming (헤드리스 가능; vendor 재생성 필요).
-3. U4 P1 — `video_qu` 채널 + localhost 릴레이 + 클라 오버레이(스트리머 단독,
-   합성 타일 인젝터로 테스트).
+2. ~~f1-ack 클라 플러밍~~ — **완료** (2026-07-14, f1-ack.md 구현 순서
+   1–4 전부 [x]): moonlight-common-c 0x5509 수신 훅 +
+   `LiRegisterBitrateAckListener` + Rust 트램폴린 + 스트리머 0x80
+   arming + **라이브 왕복 ×5 검증**(커밋 4e32ba5). 잔여 5–6단계
+   (`ack_latency_ms` 벤치 계측, Tier B 판정)는 라이브 벤치 런 의존.
+3. ~~U4 P1~~ — **완료** (2026-07-14, U4 행 참조): `video_qu` 릴레이 +
+   클라 오버레이, streamer 251·웹 103 그린. 잔여 = 호스트 무손실
+   타일 경로(포크 P2).
 4. ~~M6 W1~~ — **완주** (2026-07-14): ct-probe 라이브 검증 `CT-PROBE-OK` —
    브라우저 없이 로그인→시그널링→WebRTC answer→video_fec 구독→FEC
    디코드로 699프레임/15s(~58fps) 수신. **후속 설계 완료**:
@@ -130,9 +134,17 @@ U5/M6 스파이크, f1-ack 소스 확인+0x5509 호스트 패치.
    부호 유지, Alt/F10 시스템 메뉴 억제). 검증 = client-transport 24
    tests(라벨 매핑·와이어 바이트-정확 인코드·드롭) + app-native 15
    tests(translate 순수 함수: 스케일/클램프/버튼/휠/VK), clippy 클린.
-   잔여 = **라이브 첫 픽셀+소리+조작**(owner 스모크, 5분, 슬라이스
-   2–4+A2 동시 판정) → A1 호스트 롤(web-server 라이브러리화) · 상대
-   마우스+immersive는 M4 `session-ux`(Phase B).
+   **A1 슬라이스 1 완료** (2026-07-14, 헤드리스 검증): web-server
+   bin→lib 분리 — `web_server::build(config) -> BoundServer`(바인드된
+   주소 + stop 핸들, 포트 0 해석) / `start()`, 바이너리는 CLI+로깅
+   래퍼로 축소, actix 서비스·클라 프로토콜 무변경. 검증 =
+   `embedded_server_boots_serves_and_stops`(에페메랄 포트 부팅→raw
+   HTTP 응답→graceful stop) 포함 lib 20 + bin 22 tests,
+   clippy --all-targets 클린. 잔여 = **라이브 첫
+   픽셀+소리+조작**(owner 스모크, 5분, 슬라이스 2–4+A2 동시 판정) →
+   A1 슬라이스 2: app-native host 롤(임베드 기동 + Sunshine/streamer
+   서브프로세스 관리) · 상대 마우스+immersive는 M4
+   `session-ux`(Phase B).
 5. Gate B 2-machine 첫 신뢰 run — 이후 U1 CC 신호 판정, U2 P2 손실 복구
    실측·비율 튜닝, U3/U5 지연 계측이 전부 이 위에서 순차 판정된다.
 

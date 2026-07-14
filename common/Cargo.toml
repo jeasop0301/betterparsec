@@ -30,6 +30,9 @@ tracing = { workspace = true }
 ts-rs = { workspace = true, features = ["uuid-impl"] }
 
 thiserror = { workspace = true }
+num = { workspace = true }
+num-derive = { workspace = true }
+num-traits = { workspace = true }
 
 [lints]
 workspace = true

@@ -26,13 +26,11 @@ use tokio::{
     time::sleep,
 };
 
-use crate::{
-    buffer::ByteBuffer,
-    transport::{
-        InboundPacket, OutboundPacket, TransportChannel, TransportError, TransportEvent,
-        TransportEvents, TransportSender,
-    },
+use crate::transport::{
+    InboundPacket, OutboundPacket, TransportChannel, TransportError, TransportEvent,
+    TransportEvents, TransportSender,
 };
+use common::buffer::ByteBuffer;
 
 pub async fn new() -> Result<(WebSocketTransportSender, WebSocketTransportEvents), anyhow::Error> {
     let (event_sender, event_receiver) = channel::<TransportEvent>(20);

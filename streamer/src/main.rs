@@ -77,7 +77,6 @@ pub const TIMEOUT_DURATION: Duration = Duration::from_secs(10);
 mod abr;
 mod audio;
 mod bitrate_apply;
-mod buffer;
 mod cc;
 mod convert;
 mod dynamic_ice_servers;

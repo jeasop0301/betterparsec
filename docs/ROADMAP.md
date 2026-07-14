@@ -30,6 +30,27 @@ Tetrys FEC · 서브프레임 슬라이스 · QU · 네이티브 클라이언트
 | D. 컨트롤러·인코더 최적화 | ABR에 queue/write/freshness 피드백, TWCC(재생 가능 트레이스 후), NVENC LL 매트릭스, Pareto 선택 | CC 기계는 완성(U1) — 튜닝·판정은 Gate B/C 이후 |
 | E. 코덱·콘텐츠 효율 | HEVC 4:4:4 / AV1 truth table, 콘텐츠 인지 배분 | [ ] (M3과 동일) |
 
+### 현장 이슈 백로그 (2026-07-14 라이브 세션, owner 보고)
+
+1. **무증상 스트림 스톨 → 정지화면** — 인천 원격 + 로컬 세션에서 재현.
+   스트림이 조용히 멈추고 마지막 프레임이 정지화면으로 남는다: 클라 측
+   스톨 감지(프레임 수신 워치독)·자동 복구 사다리(IDR 요청 → ICE
+   restart → 전체 재접속)·사용자 가시 상태 표시가 전부 부재.
+   → M4 재접속 안정성 + hard gate 복원력(freeze/min, 15분 disconnect 0)
+   직결. 원인 분리는 Gate C 상관 계측 전이라도 클라 수신 타임스탬프
+   워치독만으로 감지/복구 가능 — 우선 구현 후보.
+2. **커서 미해결 + immersive 모드** — 설계는 완료
+   (docs/design/cursor-channel.md: Parsec=모양 채널+클라 렌더,
+   DCV=호스트 권위 자동 lock/unlock. P1=`cursor` DataChannel 자동 모드
+   전환, P2=모양 채널 zero-latency 커서). 구현 착수 필요. 추가로
+   **immersive 모드**(전체화면 + pointer lock + Keyboard Lock
+   Win/Alt-Tab 캡처 일괄 토글) 요구 — cursor P1과 같은 클라 상태머신에
+   함께 배선.
+3. **UDP-only 접속 — TCP fallback 부재** — 현재 UDP가 막힌 망에서는
+   접속 자체가 안 되고 WARP(1.1.1.1)로만 우회 가능. 목표는 UDP 기본 +
+   실패 시 TURN-over-TCP(443) 자동 fallback = **M1 그 자체**. coturn
+   배포·ICE policy 자동 강등·"UDP 차단 + 443만 허용" 재현 환경이 잔여.
+
 ### ultra 성능 코어 트랙 (must-do)
 
 | 트랙 | 순수 로직/설계 | 배선/구현 | 활성·판정 게이트 |
@@ -143,7 +164,10 @@ Parsec web app 문서
 - **검증:** 브라우저 상태 wipe(시크릿창/캐시삭제) 후 **재로그인만으로 재페어링 없이** 재연결. 스트림 프레임 표시.
 
 ## M1 — WARP 없이 접속 (feature #2)
-**목표:** 제약망에서 WARP off로 붙는다.
+**목표:** 제약망에서 WARP off로 붙는다. **현장 확인(2026-07-14, owner)**:
+UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회 가능 —
+"UDP 기본 + 실패 시 TURN-over-TCP(443) 자동 fallback"이 M1의 완료 조건이다
+(현장 이슈 백로그 #3).
 
 - [ ] 공인 VPS에 coturn, TURN-over-TLS on **TCP 443**, `use-auth-secret`(HMAC TTL)
 - [x] `ice_server_script` helper 작성 → 세션별 coturn REST 단기 credential 발급
@@ -184,7 +208,15 @@ Parsec web app 문서
 - [ ] `nvenc_vbv_increase` 등 rate-control 튜닝(모션 스파이크)
 - **검증:** 동일 delivered bitrate에서 AV1 4:2:0 / HEVC 4:2:0 / HEVC 4:4:4 정지·모션·색텍스트 채점.
 
-## M4 — (선택) 하드닝
+## M4 — 하드닝 + 세션 UX (owner 요구로 선택 → 필수 승격, 2026-07-14)
+- [ ] **스톨 감지·복구 사다리** (현장 이슈 #1): 클라 프레임 수신 워치독 →
+  IDR 요청 → ICE restart → 전체 재접속 에스컬레이션 + 가시 상태 표시.
+  hard gate 복원력(freeze/min, 15분 disconnect 0)의 전제.
+- [ ] **커서 P1** — `cursor` DataChannel + 호스트 권위 자동 lock/unlock
+  (cursor-channel.md §3 P1, 설계 완료) → [ ] **P2** 모양 채널
+  zero-latency 커서
+- [ ] **immersive 모드** — 전체화면 + pointer lock + Keyboard Lock 일괄
+  토글 (cursor P1 클라 상태머신에 배선)
 - [ ] 보안 감사(ARCHITECTURE §보안 6항: 서명·짧은토큰·상수시간·replay·안전인코딩·revocation)
 - [ ] 입력(Gamepad/Keyboard Lock) secure-context 동작, 오디오, 재접속 안정성
 - [ ] upstream 병합 전략 정리

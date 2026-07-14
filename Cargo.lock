@@ -423,9 +423,11 @@ name = "app-native"
 version = "2.10.0"
 dependencies = [
  "client-transport",
+ "common",
  "eframe",
  "ffmpeg-sys-next",
  "libc",
+ "moonlight-common",
  "raw-window-handle",
  "tracing",
  "tracing-subscriber",

@@ -11,6 +11,9 @@ path = "src/main.rs"
 [dependencies]
 client-transport = { path = "../client-transport" }
 transport-core = { workspace = true }
+# A2 input: wire-format single source (InboundPacket) + its field types.
+common = { workspace = true, optional = true }
+moonlight-common = { workspace = true, optional = true }
 
 # A0 shell: egui via eframe (glow backend — the stream surface will live on
 # its own raw D3D11 HWND per unified-app-architecture.md D5/D9, so the
@@ -49,12 +52,19 @@ windows = { version = "0.62", optional = true, features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
     "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
 [features]
 default = []
-video = ["dep:ffmpeg-sys-next", "dep:libc", "dep:windows"]
+video = [
+    "dep:ffmpeg-sys-next",
+    "dep:libc",
+    "dep:windows",
+    "dep:common",
+    "dep:moonlight-common",
+]
 
 [lints]
 workspace = true

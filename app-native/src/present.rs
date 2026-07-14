@@ -35,9 +35,9 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::WaitForSingleObjectEx;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_STYLE, GetWindowLongPtrW, HTTRANSPARENT,
-    MoveWindow, RegisterClassW, SetWindowLongPtrW, WINDOW_EX_STYLE, WM_ERASEBKGND, WM_NCHITTEST,
-    WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_STYLE, GWLP_USERDATA, GetWindowLongPtrW,
+    HTTRANSPARENT, MoveWindow, RegisterClassW, SetWindowLongPtrW, WINDOW_EX_STYLE, WM_ERASEBKGND,
+    WM_NCHITTEST, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
 };
 use windows::core::{Interface, PCWSTR, w};
 
@@ -66,11 +66,19 @@ impl From<windows::core::Error> for PresentError {
 const CLASS_NAME: PCWSTR = w!("BetterParsecStreamSurface");
 
 /// Hit-test transparent so egui (parent) keeps receiving mouse events in
-/// the stream area until input capture lands (A2). No background erase:
-/// the swapchain owns every pixel.
+/// the stream area until input is enabled (A2 attaches an
+/// [`crate::input::InputCtx`] via GWLP_USERDATA, after which the window
+/// consumes mouse/keyboard and forwards them onto the wire). No
+/// background erase: the swapchain owns every pixel.
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let ctx = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const crate::input::InputCtx;
+    if !ctx.is_null()
+        && let Some(r) = crate::input::handle(unsafe { &*ctx }, hwnd, msg, wp, lp)
+    {
+        return r;
+    }
     match msg {
-        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+        WM_NCHITTEST if ctx.is_null() => LRESULT(HTTRANSPARENT as isize),
         WM_ERASEBKGND => LRESULT(1),
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     }
@@ -344,6 +352,8 @@ pub struct StreamSurface {
     shared: Arc<VideoShared>,
     thread: Option<std::thread::JoinHandle<()>>,
     last_rect: (i32, i32, i32, i32),
+    /// An `InputCtx` is attached to the window (owned via USERDATA).
+    input: bool,
 }
 
 impl StreamSurface {
@@ -363,7 +373,29 @@ impl StreamSurface {
             shared,
             thread: Some(thread),
             last_rect: (0, 0, 0, 0),
+            input: false,
         })
+    }
+
+    /// Attach input capture: the window stops being hit-test transparent
+    /// and its wndproc forwards mouse/keyboard onto the session's input
+    /// channels. UI thread only (same thread as the wndproc).
+    pub fn enable_input(&mut self, ctx: crate::input::InputCtx) {
+        self.disable_input();
+        let ptr = Box::into_raw(Box::new(ctx));
+        unsafe { SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, ptr as isize) };
+        self.input = true;
+    }
+
+    fn disable_input(&mut self) {
+        if !self.input {
+            return;
+        }
+        let ptr = unsafe { SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0) };
+        if ptr != 0 {
+            drop(unsafe { Box::from_raw(ptr as *mut crate::input::InputCtx) });
+        }
+        self.input = false;
     }
 
     /// Position the child window (client-area pixel coordinates).
@@ -387,6 +419,8 @@ impl StreamSurface {
 
 impl Drop for StreamSurface {
     fn drop(&mut self) {
+        // Same thread as the wndproc — no message can race the teardown.
+        self.disable_input();
         self.shared.present_stop.store(true, Ordering::Release);
         self.shared.frame_ready.notify_all();
         if let Some(t) = self.thread.take() {

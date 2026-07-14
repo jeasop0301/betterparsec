@@ -14,6 +14,8 @@
 #[cfg(all(windows, feature = "video"))]
 mod audio;
 #[cfg(all(windows, feature = "video"))]
+mod input;
+#[cfg(all(windows, feature = "video"))]
 mod present;
 #[cfg(feature = "video")]
 mod video;
@@ -511,7 +513,7 @@ impl eframe::App for App {
                     let disconnect = ui.button("Disconnect").clicked();
                     ui.add_space(4.0);
                     #[cfg(feature = "video")]
-                    ui.small("A0 slice 4: FFmpeg decode + raw D3D11 stream surface + WASAPI audio");
+                    ui.small("A0/A2: FFmpeg decode + raw D3D11 surface + WASAPI audio + mouse/keyboard to host");
                     #[cfg(not(feature = "video"))]
                     ui.small("built without the `video` feature — frames are received and counted only");
 
@@ -534,7 +536,15 @@ impl eframe::App for App {
                                             parent,
                                             run.video.clone(),
                                         ) {
-                                            Ok(s) => self.surface = Some(s),
+                                            Ok(mut s) => {
+                                                // A2: mouse/keyboard over the
+                                                // stream go to the host.
+                                                s.enable_input(input::InputCtx {
+                                                    sender: run.session.input_sender(),
+                                                    video: run.video.clone(),
+                                                });
+                                                self.surface = Some(s);
+                                            }
                                             Err(e) => {
                                                 tracing::error!(err = %e, "stream surface create failed — egui fallback");
                                                 run.video

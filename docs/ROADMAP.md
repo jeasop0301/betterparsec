@@ -119,9 +119,20 @@ U5/M6 스파이크, f1-ack 소스 확인+0x5509 호스트 패치.
    실패 시 오디오-off 래치·세션 무영향). 검증 = client-transport 22
    tests(큐 FIFO/overflow/close·ABI 복사/절단/타임아웃) + app-native 8
    tests(libopus 인코드→디코드 라운드트립 에너지, 변환 항등/다운믹스/
-   리샘플, 실 엔드포인트 100 ms 렌더), clippy 클린. 잔여 = **라이브
-   첫 픽셀+첫 소리**(owner 스모크, 5분, 슬라이스 2–4 동시 판정) → A2
-   입력 왕복(RawInput → input DataChannel).
+   리샘플, 실 엔드포인트 100 ms 렌더), clippy 클린. **A2 입력 기계
+   완성** (2026-07-14, 헤드리스 검증): 호스트가 만드는 입력
+   채널(mouse_*/keyboard/touch/controllers)을 session이 라벨→
+   `TransportChannelId` 매핑으로 등록하고 `Session::input_sender()`
+   (encode+try_send, 오버플로 드롭)로 노출. 스트림 자식 HWND가 입력
+   활성 시 hit-test 투명을 해제하고 wndproc이 Win32 메시지를
+   `common::input_wire::InboundPacket`으로 변환(VK 코드 패스스루,
+   절대 마우스 스트림 좌표 스케일+클램프, 드래그 SetCapture, 휠
+   부호 유지, Alt/F10 시스템 메뉴 억제). 검증 = client-transport 24
+   tests(라벨 매핑·와이어 바이트-정확 인코드·드롭) + app-native 15
+   tests(translate 순수 함수: 스케일/클램프/버튼/휠/VK), clippy 클린.
+   잔여 = **라이브 첫 픽셀+소리+조작**(owner 스모크, 5분, 슬라이스
+   2–4+A2 동시 판정) → A1 호스트 롤(web-server 라이브러리화) · 상대
+   마우스+immersive는 M4 `session-ux`(Phase B).
 5. Gate B 2-machine 첫 신뢰 run — 이후 U1 CC 신호 판정, U2 P2 손실 복구
    실측·비율 튜닝, U3/U5 지연 계측이 전부 이 위에서 순차 판정된다.
 

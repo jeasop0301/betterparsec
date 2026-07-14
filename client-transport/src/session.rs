@@ -16,6 +16,7 @@ use common::api_bindings::{
     RtcIceCandidate, RtcIceServer, RtcSdpType, RtcSessionDescription, StreamClientMessage,
     StreamServerMessage, StreamSignalingMessage,
 };
+use common::input_wire::InboundPacket;
 use futures::{SinkExt, StreamExt};
 use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -71,6 +72,7 @@ pub struct Session {
     state: Arc<AtomicU8>,
     params: Arc<std::sync::Mutex<Option<StreamParams>>>,
     stop_tx: mpsc::Sender<()>,
+    input_tx: mpsc::Sender<(u8, Vec<u8>)>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -81,6 +83,9 @@ impl Session {
         let state = Arc::new(AtomicU8::new(SessionState::Connecting as u8));
         let params = Arc::new(std::sync::Mutex::new(None));
         let (stop_tx, stop_rx) = mpsc::channel::<()>(1);
+        // Input backlog ~= a few frames of events; overflow drops (stale
+        // input is worse than lost input).
+        let (input_tx, input_rx) = mpsc::channel::<(u8, Vec<u8>)>(512);
 
         let state2 = state.clone();
         let params2 = params.clone();
@@ -99,8 +104,14 @@ impl Session {
                         return;
                     }
                 };
-                let result =
-                    rt.block_on(run_session(config, core, state2.clone(), params2, stop_rx));
+                let result = rt.block_on(run_session(
+                    config,
+                    core,
+                    state2.clone(),
+                    params2,
+                    stop_rx,
+                    input_rx,
+                ));
                 match result {
                     Ok(()) => state2.store(SessionState::Stopped as u8, Ordering::Release),
                     Err(e) => {
@@ -115,7 +126,16 @@ impl Session {
             state,
             params,
             stop_tx,
+            input_tx,
             thread: Some(thread),
+        }
+    }
+
+    /// Handle for input threads; packets are dropped until the host's
+    /// input channels open (`Streaming` state).
+    pub fn input_sender(&self) -> InputSender {
+        InputSender {
+            tx: self.input_tx.clone(),
         }
     }
 
@@ -169,6 +189,41 @@ enum LocalEvent {
     LocalCandidate(RTCIceCandidateInit),
     FecData(Vec<u8>),
     FecAckOpen(Arc<RTCDataChannel>),
+    /// A host-created input channel opened (id = `TransportChannelId`).
+    InputOpen(u8, Arc<RTCDataChannel>),
+}
+
+/// DataChannel label → transport channel id for client → host input
+/// (host creates the channels; `InboundPacket::encode` picks the id).
+fn input_channel_id(label: &str) -> Option<u8> {
+    use common::api_bindings::TransportChannelId as T;
+    Some(match label {
+        "mouse_reliable" => T::MOUSE_RELIABLE,
+        "mouse_absolute" => T::MOUSE_ABSOLUTE,
+        "mouse_relative" => T::MOUSE_RELATIVE,
+        "keyboard" => T::KEYBOARD,
+        "touch" => T::TOUCH,
+        "controllers" => T::CONTROLLERS,
+        _ => return None,
+    })
+}
+
+/// Cloneable handle for UI/input threads: encodes an [`InboundPacket`]
+/// and queues it for the session loop to send on the matching channel.
+#[derive(Clone)]
+pub struct InputSender {
+    tx: mpsc::Sender<(u8, Vec<u8>)>,
+}
+
+impl InputSender {
+    /// Returns `false` when the packet cannot be encoded or the session
+    /// queue is full/gone (drop is the right behavior for input).
+    pub fn send(&self, pkt: &InboundPacket) -> bool {
+        let Some((ch, bytes)) = pkt.encode() else {
+            return false;
+        };
+        self.tx.try_send((ch.0, bytes)).is_ok()
+    }
 }
 
 /// Progress states only upgrade (Connecting → PeerConnected → Streaming):
@@ -198,6 +253,7 @@ async fn run_session(
     state: Arc<AtomicU8>,
     params_out: Arc<std::sync::Mutex<Option<StreamParams>>>,
     mut stop_rx: mpsc::Receiver<()>,
+    mut input_rx: mpsc::Receiver<(u8, Vec<u8>)>,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
     let now_ms = move || started.elapsed().as_millis().min(u64::MAX as u128) as u64;
@@ -273,6 +329,9 @@ async fn run_session(
     let mut pending_candidates: Vec<RtcIceCandidate> = Vec::new();
     let mut remote_description_set = false;
     let mut ack_channel: Option<Arc<RTCDataChannel>> = None;
+    // Host-created input channels by TransportChannelId (opened async).
+    let mut input_channels: std::collections::HashMap<u8, Arc<RTCDataChannel>> =
+        std::collections::HashMap::new();
 
     send_ws(&ws_tx, &flow.init_message()).await?;
 
@@ -296,6 +355,16 @@ async fn run_session(
                     }
                 }
             }
+            pkt = input_rx.recv() => {
+                // Session owns the matching sender, so recv never yields
+                // None while the loop runs; drop packets for channels
+                // that have not opened yet.
+                if let Some((ch, bytes)) = pkt
+                    && let Some(dc) = input_channels.get(&ch)
+                {
+                    let _ = dc.send(&bytes::Bytes::from(bytes)).await;
+                }
+            }
             ev = ev_rx.recv() => {
                 let Some(ev) = ev else { break };
                 match ev {
@@ -309,6 +378,10 @@ async fn run_session(
                             .context("send subscribe")?;
                         info!("video_fec subscribed");
                         ack_channel = Some(ch);
+                    }
+                    LocalEvent::InputOpen(id, ch) => {
+                        debug!("input channel {} open (id {id})", ch.label());
+                        input_channels.insert(id, ch);
                     }
                     LocalEvent::LocalCandidate(init) => {
                         send_ws(&ws_tx, &StreamClientMessage::WebRtc(
@@ -515,7 +588,19 @@ async fn create_peer(
                 }
             }
             _ => {
-                // Control/input channels — not used by the W1 receive probe.
+                if let Some(id) = input_channel_id(&label) {
+                    let tx = tx.clone();
+                    let dc2 = dc.clone();
+                    if dc.ready_state() == RTCDataChannelState::Open {
+                        let _ = tx.try_send(LocalEvent::InputOpen(id, dc2));
+                    } else {
+                        dc.on_open(Box::new(move || {
+                            let _ = tx.try_send(LocalEvent::InputOpen(id, dc2.clone()));
+                            done()
+                        }));
+                    }
+                }
+                // Remaining control channels (general/stats/…) — unused.
             }
         }
         done()
@@ -607,5 +692,46 @@ fn from_webrtc_sdp(value: RTCSdpType) -> RtcSdpType {
         RTCSdpType::Pranswer => RtcSdpType::Pranswer,
         RTCSdpType::Rollback => RtcSdpType::Rollback,
         RTCSdpType::Unspecified => RtcSdpType::Unspecified,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::api_bindings::TransportChannelId as T;
+
+    #[test]
+    fn input_labels_map_to_wire_channel_ids() {
+        // The host's INPUT_CHANNELS labels (streamer webrtc/mod.rs) must
+        // land on the ids InboundPacket::encode targets.
+        assert_eq!(input_channel_id("mouse_reliable"), Some(T::MOUSE_RELIABLE));
+        assert_eq!(input_channel_id("mouse_absolute"), Some(T::MOUSE_ABSOLUTE));
+        assert_eq!(input_channel_id("mouse_relative"), Some(T::MOUSE_RELATIVE));
+        assert_eq!(input_channel_id("keyboard"), Some(T::KEYBOARD));
+        assert_eq!(input_channel_id("touch"), Some(T::TOUCH));
+        assert_eq!(input_channel_id("controllers"), Some(T::CONTROLLERS));
+        assert_eq!(input_channel_id("general"), None);
+        assert_eq!(input_channel_id("video_fec"), None);
+        assert_eq!(input_channel_id("controller0"), None); // not in A2 scope
+    }
+
+    #[test]
+    fn input_sender_encodes_and_drops_on_overflow() {
+        let (tx, mut rx) = mpsc::channel::<(u8, Vec<u8>)>(2);
+        let s = InputSender { tx };
+        let pkt = InboundPacket::MouseMove {
+            delta_x: 3,
+            delta_y: -4,
+        };
+        assert!(s.send(&pkt));
+        let (ch, bytes) = rx.try_recv().expect("queued");
+        assert_eq!(ch, T::MOUSE_RELATIVE);
+        // kind=0, i16 BE deltas — byte-exact wire (input_wire encode).
+        assert_eq!(bytes, vec![0, 0, 3, 0xFF, 0xFC]);
+
+        // Overflow: capacity 2 → the third unread send reports a drop.
+        assert!(s.send(&pkt));
+        assert!(s.send(&pkt));
+        assert!(!s.send(&pkt), "full queue drops instead of blocking");
     }
 }

@@ -29,9 +29,28 @@ ffmpeg-sys-next = { version = "7.1", optional = true, default-features = false, 
 ] }
 libc = { version = "0.2", optional = true }
 
+# A0 slice 3: raw D3D11 FLIP_DISCARD present surface (design D5). The
+# stream child HWND + swapchain live outside egui; raw-window-handle
+# fetches the parent HWND from eframe.
+raw-window-handle = "0.6"
+
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [features]
 default = []
-video = ["dep:ffmpeg-sys-next", "dep:libc"]
+video = ["dep:ffmpeg-sys-next", "dep:libc", "dep:windows"]
 
 [lints]
 workspace = true

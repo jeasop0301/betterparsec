@@ -1,20 +1,24 @@
 //! BetterParsec unified app — A0 client first light
 //! (docs/design/unified-app-architecture.md §6).
 //!
-//! Slices 1+2: native shell (egui chrome) + client-transport session +
+//! Slices 1–3: native shell (egui chrome) + client-transport session +
 //! FFmpeg H.264 decode (`video` feature: D3D11VA hwaccel, software
-//! fallback) painted through an interim egui texture. The dedicated raw
-//! D3D11 FLIP_DISCARD surface (child HWND) is slice 3 (design D5); built
-//! without `video`, received frames are counted and dropped, which still
-//! runs the whole session pipeline (signaling → WebRTC → video_fec →
-//! FEC decode → FrameQueue) for real.
+//! fallback) + raw D3D11 FLIP_DISCARD present on a dedicated stream
+//! child HWND (design D5/D9; interim egui texture as fallback and on
+//! non-Windows). Built without `video`, received frames are counted and
+//! dropped, which still runs the whole session pipeline (signaling →
+//! WebRTC → video_fec → FEC decode → FrameQueue) for real.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(all(windows, feature = "video"))]
+mod present;
 #[cfg(feature = "video")]
 mod video;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(feature = "video")]
+use std::sync::Condvar;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -80,13 +84,30 @@ impl FpsWindow {
 #[cfg(feature = "video")]
 #[derive(Default)]
 struct VideoShared {
-    /// Newest decoded picture; the UI takes it (newest-wins).
+    /// Newest decoded picture; the presenter takes it (newest-wins).
     frame: Mutex<Option<video::RgbaFrame>>,
-    /// Bumped once per stored frame so the UI knows when to re-upload.
+    /// Signaled per stored frame; the raw present thread blocks here.
+    frame_ready: Condvar,
+    /// Bumped once per stored frame so the UI knows when to re-upload
+    /// (egui fallback path).
     generation: AtomicU64,
+    /// Latest decoded dimensions, packed `w << 32 | h` (aspect fit).
+    dims: AtomicU64,
+    /// Raw D3D11 surface init/present gave up — use the egui fallback.
+    raw_present_failed: AtomicBool,
+    /// Tells the present thread to exit (surface teardown).
+    present_stop: AtomicBool,
     decoded: AtomicU64,
     decode_errors: AtomicU64,
     hw_device: AtomicBool,
+}
+
+#[cfg(feature = "video")]
+impl VideoShared {
+    /// The raw D3D11 present path is (still) responsible for drawing.
+    fn raw_present_active(&self) -> bool {
+        cfg!(windows) && !self.raw_present_failed.load(Ordering::Acquire)
+    }
 }
 
 /// Per-pump decoder state: FFmpeg decoder + IDR gating.
@@ -134,10 +155,19 @@ impl DecodeState {
         self.wait_for_key = false;
         match dec.decode(&unit.data) {
             Ok(Some(frame)) => {
+                shared.dims.store(
+                    ((frame.width as u64) << 32) | frame.height as u64,
+                    Ordering::Relaxed,
+                );
                 *shared.frame.lock().unwrap_or_else(PoisonError::into_inner) = Some(frame);
                 shared.generation.fetch_add(1, Ordering::Release);
                 shared.decoded.fetch_add(1, Ordering::Relaxed);
-                egui_ctx.request_repaint();
+                shared.frame_ready.notify_all();
+                if !shared.raw_present_active() {
+                    // The egui fallback only repaints on demand; the raw
+                    // thread presents without waking the chrome.
+                    egui_ctx.request_repaint();
+                }
             }
             Ok(None) => {}
             Err(e) => {
@@ -296,12 +326,18 @@ struct App {
     host_id_text: String,
     app_id_text: String,
     running: Option<Running>,
-    /// Uploaded stream texture (interim egui present, slice 2).
+    /// Uploaded stream texture (egui fallback present, slice 2).
     #[cfg(feature = "video")]
     video_tex: Option<eframe::egui::TextureHandle>,
     /// Generation of the frame currently in `video_tex`.
     #[cfg(feature = "video")]
     video_gen: u64,
+    /// Raw D3D11 stream surface (slice 3) — child HWND + render thread.
+    #[cfg(all(windows, feature = "video"))]
+    surface: Option<present::StreamSurface>,
+    /// Raw surface init/present failed this connection — egui fallback.
+    #[cfg(all(windows, feature = "video"))]
+    surface_failed: bool,
 }
 
 impl App {
@@ -316,13 +352,20 @@ impl App {
             video_tex: None,
             #[cfg(feature = "video")]
             video_gen: 0,
+            #[cfg(all(windows, feature = "video"))]
+            surface: None,
+            #[cfg(all(windows, feature = "video"))]
+            surface_failed: false,
         }
     }
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
         use eframe::egui;
+
+        #[cfg(not(all(windows, feature = "video")))]
+        let _ = &frame;
 
         // Live counters need continuous repaint while connected.
         if self.running.is_some() {
@@ -408,34 +451,9 @@ impl eframe::App for App {
                     }
                     #[cfg(feature = "video")]
                     {
-                        let generation = run.video.generation.load(Ordering::Acquire);
-                        if generation != self.video_gen
-                            && let Some(f) = run
-                                .video
-                                .frame
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .take()
-                        {
-                            let img = egui::ColorImage::from_rgba_unmultiplied(
-                                [f.width, f.height],
-                                &f.rgba,
-                            );
-                            match self.video_tex.as_mut() {
-                                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
-                                None => {
-                                    self.video_tex = Some(ctx.load_texture(
-                                        "stream",
-                                        img,
-                                        egui::TextureOptions::LINEAR,
-                                    ));
-                                }
-                            }
-                            self.video_gen = generation;
-                        }
                         ui.separator();
                         ui.label(format!(
-                            "decoded: {} ({}, errors: {})",
+                            "decoded: {} ({}, errors: {}) — {}",
                             run.video.decoded.load(Ordering::Relaxed),
                             if run.video.hw_device.load(Ordering::Relaxed) {
                                 "d3d11va"
@@ -443,17 +461,140 @@ impl eframe::App for App {
                                 "sw decode"
                             },
                             run.video.decode_errors.load(Ordering::Relaxed),
+                            if run.video.raw_present_active() {
+                                "raw flip present"
+                            } else {
+                                "egui fallback present"
+                            },
                         ));
-                        if let Some(tex) = &self.video_tex {
-                            let size = tex.size_vec2();
-                            let scale = (ui.available_width() / size.x).min(1.0);
-                            ui.image((tex.id(), size * scale));
-                        }
                     }
                     ui.add_space(8.0);
-                    if ui.button("Disconnect").clicked()
-                        && let Some(run) = self.running.take()
+                    let disconnect = ui.button("Disconnect").clicked();
+                    ui.add_space(4.0);
+                    #[cfg(feature = "video")]
+                    ui.small("A0 slice 3: FFmpeg decode + raw D3D11 FLIP_DISCARD stream surface");
+                    #[cfg(not(feature = "video"))]
+                    ui.small("built without the `video` feature — frames are received and counted only");
+
+                    // Everything below the chrome is the stream viewport.
+                    #[cfg(feature = "video")]
                     {
+                        let avail = ui.available_size();
+                        if avail.y > 8.0 {
+                            let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
+
+                            // Raw D3D11 child surface (slice 3): create
+                            // lazily, keep its HWND aspect-fit inside the
+                            // viewport, demote to the egui fallback on
+                            // failure.
+                            #[cfg(windows)]
+                            if !self.surface_failed {
+                                if self.surface.is_none() {
+                                    match parent_hwnd(frame) {
+                                        Some(parent) => match present::StreamSurface::create(
+                                            parent,
+                                            run.video.clone(),
+                                        ) {
+                                            Ok(s) => self.surface = Some(s),
+                                            Err(e) => {
+                                                tracing::error!(err = %e, "stream surface create failed — egui fallback");
+                                                run.video
+                                                    .raw_present_failed
+                                                    .store(true, Ordering::Release);
+                                                self.surface_failed = true;
+                                            }
+                                        },
+                                        None => {
+                                            tracing::error!("no Win32 window handle — egui fallback");
+                                            run.video
+                                                .raw_present_failed
+                                                .store(true, Ordering::Release);
+                                            self.surface_failed = true;
+                                        }
+                                    }
+                                }
+                                match self.surface.as_mut() {
+                                    Some(s) if s.failed() => {
+                                        self.surface = None;
+                                        self.surface_failed = true;
+                                    }
+                                    Some(s) => {
+                                        let dims = run.video.dims.load(Ordering::Relaxed);
+                                        let (vw, vh) =
+                                            ((dims >> 32) as f32, (dims & 0xffff_ffff) as f32);
+                                        let fit = if vw > 0.0 && vh > 0.0 {
+                                            let k = (rect.width() / vw).min(rect.height() / vh);
+                                            egui::Rect::from_center_size(
+                                                rect.center(),
+                                                egui::vec2(vw * k, vh * k),
+                                            )
+                                        } else {
+                                            rect
+                                        };
+                                        let ppp = ctx.pixels_per_point();
+                                        s.set_rect(
+                                            (fit.min.x * ppp).round() as i32,
+                                            (fit.min.y * ppp).round() as i32,
+                                            (fit.width() * ppp).round() as i32,
+                                            (fit.height() * ppp).round() as i32,
+                                        );
+                                    }
+                                    None => {}
+                                }
+                            }
+
+                            // Interim egui texture present (slice 2):
+                            // non-Windows builds and raw-path failure.
+                            if !run.video.raw_present_active() {
+                                let generation = run.video.generation.load(Ordering::Acquire);
+                                if generation != self.video_gen
+                                    && let Some(f) = run
+                                        .video
+                                        .frame
+                                        .lock()
+                                        .unwrap_or_else(PoisonError::into_inner)
+                                        .take()
+                                {
+                                    let img = egui::ColorImage::from_rgba_unmultiplied(
+                                        [f.width, f.height],
+                                        &f.rgba,
+                                    );
+                                    match self.video_tex.as_mut() {
+                                        Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                                        None => {
+                                            self.video_tex = Some(ctx.load_texture(
+                                                "stream",
+                                                img,
+                                                egui::TextureOptions::LINEAR,
+                                            ));
+                                        }
+                                    }
+                                    self.video_gen = generation;
+                                }
+                                if let Some(tex) = &self.video_tex {
+                                    let size = tex.size_vec2();
+                                    let k = (rect.width() / size.x).min(rect.height() / size.y);
+                                    let img_rect =
+                                        egui::Rect::from_center_size(rect.center(), size * k);
+                                    ui.painter().image(
+                                        tex.id(),
+                                        img_rect,
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(0.0, 0.0),
+                                            egui::pos2(1.0, 1.0),
+                                        ),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    if disconnect && let Some(run) = self.running.take() {
+                        #[cfg(all(windows, feature = "video"))]
+                        {
+                            self.surface = None; // joins the present thread
+                        }
                         run.stop();
                         #[cfg(feature = "video")]
                         {
@@ -461,13 +602,18 @@ impl eframe::App for App {
                             self.video_gen = 0;
                         }
                     }
-                    ui.add_space(4.0);
-                    #[cfg(feature = "video")]
-                    ui.small("A0 slice 2: FFmpeg decode + interim egui present; the raw D3D11 surface is slice 3");
-                    #[cfg(not(feature = "video"))]
-                    ui.small("built without the `video` feature — frames are received and counted only");
                 }
             }
         });
+    }
+}
+
+/// The eframe chrome window's Win32 handle (parent for the stream child).
+#[cfg(all(windows, feature = "video"))]
+fn parent_hwnd(frame: &eframe::Frame) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match frame.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+        _ => None,
     }
 }

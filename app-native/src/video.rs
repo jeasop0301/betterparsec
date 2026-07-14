@@ -323,9 +323,8 @@ mod tests {
     fn garbage_input_never_yields_a_frame() {
         let mut d = Decoder::new().expect("decoder init");
         for _ in 0..4 {
-            match d.decode(&[0x42u8; 512]) {
-                Ok(Some(_)) => panic!("garbage produced a frame"),
-                Ok(None) | Err(_) => {}
+            if let Ok(Some(_)) = d.decode(&[0x42u8; 512]) {
+                panic!("garbage produced a frame");
             }
         }
     }
@@ -377,7 +376,7 @@ mod tests {
         assert_eq!((f.width, f.height), (320, 240));
         assert_eq!(f.rgba.len(), 320 * 240 * 4);
         // testsrc2 is colorful — a flat fill means the convert path lied.
-        let first: [u8; 4] = f.rgba[..4].try_into().unwrap();
+        let first: [u8; 4] = f.rgba[..4].try_into().expect("4-byte pixel");
         assert!(
             f.rgba.chunks_exact(4).any(|px| px != first),
             "decoded frame is a flat fill"

@@ -100,8 +100,18 @@ U5/M6 스파이크, f1-ack 소스 확인+0x5509 호스트 패치.
    NV12/YUV420P→RGBA, 디코드 실패→RxCore needs-IDR 래치, interim egui
    프레젠트(첫 IDR 게이트 포함). 검증 = openh264 합성 스트림 30 AU
    헤드리스 디코드 + 픽셀 비균일 assert(3 tests 그린), non-video 빌드
-   무손상, clippy 클린. 잔여 = **라이브 첫 픽셀**(owner 스모크, 5분) →
-   슬라이스 3: raw FLIP_DISCARD 표면(D5).
+   무손상, clippy 클린. **슬라이스 3 기계 완성** (2026-07-14, 헤드리스
+   검증): raw D3D11 FLIP_DISCARD 프레젠트(D5) — 스트림 전용 자식
+   HWND(D9, hit-test transparent) + `IDXGISwapChain2`
+   `FLIP_DISCARD|FRAME_LATENCY_WAITABLE_OBJECT`, `SetMaximumFrameLatency(1)`
+   **스왑체인에**(moonlight-qt d3d11va.cpp:550 함정 회피), 버퍼=비디오
+   해상도 + `DXGI_SCALING_STRETCH`, HWND 자체를 aspect-fit(레터박스),
+   디바이스 lost 시 1회 재생성 → egui 텍스처 폴백 래치(비 Windows 포함).
+   검증 = 실 하드웨어 스왑체인 draw→백버퍼 readback 픽셀-동일 +
+   중간 해상도 변경(ResizeBuffers) + Present 성공(4 tests 그린),
+   non-video 빌드 무손상, clippy(--tests 포함) 클린. 잔여 = **라이브
+   첫 픽셀**(owner 스모크, 5분, 슬라이스 2+3 동시 판정) → 슬라이스 4:
+   WASAPI shared 오디오(D7 Phase A) → A2 입력 왕복.
 5. Gate B 2-machine 첫 신뢰 run — 이후 U1 CC 신호 판정, U2 P2 손실 복구
    실측·비율 튜닝, U3/U5 지연 계측이 전부 이 위에서 순차 판정된다.
 

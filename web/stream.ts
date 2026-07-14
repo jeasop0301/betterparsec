@@ -658,17 +658,20 @@ class ViewerApp implements Component {
 
     // Pointer Lock
     //
-    // `pointerLockOptionsUnsupported`: a browser that rejects the
-    // `unadjustedMovement` options form has its rejection delivered ASYNC, by
-    // which point the user gesture is spent. Remember it and use the plain
-    // call on the NEXT gesture instead of retrying inside this one.
-    private pointerLockOptionsUnsupported = false
+    // The plain `requestPointerLock()` is the reliable path — a bare-page test
+    // in the target browser locked with it while the `{unadjustedMovement:true}`
+    // options form was silently refused (lock never engaged, no thrown error),
+    // so basic locking must NOT be gated on the options form. We attempt
+    // unadjustedMovement (raw deltas, no OS acceleration) only after the plain
+    // lock is already held, as a non-blocking upgrade: if it is refused the
+    // lock simply stays adjusted.
+    //
     // Exactly one request may be in flight. Issuing a second
     // `requestPointerLock` while one is pending throws InUseAttributeError
-    // ("Pointer lock pending") — the two entry points (Lock Mouse button and
-    // click-to-relock) plus any stray gesture would otherwise collide. Set and
-    // cleared synchronously around the awaited request; JS is single-threaded,
-    // so no two invocations can pass the guard between the check and the set.
+    // ("Pointer lock pending"); the two entry points (Lock Mouse button and
+    // click-to-relock) plus any stray gesture would otherwise collide. The
+    // guard is set and cleared synchronously around the awaited request; JS is
+    // single-threaded, so no two invocations pass it between check and set.
     private pointerLockPending = false
 
     async requestPointerLock(errorIfNotFound: boolean = false) {
@@ -696,25 +699,12 @@ class ViewerApp implements Component {
 
         this.pointerLockPending = true
         try {
-            // unadjustedMovement gives raw deltas (no OS pointer acceleration).
-            // Exactly one request per gesture — no competing pointerlockerror
-            // retry (that second request, fired while this one was pending, was
-            // the "Pointer lock pending" bug). A browser that rejects the
-            // options form trips the flag; the next click uses the plain call
-            // (retrying here would land outside the user-activation window).
-            if (this.pointerLockOptionsUnsupported) {
-                await inputElement.requestPointerLock()
-            } else {
-                await inputElement.requestPointerLock({ unadjustedMovement: true })
-            }
+            // Plain, options-less request within the user gesture — the proven
+            // path. `await` handles both the promise (modern) and undefined
+            // (older) return shapes.
+            await inputElement.requestPointerLock()
         } catch (error) {
-            // Only the options form being unsupported should disable it; an
-            // InUseAttributeError (should no longer occur behind the guard) or
-            // transient rejection must not permanently drop unadjustedMovement.
-            if (error instanceof Error && (error.name == "NotSupportedError" || error.name == "InvalidStateError")) {
-                this.pointerLockOptionsUnsupported = true
-            }
-            console.warn("Pointer lock request failed; next click retries", error)
+            console.warn("Pointer lock request failed", error)
         } finally {
             this.pointerLockPending = false
         }

@@ -416,6 +416,11 @@ ts_consts!(
     pub const CONTROLLER14: u8 = 24;
     pub const CONTROLLER15: u8 = 25;
     pub const RTT: u8 = 26;
+    // M4 cursor P1: host-authority cursor visibility/position (POS wire,
+    // cursor-channel.md §3). Reliable+ordered on every transport: a
+    // dedicated DataChannel on WebRTC, a prefixed frame on WebSocket —
+    // host-cursor authority is transport-agnostic (DCV does it over TCP).
+    pub const CURSOR: u8 = 27;
 );
 
 #[derive(Serialize, Deserialize, Debug, TS, Clone, Copy, PartialEq, Eq)]

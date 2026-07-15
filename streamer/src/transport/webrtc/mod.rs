@@ -72,8 +72,6 @@ use crate::{
 };
 
 mod audio;
-mod cursor_tracker;
-pub(crate) mod cursor_wire;
 mod fec_sender;
 // Wire/framing moved to the shared transport-core crate (M6 W1); re-exported
 // here so `crate::transport::webrtc::fec_wire::*` call sites stay unchanged.
@@ -217,7 +215,9 @@ pub async fn new(
             }),
         )
         .await?;
-    cursor_tracker::spawn(cursor_channel);
+    crate::transport::cursor_tracker::spawn(crate::transport::cursor_tracker::WebRtcCursorSink(
+        cursor_channel,
+    ));
 
     let runtime = Handle::current();
     let video_metrics = Arc::new(VideoTransportMetrics::new(video_frame_queue_size));

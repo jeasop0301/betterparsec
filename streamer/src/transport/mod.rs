@@ -20,6 +20,8 @@ use common::buffer::ByteBuffer;
 
 use self::metrics::VideoTransportStats;
 
+pub(crate) mod cursor_tracker;
+pub(crate) mod cursor_wire;
 pub(crate) mod metrics;
 pub mod web_socket;
 pub mod webrtc;

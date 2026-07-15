@@ -13,7 +13,7 @@ import { Logger, LogMessageInfo } from "./log.js"
 import { gatherPipeInfo } from "./pipeline/index.js"
 import { BenchmarkContext, StreamStats } from "./stats.js"
 import { StallWatchdog, WatchdogAction } from "./session_ux.js"
-import { Transport, TransportShutdown } from "./transport/index.js"
+import { Transport, TransportChannel, TransportShutdown } from "./transport/index.js"
 import { WebSocketTransport } from "./transport/web_socket.js"
 import { WebRTCTransport } from "./transport/webrtc.js"
 import { allVideoCodecs, andVideoCodecs, createSupportedVideoFormatsBits, emptyVideoCodecs, getSelectedVideoCodec, hasAnyCodec, VideoCodecSupport } from "./video.js"
@@ -121,18 +121,19 @@ export class Stream implements Component {
     private videoRenderer: VideoRenderer | null = null
     private audioPlayer: AudioPlayer | null = null
     // M4 cursor P1: only set when settings.mouseMode == "auto" and the
-    // transport is WebRTC — non-auto sessions never allocate this (#5: no
-    // behavior change otherwise). Recreated in createVideoRenderer() so it
-    // survives transport restarts, matching the FEC/QU wiring pattern.
+    // transport exposes a cursor channel — non-auto sessions never allocate
+    // this (#5: no behavior change otherwise). Recreated in
+    // createVideoRenderer() so it survives transport restarts, matching the
+    // FEC/QU wiring pattern.
     private cursorAutoMode: CursorAutoMode | null = null
-    // M4 auto-runtime (mid-session mouseMode switch): tracks the physical
-    // RTCDataChannel a 'message' listener has been attached to. setOnCursorChannel
-    // re-registration is harmless (it just overwrites the transport's stash
-    // callback), but a second addEventListener on the SAME channel would
-    // double-fire cursorAutoMode.onVisibility — this guards setCursorAutoEnabled()
-    // against that when it's called repeatedly at runtime (enable/disable/
-    // re-enable) against a still-live transport.
-    private cursorChannelWired: RTCDataChannel | null = null
+    // M4 auto-runtime (mid-session mouseMode switch): tracks the transport
+    // channel a receive listener has been attached to. A second listener on
+    // the SAME channel would double-fire cursorAutoMode.onVisibility — this
+    // guards setCursorAutoEnabled() against that when called repeatedly at
+    // runtime (enable/disable/re-enable) against a still-live transport. A
+    // transport restart yields a fresh channel object, so the stale
+    // reference never matches and a new listener attaches.
+    private cursorChannelWired: TransportChannel | null = null
 
     private input: StreamInput
     private stats: StreamStats
@@ -554,11 +555,16 @@ export class Stream implements Component {
             return
         }
 
-        if (!(this.transport instanceof WebRTCTransport)) {
+        // Transport-agnostic (cursor-channel.md; DCV ships cursor authority
+        // over TCP): TransportChannelId.CURSOR is a dedicated DataChannel on
+        // WebRTC and a prefixed frame on the WebSocket transport — both
+        // surface through the generic channel table.
+        const cursorChannel = this.transport?.getChannel(TransportChannelId.CURSOR)
+        if (!cursorChannel || cursorChannel.type !== "data") {
+            this.debugLog("mouseMode auto: no cursor channel on this transport — host cursor authority unavailable", { type: "ifErrorDescription" })
             return
         }
 
-        const cursorTransport = this.transport
         // Re-created on every enable (startup or runtime) so it always starts
         // back in the default unlocked (follow) state instead of carrying
         // over stale lock state from a prior enable/disable cycle.
@@ -570,36 +576,22 @@ export class Stream implements Component {
         // this baseline if the host cursor stays visible the whole session.
         this.emitCursorAutoState(cursorAutoMode.locked)
 
-        // setOnCursorChannel's stash callback fires immediately if the
-        // channel already arrived (see webrtc.ts) — this is what makes
-        // enabling mid-session (after the channel is already live) work.
-        // Re-registering here on every enable is harmless: the transport
-        // only ever keeps the latest callback.
-        cursorTransport.setOnCursorChannel((cursorCh: RTCDataChannel) => {
-            if (this.cursorChannelWired === cursorCh) {
-                // Already listening on this physical channel from a prior
-                // enable — attaching a second 'message' listener would
-                // double-fire cursorAutoMode.onVisibility per host sample.
-                return
-            }
-            this.cursorChannelWired = cursorCh
-
-            cursorCh.addEventListener('message', (ev: MessageEvent) => {
-                // Read the field (not the `cursorAutoMode` closed over above)
-                // so a machine swapped in by a later disable/re-enable cycle
+        if (this.cursorChannelWired !== cursorChannel) {
+            this.cursorChannelWired = cursorChannel
+            cursorChannel.addReceiveListener((data: ArrayBuffer) => {
+                // Read the field (not the machine closed over above) so a
+                // machine swapped in by a later disable/re-enable cycle
                 // takes over immediately without needing its own listener.
                 const activeCursorAutoMode = this.cursorAutoMode
                 if (!activeCursorAutoMode) {
                     return
                 }
-                const buf: ArrayBuffer = ev.data instanceof ArrayBuffer
-                    ? ev.data : ev.data.buffer
-                const msg = parseCursorMessage(buf)
+                const msg = parseCursorMessage(data)
                 if (msg) {
                     this.applyCursorAutoAction(activeCursorAutoMode.onVisibility(msg.visible, performance.now()))
                 }
             })
-        })
+        }
     }
     // M4 auto-runtime: call when mouseMode changes at runtime (e.g. the
     // sidebar mouse-mode selector) so the cursor-channel wiring engages or

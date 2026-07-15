@@ -397,9 +397,17 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   현장 리포트 "세션 중 auto 선택 무반응" 대응): 사이드바 선택기에 auto
   추가 + `Stream.onMouseModeChanged` → `setCursorAutoEnabled`(채널
   리스너 dedup — 물리 채널당 1회, 머신은 필드 경유라 스왑 즉시 반영;
-  전환이 settings에 반영돼 재접속에도 유지). 잔여 = 라이브: auto 모드로
-  FPS 게임 lock/메뉴 unlock 실동작 → [ ] **P2** 모양 채널 zero-latency
-  커서
+  전환이 settings에 반영돼 재접속에도 유지). **전송-불문 승격** (2026-07-15,
+  owner 지적 "DCV는 TCP에서도 커서 됨" — 정당): cursor를
+  `TransportChannelId::CURSOR`(=27) 1급 채널로 — WebRTC는 기존 전용
+  DataChannel(라벨이 제네릭 테이블로 매핑, 스태시 특례 제거), WebSocket은
+  CURSOR-프리픽스 프레임(트래커를 `CursorSink` 추상화로 이동:
+  `transport/cursor_tracker.rs`, ws 프레임 바이트-핀 +1 test). 클라는
+  `getChannel(CURSOR)` 단일 경로로 양 전송 소비 → **UDP 차단(TCP 폴백)
+  망에서도 auto 커서 동작**. 검증: common 81 + streamer 183 + 웹 143,
+  clippy·fmt·tsc 클린, streamer.exe·static/ 재배포. 잔여 = 라이브: auto
+  모드 FPS lock/메뉴 unlock (UDP망 + TCP망 각 1회) → [ ] **P2** 모양
+  채널 zero-latency 커서
 - [~] **immersive 모드** — 전체화면 + pointer lock + Keyboard Lock 일괄
   토글. **웹 완성** (2026-07-15, 헤드리스 검증): 사이드바 Immersive
   버튼 — 진입 = fullscreen 확인 후 keyboard.lock(가드) +

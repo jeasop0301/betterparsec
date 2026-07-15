@@ -46,6 +46,13 @@ pub async fn new() -> Result<(WebSocketTransportSender, WebSocketTransportEvents
     // This will start the loop of sending / receiving
     recv_rtt(sender.rtt.clone(), sender.event_sender.clone(), 0).await;
 
+    // M4 cursor P1: host-authority cursor channel, transport-agnostic —
+    // on this transport the POS wire rides a CURSOR-prefixed ws frame
+    // (cursor-channel.md §3; DCV ships the same authority over TCP).
+    crate::transport::cursor_tracker::spawn(crate::transport::cursor_tracker::WebSocketCursorSink(
+        sender.event_sender.clone(),
+    ));
+
     Ok((sender, WebSocketTransportEvents { event_receiver }))
 }
 

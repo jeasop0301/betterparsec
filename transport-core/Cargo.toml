@@ -4,6 +4,11 @@ version.workspace = true
 edition = "2024"
 license.workspace = true
 
+# U2 P2 FEC quantification rig (headless recovery-vs-ratio measurement).
+[[bin]]
+name = "fec-rig"
+path = "src/bin/fec_rig.rs"
+
 [dependencies]
 
 [dev-dependencies]

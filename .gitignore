@@ -32,3 +32,6 @@ server
 # Loose runtime binaries at the repo root (run-in-place artifacts)
 /*.exe
 /*.dll
+
+# Local-only helper scripts (machine-specific paths, not for the repo)
+*.local.ps1

@@ -50,7 +50,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
-            .with_title("BetterParsec"),
+            .with_title("BetterParsec — build 07-16a"),
         ..Default::default()
     };
     eframe::run_native(
@@ -803,21 +803,16 @@ impl eframe::App for App {
                                             self.cursor_state.pump(run.session.cursor());
                                         }
                                         // M4 Phase B: immersive machine —
-                                        // fullscreen confirmed first, then
-                                        // capture; exits converge on one
-                                        // Release (immersive.rs).
-                                        let (fs, focused) = ctx.input(|i| {
-                                            (
-                                                i.viewport().fullscreen.unwrap_or(false),
-                                                i.viewport().focused.unwrap_or(true),
-                                            )
-                                        });
-                                        let exit_requested = self.capture.take_exit_requested();
-                                        for action in self.immersive.on_tick(
-                                            immersive_clicked || exit_requested,
-                                            fs,
-                                            focused,
-                                        )
+                                        // one settle frame then engage; exits
+                                        // converge on one Release. Capture no
+                                        // longer waits on the OS fullscreen/
+                                        // focus readback (it could wedge
+                                        // Entering forever — immersive.rs).
+                                        let exit_requested =
+                                            self.capture.take_exit_requested();
+                                        for action in self
+                                            .immersive
+                                            .on_tick(immersive_clicked || exit_requested)
                                         {
                                             match action {
                                                 immersive::Action::SetFullscreen(on) => {

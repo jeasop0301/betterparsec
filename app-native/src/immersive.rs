@@ -41,8 +41,7 @@ pub enum Action {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Off,
-    /// Fullscreen requested; capture waits for the OS to confirm both
-    /// fullscreen and focus (web parity: never capture un-fullscreened).
+    /// Fullscreen requested; one settle frame before engaging capture.
     Entering,
     On,
 }
@@ -67,9 +66,17 @@ impl Immersive {
         self.state == State::On
     }
 
-    /// One shell frame: `toggle` = immersive button clicked this frame,
-    /// `fullscreen`/`focused` = current viewport state.
-    pub fn on_tick(&mut self, toggle: bool, fullscreen: bool, focused: bool) -> Vec<Action> {
+    /// One shell frame: `toggle` = immersive button clicked (or the
+    /// Ctrl+Alt+Shift+Q escape hatch fired) this frame.
+    ///
+    /// Capture engages one frame after the fullscreen request rather than
+    /// waiting on the OS to *report* fullscreen/focus: that readback
+    /// proved unreliable (the window went fullscreen but the reported flag
+    /// never flipped, wedging capture in `Entering` forever). The
+    /// per-frame cursor re-clip fixes the geometry once fullscreen lands,
+    /// and exit is always available via the button or the keyboard-hook
+    /// escape hatch, so no focus/fullscreen auto-exit is needed.
+    pub fn on_tick(&mut self, toggle: bool) -> Vec<Action> {
         match self.state {
             State::Off => {
                 if toggle {
@@ -84,23 +91,15 @@ impl Immersive {
                     self.state = State::Off;
                     return vec![Action::SetFullscreen(false)];
                 }
-                if fullscreen && focused {
-                    self.state = State::On;
-                    return vec![Action::Engage];
-                }
-                vec![] // waiting for the OS to confirm
+                // Settle frame elapsed: engage unconditionally.
+                self.state = State::On;
+                vec![Action::Engage]
             }
             State::On => {
-                if toggle || !focused {
-                    // Button exit / focus lost (alt-tab): full teardown.
+                if toggle {
+                    // The only exit: button or Ctrl+Alt+Shift+Q hatch.
                     self.state = State::Off;
                     return vec![Action::Release, Action::SetFullscreen(false)];
-                }
-                if !fullscreen {
-                    // Fullscreen already gone (external exit) — release
-                    // capture only; no redundant fullscreen command.
-                    self.state = State::Off;
-                    return vec![Action::Release];
                 }
                 vec![]
             }
@@ -126,95 +125,65 @@ impl Immersive {
 mod tests {
     use super::*;
 
-    #[test]
-    fn enter_waits_for_fullscreen_then_engages() {
-        let mut im = Immersive::default();
-        assert_eq!(
-            im.on_tick(true, false, true),
-            vec![Action::SetFullscreen(true)]
-        );
+    fn engage(im: &mut Immersive) {
+        // Off -> Entering (request fullscreen) -> On (engage next frame).
+        assert_eq!(im.on_tick(true), vec![Action::SetFullscreen(true)]);
         assert!(!im.engaged());
-        // OS hasn't confirmed yet — no capture.
-        assert_eq!(im.on_tick(false, false, true), vec![]);
-        // Confirmed: engage exactly once.
-        assert_eq!(im.on_tick(false, true, true), vec![Action::Engage]);
+        assert_eq!(im.on_tick(false), vec![Action::Engage]);
         assert!(im.engaged());
-        assert_eq!(im.on_tick(false, true, true), vec![]);
     }
 
     #[test]
-    fn entering_needs_focus_too() {
+    fn enter_then_engages_next_frame() {
         let mut im = Immersive::default();
-        im.on_tick(true, false, true);
-        assert_eq!(im.on_tick(false, true, false), vec![]);
-        assert_eq!(im.on_tick(false, true, true), vec![Action::Engage]);
+        engage(&mut im);
+        // Steady state is silent.
+        assert_eq!(im.on_tick(false), vec![]);
+        assert!(im.engaged());
+    }
+
+    #[test]
+    fn capture_does_not_wait_on_os_readback() {
+        // Regression: the OS fullscreen/focus flags used to gate Engage and
+        // could wedge Entering forever. A single plain tick after the
+        // request must engage regardless of any external state.
+        let mut im = Immersive::default();
+        im.on_tick(true);
+        assert_eq!(im.on_tick(false), vec![Action::Engage]);
+        assert!(im.engaged());
     }
 
     #[test]
     fn toggle_cancels_before_capture() {
         let mut im = Immersive::default();
-        im.on_tick(true, false, true);
-        assert_eq!(
-            im.on_tick(true, false, true),
-            vec![Action::SetFullscreen(false)]
-        );
+        im.on_tick(true);
+        assert_eq!(im.on_tick(true), vec![Action::SetFullscreen(false)]);
         assert!(!im.engaged());
-        // Fully off: a later fullscreen confirm must not engage.
-        assert_eq!(im.on_tick(false, true, true), vec![]);
-    }
-
-    #[test]
-    fn button_exit_releases_and_leaves_fullscreen() {
-        let mut im = Immersive::default();
-        im.on_tick(true, true, true);
-        im.on_tick(false, true, true);
-        assert_eq!(
-            im.on_tick(true, true, true),
-            vec![Action::Release, Action::SetFullscreen(false)]
-        );
+        // Fully off: a later plain tick must not engage.
+        assert_eq!(im.on_tick(false), vec![]);
         assert!(!im.engaged());
     }
 
     #[test]
-    fn external_fullscreen_loss_releases_without_fullscreen_cmd() {
+    fn button_or_hatch_exit_releases_and_leaves_fullscreen() {
         let mut im = Immersive::default();
-        im.on_tick(true, true, true);
-        im.on_tick(false, true, true);
-        assert_eq!(im.on_tick(false, false, true), vec![Action::Release]);
-    }
-
-    #[test]
-    fn focus_loss_is_a_full_teardown() {
-        let mut im = Immersive::default();
-        im.on_tick(true, true, true);
-        im.on_tick(false, true, true);
+        engage(&mut im);
         assert_eq!(
-            im.on_tick(false, true, false),
+            im.on_tick(true),
             vec![Action::Release, Action::SetFullscreen(false)]
         );
-        // Refocusing later must not re-engage by itself.
-        assert_eq!(im.on_tick(false, true, true), vec![]);
+        assert!(!im.engaged());
+        // Silent afterwards.
+        assert_eq!(im.on_tick(false), vec![]);
     }
 
     #[test]
-    fn every_exit_path_releases_exactly_once() {
-        for exit in ["toggle", "fullscreen", "focus"] {
-            let mut im = Immersive::default();
-            im.on_tick(true, true, true);
-            im.on_tick(false, true, true);
-            let actions = match exit {
-                "toggle" => im.on_tick(true, true, true),
-                "fullscreen" => im.on_tick(false, false, true),
-                _ => im.on_tick(false, true, false),
-            };
-            assert_eq!(
-                actions.iter().filter(|a| **a == Action::Release).count(),
-                1,
-                "exit path {exit}"
-            );
-            // Machine is silent afterwards.
-            assert_eq!(im.on_tick(false, false, false), vec![]);
-        }
+    fn exit_releases_exactly_once() {
+        let mut im = Immersive::default();
+        engage(&mut im);
+        let actions = im.on_tick(true);
+        assert_eq!(actions.iter().filter(|a| **a == Action::Release).count(), 1);
+        assert_eq!(im.on_tick(false), vec![]);
     }
 
     #[test]
@@ -223,12 +192,12 @@ mod tests {
         assert_eq!(off.reset(), vec![]);
 
         let mut entering = Immersive::default();
-        entering.on_tick(true, false, true);
+        entering.on_tick(true);
         assert_eq!(entering.reset(), vec![Action::SetFullscreen(false)]);
 
         let mut on = Immersive::default();
-        on.on_tick(true, true, true);
-        on.on_tick(false, true, true);
+        on.on_tick(true);
+        on.on_tick(false);
         assert_eq!(
             on.reset(),
             vec![Action::Release, Action::SetFullscreen(false)]
@@ -240,10 +209,10 @@ mod tests {
     fn wants_relative_capture_follows_host_authority() {
         // (engaged, host_cursor_visible) -> want_relative
         let cases = [
-            (true, true, false),   // host shows a cursor: release to absolute
-            (true, false, true),   // host hides its cursor: relative capture
-            (false, true, false),  // not engaged: never relative
-            (false, false, false), // not engaged: never relative, even if hidden
+            (true, true, false),
+            (true, false, true),
+            (false, true, false),
+            (false, false, false),
         ];
         for (engaged, host_cursor_visible, want) in cases {
             assert_eq!(

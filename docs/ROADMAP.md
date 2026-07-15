@@ -96,7 +96,7 @@ Tetrys FEC · 서브프레임 슬라이스 · QU · 네이티브 클라이언트
 |---|---|---|---|
 | U1. 프레임딜레이 CC (Pudica류) | [x] cc.rs 26 tests | [x] 송신루프 배선 + `min(abr, cc)` 합성 + 세대 가드/손실 모멘텀 수정 (2026-07-14, docs/design/cc-wiring.md, +12 tests) | Gate B 벤치 셀에서 송신측 신호 대역폭 판정 → 부족 시 TWCC/수신측 피드(Gate D) |
 | U2. Tetrys 슬라이딩윈도우 FEC | [x] fec.rs 47 tests (GF(256), MDS sweep) + u32 wrap/윈도캡 가드 3핀 | [x] 프레이밍 설계(video_fec DataChannel) + **P1 배선 완료** + **P2-lite 라이브 손실 검증 통과** (2026-07-14, 루프백+clumsy 5%/20%: FEC-only 렌더 라이브, 20%에서도 화면 깨짐 0, needs-IDR 복구 루프 39+36회 순환, 손실 중 재접속 ~1.1 s — fec-framing.md §8-A) + [x] **P2 계측 기반 완성** (2026-07-15, task 병렬): Recovered/LossSpan 카운터 양측 미러 — `FecDecoderStats`/`VideoReceiverStats`(source/repair 수신, symbols_recovered, frames_recovered(프레임이 복구 심볼 사용), loss_spans/loss_spans_recovered) + `Recovered{via_fec}` 이벤트 플래그, loss-span은 단일 frontier 지연 발견 근사(인라인 문서화, 기존 동작 비트-동일). transport-core 101 + 웹 fec 49 tests | Gate B/D — P2 정량화 rig(카운터 소비·복구율 vs 비율 곡선), P3 적응 비율 A/B·기본 경로 판정 |
-| U3. 서브프레임 슬라이스 | [x] 제약 인벤토리 + [x] 콜백 granularity 조사(1콜백=1프레임 확정, slice-qu-constraints.md §5) + [x] **와이어 계약 핀** (2026-07-15, §6): Sunshine은 FEC 블록을 크기 균등 분할(mid-NAL, stream.cpp:1552-1599)이라 "블록=슬라이스" 전제는 GFE 전용 — per-slice DU는 포크 선행(슬라이스 정렬 블록 + `multiFecFlags 0x20` 시그널, 2비트 한계로 슬라이스 ≤4)의 양측 계약으로 재분류 | [x] **소형 레버**: `slices_per_frame` C-경로 래퍼 갭 수정 — capability bits 24-31 패킹, 기본 1 비트-동일 핀(2026-07-14, streamer 261 tests). 잔여(§6.3 순서): [ ] 활성값 튜닝(P0 RTX 4070 슬라이스 지연 실측 선행) · [ ] 포크: 슬라이스 정렬 FEC 블록+0x20 (MSYS2 세션) · [ ] depacketizer 패치(0x20 게이트, 포크 트래픽으로 루프백 검증) · [ ] 스트리머 per-slice 송신 | Gate C에서 인코드→프레젠트 겹침 이득 실측 |
+| U3. 서브프레임 슬라이스 | [x] 제약 인벤토리 + [x] 콜백 granularity 조사(1콜백=1프레임 확정, slice-qu-constraints.md §5) + [x] **와이어 계약 핀** (2026-07-15, §6): Sunshine은 FEC 블록을 크기 균등 분할(mid-NAL)이라 "블록=슬라이스" 전제는 GFE 전용 — per-slice DU는 포크 선행(슬라이스 정렬 블록 + `multiFecFlags 0x20` 시그널, 2비트 한계로 슬라이스 ≤4)의 양측 계약으로 재분류 | [x] **소형 레버**: `slices_per_frame` C-경로 래퍼 갭 수정 — capability bits 24-31 패킹, 기본 1 비트-동일 핀(2026-07-14, streamer 261 tests) + [x] **활성값 튜닝 봉인 해제** (2026-07-16 새벽, P0 실측 완료 — 아래 P0 항): RTX 4070에서 슬라이스 2/4는 h264_nvenc 인코드 지연 비용 없음(±6% 노이즈) → slices_per_frame 상향은 겹침 이득 목적으로 자유 + [x] **포크: 슬라이스 정렬 FEC 블록+0x20 완료** (2026-07-16 새벽, foundation-sunshine `52777ec0` = betterparsec-baseline 브랜치, 리포 패치 docs/host-patches/foundation-sunshine-slice-aligned-fec.patch): `slice_aligned_fec` config(기본 off, 스톡과 와이어 비트-동일 폴백) — VCL-NAL 컷 스캐너(H.264 1-5/HEVC <32, 4바이트 스타트코드는 선행 0을 이전 그룹 trailing zero로), 그룹별 독립 패킷화(frame_header는 그룹 0만, lastPayloadLen 그룹-로컬 재계산, 그룹당 shard 예산 검증 실패 시 폴백), multiFecFlags 0x30. MSYS2 빌드·스테이지 `2026.0715.232805.52777ec0` SHA `ca274994…90806a`. 잔여(§6.3): [ ] depacketizer 패치(0x20 게이트 — **트레일링 제로 DU 관용 필수**, 포크 트래픽 루프백 검증) · [ ] 스트리머 per-slice 송신 | Gate C에서 인코드→프레젠트 겹침 이득 실측 |
 | U4. QU build-to-lossless | [x] 채널·타일 프로토콜 설계 (2026-07-14, docs/design/qu-protocol.md — `video_qu` 단일 reliable 채널, PNG 타일+CRC 자가검증, epoch/invalidate, 오버레이 캔버스 합성 결정, localhost 릴레이 인터페이스) | [x] **P1 완료** (2026-07-14): 스트리머 릴레이(qu_relay, subscribe 게이트·세대 가드·4 MiB 바운드·재접속 replay) + 클라 오버레이(순수 상태/DOM 분리, CRC 자가검증, 디코드-중-invalidate 레이스 가드) — sonnet 리뷰 8건 전부 수정·핀, streamer 251·웹 103 그린. 잔여: [ ] 호스트 무손실 타일 경로(포크 P2, 릴레이 포트 config 플러밍 포함) | Gate E — 데스크톱 모드 픽셀-퍼펙트 |
 | U5. 네이티브 클라이언트 (ultra 티어) | [x] 리서치 05 §3 아키텍처 | [x] moonlight-qt 포크 스파이크 완료 (m6-native-spike.md, 접합 = Rust cdylib 사이드카 Option-3) → [x] **W1 완주** (2026-07-14): `transport-core` 추출 + 순수 `VideoReceiver`(TS 미러, 15 tests) + `client-transport` cdylib(C ABI ct_receiver_*/ct_start/FrameQueue, 헤더) + **WebRTC/signaling 클라 라이브 검증** — ct-probe가 브라우저 없이 699프레임/15s 수신, `CT-PROBE-OK` (StartStream 타이밍 교착·상태 역전 130ms 두 함정 해소, 스파이크 §F 갱신). 잔여: W2 셸 글루(Qt 6 빌드 환경 ~2–3h) 또는 통합 앱 셸 직행 | Gate C 외부 계측으로 지연 왕좌 판정 |
 
@@ -313,8 +313,15 @@ Parsec web app 문서
   step 6 Tier B 판정 (f1-ack.md).
 - [x] patched Moonlight dependency를 고정 revision + repository-owned patch + bootstrap/CI
   구조로 전환해 외부 로컬 작업 트리 없이 clean clone을 재현한다.
-- [ ] RTX 4070 ULL/슬라이스 인코드 지연 자체 실측(리서치 04 §3-1 문헌 상충 해소;
-  U3 착수 전 필요).
+- [x] RTX 4070 ULL/슬라이스 인코드 지연 자체 실측 — **완료** (2026-07-16 새벽,
+  `nvenc-slice-probe` bin: `cargo run --release -p app-native --features video
+  --bin nvenc-slice-probe`, 1080p NV12 CBR 10Mbps tune=ull, 30 warmup + 300
+  measured, 비트스트림 VCL NAL 카운트로 슬라이스 적용 검증 — 전 config
+  요청=관측): p50 slices=1→2→4: p1 1634→1540→1586us, p4 2142→2129→2166us,
+  델타 -6%~+1% = **노이즈 수준. 문헌의 "슬라이스 = 수 ms 비용" 주장 기각**
+  (리서치 04 §3-1 상충 해소) — U3 slices_per_frame 튜닝은 인코드 지연
+  세금 없이 겹침 이득만 판정하면 된다(Gate C). 주의: h264_nvenc private
+  `slices` AVOption 부재 — `AVCodecContext.slices` 필드가 유효 레버.
 
 **검증:** 내부 수치가 packet capture/외부 계측과 각각 ±2 ms 또는 ±10% 안에서
 일치해야 한다. 기존 2026-07-13 최초 same-PC run의 host latency와 RTP jitter는 단위
@@ -492,9 +499,28 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   WM_MOUSEMOVE 억제·커서 강제 숨김 + `ClipCursor` 매 프레임
   재단언(이동/리사이즈 이벤트 플러밍 불요) + egui viewport fullscreen
   토글 + 전역 해제 안전망(surface Drop·세션 리셋 3경로, 클립/등록
-  잔류 없음). app-native 43 tests. 잔여 = Phase B2: LL 키보드 훅
-  (Win/Alt-Tab 캡처 — Keyboard Lock 등가) + immersive 중 host-authority
-  auto 전환(CursorShared visibility) + 라이브 판정.
+  잔류 없음). **Phase B2 완성** (2026-07-16 새벽, task 병렬, 헤드리스
+  검증): WH_KEYBOARD_LL 훅 — 캡처 중 Win 키·Alt+Tab을 삼켜서 와이어
+  Key 패킷으로 전달(SwallowForward), **Ctrl+Alt+Shift+Q = immersive
+  탈출 해치**(커서가 스트림 child에 클립돼 사이드바 버튼 도달 불가 —
+  키다운 엣지에서만 발화, `CaptureShared.take_exit_requested()`로 셸
+  토글에 합류). 순수 `hook_decision` 테이블 5 tests, 훅 설치/해제는
+  engage/`release_mouse_capture_global` 단일 수렴점에 배선(기존 해제
+  3경로 전부 무누수), LL 훅 컨텍스트 한계는 OnceLock 슬롯 + VK_Q
+  콤보는 GetAsyncKeyState(LL 훅에서 GetKeyState 1이벤트 지연 회피).
+  app-native 49 tests. 잔여 = immersive 중 host-authority auto 전환
+  (CursorShared visibility) + 라이브 판정.
+- [x] **웹 UI/UX 폴리시 패스** (2026-07-16 새벽, task 병렬 — owner
+  "moonlight-web 느낌 너무 구리고 불편" 대응): 타이포 스케일(14px UI
+  베이스, h1/h2/h3 위계, 전역 text-shadow 제거), 유휴 네온 글로우
+  제거(글로우는 hover/focus-visible만), bg-0..3 실 엘리베이션 스케일,
+  모든 인터랙티브 요소에 hover/focus-visible/active/disabled 상태,
+  터치 타깃 ≥40px, 모달/폼 max-width(울트라와이드), 설정 메뉴 섹션
+  그룹화(`.settings-section`), 사이드바 aria-expanded + 선택 상태
+  하이라이트. **moonlight 테마 대수선**: standard.css 전용 토큰/셀렉터
+  다수가 moonlight 테마에서 미정의(토스트·호스트 상태·로딩·검색이
+  통째로 무스타일)였던 것을 자체 팔레트로 포팅 — 양 테마 기능 동등.
+  클래스 리네임/삭제 0(프로그램 검증), tsc 클린, 웹 160 tests 그린.
 - [ ] 보안 감사(ARCHITECTURE §보안 6항: 서명·짧은토큰·상수시간·replay·안전인코딩·revocation)
 - [ ] 입력(Gamepad/Keyboard Lock) secure-context 동작, 오디오, 재접속 안정성
 - [ ] upstream 병합 전략 정리

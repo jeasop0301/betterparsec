@@ -7,6 +7,10 @@ license.workspace = true
 [[bin]]
 name = "betterparsec"
 path = "src/main.rs"
+[[bin]]
+name = "nvenc-slice-probe"
+path = "src/bin/nvenc_slice_probe.rs"
+required-features = ["video"]
 
 [dependencies]
 client-transport = { path = "../client-transport" }

@@ -12,6 +12,7 @@ const sidebarParent = document.getElementById("sidebar-parent")
 const sidebarButton = document.getElementById("sidebar-button")
 
 sidebarButton?.addEventListener("click", toggleSidebar)
+sidebarButton?.setAttribute("aria-expanded", "false")
 
 let sidebarComponent: Sidebar | null = null
 
@@ -42,6 +43,8 @@ export function setSidebarExtended(extended: boolean) {
     } else {
         sidebarRoot?.classList.remove("sidebar-show")
     }
+    // Reflect the toggle's current state for assistive tech / keyboard users
+    sidebarButton?.setAttribute("aria-expanded", extended ? "true" : "false")
     sidebarExtended = extended
 }
 export function isSidebarExtended(): boolean {

@@ -16,8 +16,8 @@
 //! Relative mouse (RawInput + cursor lock) arrives with the
 //! `session-ux` immersive state machine (M4/Phase B).
 
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use client_transport::session::InputSender;
 use common::input_wire::InboundPacket;
@@ -26,14 +26,15 @@ use moonlight_common::stream::control::{
 };
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN,
-    VK_SHIFT,
+    GetAsyncKeyState, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_LWIN,
+    VK_MENU, VK_Q, VK_RWIN, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, HTCLIENT, SetCursor, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
-    WM_XBUTTONUP,
+    CallNextHookEx, GetClientRect, HHOOK, HTCLIENT, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, SetCursor,
+    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use crate::VideoShared;
@@ -56,15 +57,37 @@ pub struct InputCtx {
 
 /// Shell→wndproc shared immersive capture state.
 #[derive(Debug, Default)]
-pub struct CaptureShared(std::sync::atomic::AtomicBool);
+pub struct CaptureShared {
+    relative: AtomicBool,
+    /// Set by the keyboard hook's Ctrl+Alt+Shift+Q escape hatch (Phase
+    /// B2, below); the shell tick consumes it via
+    /// [`Self::take_exit_requested`]. While relative capture is
+    /// engaged the cursor is clipped to the stream child (present.rs),
+    /// so the sidebar "Exit immersive" button is unreachable — this is
+    /// the only way out.
+    exit_requested: AtomicBool,
+}
 
 impl CaptureShared {
     pub fn set_relative(&self, on: bool) {
-        self.0.store(on, Ordering::Release);
+        self.relative.store(on, Ordering::Release);
     }
 
     pub fn relative(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.relative.load(Ordering::Acquire)
+    }
+
+    /// Requests immersive exit (keyboard hook, UI thread via the LL
+    /// hook's own thread — same process, no cross-thread sync beyond
+    /// the atomic).
+    pub fn request_exit(&self) {
+        self.exit_requested.store(true, Ordering::Release);
+    }
+
+    /// Consumes a pending exit request; `false` once already taken this
+    /// tick. The shell calls this once per frame (main.rs).
+    pub fn take_exit_requested(&self) -> bool {
+        self.exit_requested.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -337,6 +360,181 @@ pub fn handle(
     Some(LRESULT(0))
 }
 
+// ── Keyboard Lock (Phase B2, WH_KEYBOARD_LL) ────────────────────────────────
+//
+// Immersive relative capture clips the cursor to the stream child, so the
+// sidebar "Exit immersive" button is unreachable, and Windows would
+// otherwise steal the Win keys and Alt+Tab away from the host (Start
+// menu / task switcher) instead of forwarding them — the Keyboard Lock
+// analog (web `keyboard.lock()`; see docs/design/unified-app-architecture.md
+// §4-3). A WH_KEYBOARD_LL hook intercepts those keys ahead of any window
+// getting them and either forwards them onto the wire or fires the
+// Ctrl+Alt+Shift+Q escape hatch.
+
+/// Outcome of [`hook_decision`] for one low-level keyboard event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookAction {
+    /// Let Windows (and, after `CallNextHookEx`, the app's own
+    /// WM_KEYDOWN/UP path in [`handle`]) process the key normally.
+    Pass,
+    /// Windows must never see this key: forward it to the host on the
+    /// wire and swallow it here (`CallNextHookEx` is skipped).
+    SwallowForward,
+    /// The Ctrl+Alt+Shift+Q escape hatch fired.
+    ExitImmersive,
+}
+
+/// Pure Keyboard Lock decision table (unit-tested, no Win32).
+///
+/// `alt_down` carries whichever extra-modifier condition matters for
+/// `vk`: the literal Alt-down flag (`KBDLLHOOKSTRUCT` `LLKHF_ALTDOWN`)
+/// for `VK_TAB`, or the full Ctrl+Alt+Shift combo — tracked by the
+/// caller from the hook's own key stream or `GetAsyncKeyState`, since
+/// `GetKeyState` in a low-level hook can lag the event that is still
+/// in-flight — for the `VK_Q` escape hatch. Rules:
+/// - `capture_on == false` ⇒ [`HookAction::Pass`] (hook installed but
+///   immersive not engaged — e.g. a race during teardown).
+/// - `VK_LWIN`/`VK_RWIN` ⇒ [`HookAction::SwallowForward`] (Start menu).
+/// - `VK_TAB` with `alt_down` ⇒ [`HookAction::SwallowForward`] (task
+///   switcher).
+/// - `VK_Q` key-down with `alt_down` (Ctrl+Alt+Shift satisfied) ⇒
+///   [`HookAction::ExitImmersive`].
+/// - Everything else ⇒ [`HookAction::Pass`] — the wndproc's WM_KEYDOWN
+///   path ([`handle`]) already forwards normal keys; reporting them
+///   here too would double-send.
+pub fn hook_decision(vk: u32, alt_down: bool, key_up: bool, capture_on: bool) -> HookAction {
+    if !capture_on {
+        return HookAction::Pass;
+    }
+    if vk == VK_Q.0 as u32 {
+        return if !key_up && alt_down {
+            HookAction::ExitImmersive
+        } else {
+            HookAction::Pass
+        };
+    }
+    let is_win = vk == VK_LWIN.0 as u32 || vk == VK_RWIN.0 as u32;
+    let is_alt_tab = vk == VK_TAB.0 as u32 && alt_down;
+    if is_win || is_alt_tab {
+        HookAction::SwallowForward
+    } else {
+        HookAction::Pass
+    }
+}
+
+/// An `HHOOK` is a process-global handle, not tied to the installing
+/// thread (same reasoning as `cursor_icon::OwnedCursor`); wrap it so the
+/// static slot below can hold it.
+struct HookHandle(HHOOK);
+unsafe impl Send for HookHandle {}
+
+/// Per-session state the hook proc needs — stashed in [`HOOK_STATE`]
+/// because a raw `HOOKPROC` gets no user context (no lparam/closure
+/// capture, unlike `GWLP_USERDATA` for the wndproc).
+#[derive(Clone)]
+struct HookShared {
+    capture: Arc<CaptureShared>,
+    sender: InputSender,
+}
+
+struct HookState {
+    hook: HookHandle,
+    shared: HookShared,
+}
+
+/// Install/uninstall slot for the low-level keyboard hook. `None` when
+/// not installed.
+static HOOK_STATE: OnceLock<Mutex<Option<HookState>>> = OnceLock::new();
+
+fn hook_state() -> &'static Mutex<Option<HookState>> {
+    HOOK_STATE.get_or_init(|| Mutex::new(None))
+}
+
+/// Installs the WH_KEYBOARD_LL hook (idempotent — a second call while
+/// already installed is a no-op). **Must run on the UI thread**: a
+/// low-level hook executes in the context of the thread that installed
+/// it, and that thread must keep pumping messages (`GetMessage`/
+/// `DispatchMessage`) or the hook call adds visible system-wide input
+/// lag — the eframe main thread already does this for the window
+/// message loop, so it qualifies.
+pub fn install_keyboard_hook(capture: Arc<CaptureShared>, sender: InputSender) {
+    let mut guard = hook_state().lock().unwrap_or_else(PoisonError::into_inner);
+    if guard.is_some() {
+        return;
+    }
+    let shared = HookShared { capture, sender };
+    let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) };
+    match hook {
+        Ok(h) => {
+            *guard = Some(HookState {
+                hook: HookHandle(h),
+                shared,
+            })
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, "SetWindowsHookExW(WH_KEYBOARD_LL) failed — Win/Alt-Tab capture unavailable");
+        }
+    }
+}
+
+/// Uninstalls the hook (idempotent — safe to call with none installed).
+pub fn uninstall_keyboard_hook() {
+    let mut guard = hook_state().lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(state) = guard.take() {
+        unsafe {
+            let _ = UnhookWindowsHookEx(state.hook.0);
+        }
+    }
+}
+
+/// `WH_KEYBOARD_LL` hook procedure. No user context is available (see
+/// [`HookShared`]); `code < 0` must always fall through to
+/// `CallNextHookEx` unexamined (SDK contract).
+unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 {
+        let shared = hook_state()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|s| s.shared.clone());
+        if let Some(shared) = shared {
+            let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+            let vk = kb.vkCode;
+            let msg = wparam.0 as u32;
+            let key_up = matches!(msg, WM_KEYUP | WM_SYSKEYUP);
+            let ctrl_down = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0;
+            let shift_down = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0;
+            let alt_down = if vk == VK_TAB.0 as u32 {
+                kb.flags.contains(LLKHF_ALTDOWN)
+            } else {
+                // VK_Q escape hatch: full Ctrl+Alt+Shift combo.
+                kb.flags.contains(LLKHF_ALTDOWN) && ctrl_down && shift_down
+            };
+            match hook_decision(vk, alt_down, key_up, shared.capture.relative()) {
+                HookAction::Pass => {}
+                HookAction::ExitImmersive => {
+                    shared.capture.request_exit();
+                    return LRESULT(1);
+                }
+                HookAction::SwallowForward => {
+                    shared.sender.send(&InboundPacket::Key {
+                        action: if key_up {
+                            KeyAction::Up
+                        } else {
+                            KeyAction::Down
+                        },
+                        modifiers: current_modifiers(),
+                        key: vk as u16,
+                        flags: KeyFlags::empty(),
+                    });
+                    return LRESULT(1);
+                }
+            }
+        }
+    }
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -527,5 +725,72 @@ mod tests {
         assert!(c.relative());
         c.set_relative(false);
         assert!(!c.relative());
+    }
+
+    #[test]
+    fn capture_shared_exit_request_roundtrip() {
+        let c = CaptureShared::default();
+        assert!(!c.take_exit_requested());
+        c.request_exit();
+        assert!(c.take_exit_requested());
+        // Consuming clears it — a second read this tick sees nothing new.
+        assert!(!c.take_exit_requested());
+    }
+
+    #[test]
+    fn hook_decision_capture_off_always_passes() {
+        use HookAction::Pass;
+        assert_eq!(hook_decision(VK_LWIN.0 as u32, false, false, false), Pass);
+        assert_eq!(hook_decision(VK_TAB.0 as u32, true, false, false), Pass);
+        assert_eq!(hook_decision(VK_Q.0 as u32, true, false, false), Pass);
+    }
+
+    #[test]
+    fn hook_decision_win_keys_swallow_both_edges() {
+        use HookAction::SwallowForward;
+        assert_eq!(
+            hook_decision(VK_LWIN.0 as u32, false, false, true),
+            SwallowForward
+        );
+        assert_eq!(
+            hook_decision(VK_RWIN.0 as u32, false, true, true),
+            SwallowForward
+        );
+    }
+
+    #[test]
+    fn hook_decision_alt_tab_needs_alt_flag() {
+        assert_eq!(
+            hook_decision(VK_TAB.0 as u32, true, false, true),
+            HookAction::SwallowForward
+        );
+        // Plain Tab (no Alt) is not the task-switcher combo.
+        assert_eq!(
+            hook_decision(VK_TAB.0 as u32, false, false, true),
+            HookAction::Pass
+        );
+    }
+
+    #[test]
+    fn hook_decision_exit_combo_fires_on_key_down_only() {
+        assert_eq!(
+            hook_decision(VK_Q.0 as u32, true, false, true),
+            HookAction::ExitImmersive
+        );
+        // Key-up edge and an unsatisfied combo both just pass through.
+        assert_eq!(
+            hook_decision(VK_Q.0 as u32, true, true, true),
+            HookAction::Pass
+        );
+        assert_eq!(
+            hook_decision(VK_Q.0 as u32, false, false, true),
+            HookAction::Pass
+        );
+    }
+
+    #[test]
+    fn hook_decision_ordinary_keys_pass_through() {
+        // 'A' — the wndproc WM_KEYDOWN path already forwards it.
+        assert_eq!(hook_decision(0x41, false, false, true), HookAction::Pass);
     }
 }

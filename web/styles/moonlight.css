@@ -6,12 +6,82 @@
     --ml-topbar-icon-size: 26px;
     --ml-topbar-icon-button: 36px;
     --ml-topbar-actions-offset: 88px;
+
+    /* Colors — Moonlight is the flatter, quieter alternate theme (indigo/gray,
+       no cyan glow). Same token names as standard.css so shared component
+       rules below resolve consistently regardless of which theme is active
+       (only one stylesheet is ever loaded at a time). */
+    --bg-0: #1c1e21;
+    --bg-1: #26282c;
+    --bg-2: #313339;
+    --bg-3: #3d4048;
+    --text-1: #c7d0da;
+    --text-2: #ffffff;
+    --text-muted: #8b9199;
+    --accent-cyan: #5c6bc0;
+    --accent-cyan-2: #7986cb;
+    --accent-cyan-light: #9fa8da;
+    --muted: rgba(255, 255, 255, 0.06);
+    --border-subtle: rgba(255, 255, 255, 0.12);
+    --error: #ff8a65;
+    --error-light: #ffab91;
+    --success: #66bb6a;
+    --warning: #ffca28;
+    --status-online: #66bb6a;
+    --status-offline: #757575;
+    --status-connecting: #ffca28;
+
+    /* Spacing */
+    --space-xs: 4px;
+    --space-sm: 8px;
+    --space-md: 16px;
+    --space-lg: 24px;
+    --space-xl: 32px;
+
+    /* Radii */
+    --radius-sm: 6px;
+    --radius-md: 12px;
+    --radius-lg: 16px;
+
+    /* Shadows — flat theme: neutral, no colored glow at rest */
+    --shadow-1: 0 4px 12px rgba(0, 0, 0, 0.5);
+    --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.6);
+    --shadow-3: 0 12px 36px rgba(0, 0, 0, 0.7);
+    --shadow-button: 0 2px 6px rgba(0, 0, 0, 0.4);
+    --glow-cyan: 0 0 0 rgba(0, 0, 0, 0);
+    --glow-cyan-bright: 0 0 0 rgba(0, 0, 0, 0);
+    --glow-focus: 0 0 0 3px rgba(121, 134, 203, 0.5);
+
+    /* Typography scale — matches standard.css hierarchy */
+    --font-size-base: 1rem;
+    --font-size-sm: 0.875rem;
+    --font-size-xs: 0.78rem;
+    --line-height-base: 1.5;
+    --line-height-tight: 1.25;
+    --font-h1: 1.6rem;
+    --font-h2: 1.2rem;
+    --font-h3: 0.8rem;
+    --font-card-title: 0.95rem;
+
+    /* Layout */
+    --max-form-width: 560px;
+
+    /* Animation durations */
+    --dur-fast: 0.18s;
+    --dur-med: 0.25s;
+    --dur-slow: 0.4s;
+}
+
+/* 14px effective root, matching standard.css's calmer UI chrome scale */
+html {
+    font-size: 87.5%;
 }
 
 body {
-    background-color: #333333;
-    color: #ffffff;
-    font-size: 1.2rem;
+    background-color: var(--bg-0);
+    color: var(--text-2);
+    font-size: var(--font-size-base);
+    line-height: var(--line-height-base);
     font-family: sans-serif;
 }
 
@@ -37,10 +107,65 @@ body.stream {
     overscroll-behavior: none !important;
 }
 
+.root:not(input) {
+    -webkit-touch-callout: none;
+    -webkit-user-drag: none;
+    -webkit-user-select: none;
+    -khtml-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    user-select: none;
+}
+
+img {
+    -webkit-user-drag: none;
+}
+
+/* Global smooth animations for interactive changes */
+*,
+*::before,
+*::after {
+    touch-action: manipulation;
+    transition: background-color 0.2s ease, color 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+
+    *,
+    *::before,
+    *::after {
+        transition: none !important;
+        animation: none !important;
+    }
+}
+
+h1,
 h2,
 h3 {
-    margin-top: 12px;
-    margin-bottom: 8px;
+    margin: 0 0 var(--space-sm);
+    font-weight: 600;
+    line-height: var(--line-height-tight);
+    color: var(--text-2);
+}
+
+h1 {
+    font-size: var(--font-h1);
+    margin-top: 0;
+}
+
+h2 {
+    font-size: var(--font-h2);
+    margin-top: var(--space-md);
+}
+
+h3 {
+    font-size: var(--font-h3);
+    margin-top: var(--space-lg);
+    margin-bottom: var(--space-sm);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-1);
+    opacity: 0.85;
 }
 
 /** Input Div */
@@ -48,6 +173,8 @@ h3 {
     display: flex;
     flex-direction: row;
     align-items: center;
+    gap: var(--space-sm);
+    min-height: 40px;
 }
 
 /** Hide the file input */
@@ -60,31 +187,51 @@ input[type="file"] {
 label {
     cursor: default;
     margin-right: 5px;
+    font-size: var(--font-size-sm);
+    color: var(--text-1);
 }
 
 /** Button */
 .file-button,
 button {
-    background-color: rgba(63, 81, 181, 1.0);
-    border: none;
-    border-radius: 5px;
-    padding: 5px;
-    margin: 8px;
-    font-size: 1.2rem;
+    background-color: var(--bg-2);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: var(--space-sm) var(--space-md);
+    margin: var(--space-sm);
+    min-height: 40px;
+    font-size: var(--font-size-base);
     cursor: pointer;
-    transition: none !important;
-    animation: none !important;
+    color: var(--text-2);
+    box-shadow: var(--shadow-button);
+    transition: all var(--dur-fast) ease;
 }
 
-.file-button:hover,
-button:hover:not(.logout-button):not(.admin-button):not(.open-settings):not(.host-add) {
-    box-shadow: none;
+.file-button:hover:not(:disabled),
+button:hover:not(.logout-button):not(.admin-button):not(.open-settings):not(.host-add):not(:disabled) {
+    background-color: var(--bg-3);
+    border-color: var(--accent-cyan-2);
 }
 
+.file-button:focus-visible,
+button:focus-visible {
+    outline: none;
+    box-shadow: var(--glow-focus);
+    border-color: var(--accent-cyan-2);
+}
+
+.file-button:active:not(:disabled),
+button:active:not(:disabled) {
+    background-color: var(--bg-1);
+}
 
 /* Disable all fancy effects when the button is disabled */
 button:disabled {
-    background-color: gray !important;
+    background-color: var(--bg-1) !important;
+    border-color: var(--muted);
+    color: var(--text-muted);
+    cursor: not-allowed;
+    opacity: 0.65;
 }
 
 .button-fit-content {
@@ -96,19 +243,30 @@ input[type="checkbox"] {
     /* remove native box */
     appearance: none;
     vertical-align: middle;
-    width: 24px;
-    height: 24px;
-    border: 2px solid #555;
-    border-radius: 6px;
+    width: 22px;
+    height: 22px;
+    border: 2px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
     cursor: pointer;
     position: relative;
     display: inline-block;
+    background: var(--bg-2);
+    transition: all var(--dur-fast) ease;
+}
+
+input[type="checkbox"]:hover:enabled {
+    border-color: var(--accent-cyan-2);
+}
+
+input[type="checkbox"]:focus-visible {
+    outline: none;
+    box-shadow: var(--glow-focus);
 }
 
 input[type="checkbox"]::after {
     content: "✓";
     color: white;
-    font-size: 18px;
+    font-size: 16px;
     position: absolute;
     top: 50%;
     left: 50%;
@@ -120,8 +278,8 @@ input[type="checkbox"]::after {
 
 input[type="checkbox"]:checked {
     /* box fill */
-    background: rgb(206, 147, 216);
-    border-color: rgb(206, 147, 216);
+    background: var(--accent-cyan);
+    border-color: var(--accent-cyan-light);
 }
 
 input[type="checkbox"]:checked::after {
@@ -131,15 +289,18 @@ input[type="checkbox"]:checked::after {
 }
 
 input[type="checkbox"]:disabled {
-    color: none;
-    border-color: black;
+    color: var(--text-muted);
+    border-color: var(--muted);
+    background: var(--bg-1);
     box-shadow: none;
+    cursor: not-allowed;
+    opacity: 0.65;
 }
 
 
 /** Slider */
 input[type="range"] {
-    accent-color: rgba(63, 81, 181, 1.0);
+    accent-color: var(--accent-cyan-2);
 
     width: 200px;
     height: 32px;
@@ -154,6 +315,12 @@ input[type="range"]:active {
     cursor: grabbing;
 }
 
+input[type="range"]:focus-visible {
+    outline: none;
+    box-shadow: var(--glow-focus);
+    border-radius: var(--radius-sm);
+}
+
 /** Text Field likes  */
 .textlike,
 textarea,
@@ -162,16 +329,22 @@ select,
 input[type=text],
 input[type=password],
 input[type=number] {
-    color: white;
-    font-size: 1.2rem;
+    width: 100%;
+    box-sizing: border-box;
+    color: var(--text-2);
+    font-size: var(--font-size-base);
+    line-height: var(--line-height-tight);
     margin: 5px;
-    background-color: rgba(0, 0, 0, 0.2);
-    border-radius: 2px;
-    border: 1px solid rgba(255, 255, 255, 0.4);
+    min-height: 40px;
+    padding: 0 var(--space-sm);
+    background-color: var(--bg-1);
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-subtle);
     /* multiline */
     overflow-x: auto;
     overflow-y: auto;
     white-space: pre-wrap;
+    transition: all var(--dur-fast) ease;
 
     max-height: max-content;
 }
@@ -183,9 +356,21 @@ select:hover:enabled,
 input[type=text]:hover:enabled,
 input[type=password]:hover:enabled,
 input[type="number"]:hover:enabled {
-    transition: all 0.2s;
-    background-color: rgba(0, 0, 0, 0);
-    border-color: rgb(255, 255, 255, 0.7);
+    transition: all var(--dur-fast) ease;
+    background-color: var(--bg-2);
+    border-color: var(--accent-cyan-2);
+}
+
+.textlike:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+.select-polyfill-display:focus-visible,
+input[type=text]:focus-visible,
+input[type=password]:focus-visible,
+input[type="number"]:focus-visible {
+    outline: none;
+    border-color: var(--accent-cyan-2);
+    box-shadow: var(--glow-focus);
 }
 
 textarea:disabled,
@@ -194,15 +379,22 @@ select:disabled,
 input[type=text]:disabled,
 input[type=password]:disabled,
 input[type=number]:disabled {
-    color: gray;
+    color: var(--text-muted);
+    background-color: var(--bg-1);
+    border-color: var(--muted);
+    cursor: not-allowed;
+    opacity: 0.65;
 }
 
 input[type=range]:disabled {
-    color: gray;
+    color: var(--text-muted);
+    opacity: 0.65;
+    cursor: not-allowed;
 }
 
 select option {
-    background-color: rgb(66, 66, 66);
+    background-color: var(--bg-1);
+    color: var(--text-2);
 }
 
 /** Hide the number up down thingy on number inputs */
@@ -238,12 +430,18 @@ input[type=number] {
 
 .select-polyfill-list {
     position: absolute;
-    background-color: rgb(48, 48, 48);
-    border: 1px solid gray;
-    margin-top: 4px;
+    background-color: var(--bg-2);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-2);
+    margin-top: var(--space-xs);
     left: 0;
     z-index: 1;
     cursor: pointer;
+
+    max-height: 240px;
+    overflow-y: auto;
+    overflow-x: hidden;
 }
 
 .select-polyfill-list.bottom {
@@ -257,21 +455,30 @@ input[type=number] {
 }
 
 .select-polyfill-list p {
-    color: white;
-    padding-top: 5px;
-    padding-bottom: 5px;
-    margin-top: 0;
-    margin-bottom: 0;
+    color: var(--text-1);
+    min-height: 40px;
+    display: flex;
+    align-items: center;
+    padding: 0 var(--space-md);
+    margin: 0;
+    transition: background-color var(--dur-fast) ease, color var(--dur-fast) ease;
 }
 
 .select-polyfill-list p:hover {
-    background-color: rgb(25, 103, 210);
-    color: white;
+    background-color: var(--accent-cyan);
+    color: var(--text-2);
+}
+
+/* Currently-selected option: kept visible even when not hovered */
+.select-polyfill-list p.select-polyfill-selected {
+    background: rgba(121, 134, 203, 0.25);
+    color: var(--accent-cyan-light);
+    font-weight: 600;
 }
 
 .select-polyfill-wrapper:hover:not(:has(.select-polyfill-list p:hover)) .select-polyfill-selected {
-    background-color: rgb(25, 103, 210);
-    color: white;
+    background-color: var(--accent-cyan);
+    color: var(--text-2);
 }
 
 
@@ -284,7 +491,7 @@ input[type=number] {
     top: 0;
     width: 100vw;
     height: 100vh;
-    background-color: rgba(0, 0, 0, 0.4);
+    background-color: rgba(0, 0, 0, 0.5);
     /** animation */
     visibility: visible;
     opacity: 1;
@@ -294,16 +501,20 @@ input[type=number] {
 .modal-content {
     position: relative;
     z-index: 5001;
-    background-color: rgb(86, 92, 100);
+    background-color: var(--bg-1);
 
-    margin: 15% auto;
-    padding: 20px;
-    border: 1px solid #888;
-    border-radius: 5px;
+    margin: 10% auto;
+    padding: var(--space-lg);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-3);
+    color: var(--text-1);
 
-    width: 80%;
+    /* Comfortable form width — don't let dialogs stretch across ultrawide screens */
+    width: 90%;
+    max-width: var(--max-form-width);
 
-    max-height: 60%;
+    max-height: 70%;
     overflow-y: auto;
 }
 
@@ -320,8 +531,10 @@ input[type=number] {
     display: block;
     position: fixed;
     z-index: 1;
-    border-radius: 5px;
-    background-color: rgb(86, 92, 100);
+    border-radius: var(--radius-md);
+    background-color: var(--bg-2);
+    border: 1px solid var(--border-subtle);
+    box-shadow: var(--shadow-2);
     /** animation */
     scale: 1;
     opacity: 1;
@@ -335,27 +548,29 @@ input[type=number] {
 
 .context-menu-element {
     margin: 0;
-    padding: 10px;
-    min-width: 110px;
+    padding: var(--space-sm) var(--space-md);
+    min-height: 40px;
+    min-width: 140px;
+    display: flex;
+    align-items: center;
     cursor: pointer;
-    border-radius: 5px;
+    border-radius: var(--radius-sm);
     /** animation */
-    transition: all 0.15s;
-    background-color: rgba(255, 255, 255, 0);
+    transition: all var(--dur-fast) ease;
+    background-color: transparent;
 }
 
 .context-menu-element:hover {
     /** animation */
-    transition: all 0.2s;
-    background-color: rgba(255, 255, 255, 0.2);
+    background-color: var(--bg-3);
 }
 
 .context-menu-element-red {
-    background-color: #7d0e0e;
+    color: var(--error);
 }
 
 .context-menu-element-red:hover {
-    background-color: #a43535;
+    background-color: rgba(255, 138, 101, 0.25);
 }
 
 .context-menu-disabled {
@@ -445,6 +660,12 @@ input[type=number] {
     justify-content: center;
 }
 
+/* Sidebar currently extended — make the toggle's own state obvious */
+.sidebar-show .sidebar-button {
+    background-color: var(--bg-3);
+    border-color: var(--accent-cyan-2);
+}
+
 .sidebar-button-image {
     transition: all 0.3s linear;
 }
@@ -471,11 +692,13 @@ input[type=number] {
 
 
 .sidebar-content {
-    background-color: rgb(86, 92, 100);
-    border-radius: 5px;
-    padding: 10px 10px 10px 10px;
+    background-color: var(--bg-2);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: var(--space-sm);
     display: flex;
     flex-direction: column;
+    box-shadow: var(--shadow-2);
 }
 
 /** TODO: reorder stream sidebar */
@@ -505,7 +728,11 @@ input[type=number] {
     padding-bottom: 0.2cm;
     margin-bottom: 0.5cm;
 
-    background-color: rgb(86, 92, 100);
+    background-color: var(--bg-2);
+    border: 1px solid var(--error);
+    border-left: 4px solid var(--error);
+    border-radius: var(--radius-sm);
+    color: var(--error-light);
 }
 
 .error-image {
@@ -544,8 +771,8 @@ input[type=number] {
 
 .top-line>h1 {
     margin: 0;
-    font-size: 1.25rem;
-    font-weight: 500;
+    font-size: var(--font-h1);
+    font-weight: 600;
     line-height: 1;
     white-space: nowrap;
 }
@@ -565,7 +792,8 @@ input[type=number] {
 .top-line-actions button,
 .actions-list button {
     background-color: transparent;
-    border-radius: 4px;
+    border: none;
+    border-radius: var(--radius-sm);
     margin: 0;
     padding: 0;
 }
@@ -573,8 +801,14 @@ input[type=number] {
 .top-line button:hover,
 .top-line-actions button:hover,
 .actions-list button:hover {
-    box-shadow: none;
-    background-color: transparent;
+    background-color: rgba(255, 255, 255, 0.14);
+}
+
+.top-line button:focus-visible,
+.top-line-actions button:focus-visible,
+.actions-list button:focus-visible {
+    outline: none;
+    box-shadow: var(--glow-focus);
 }
 
 .logout-button {
@@ -669,6 +903,23 @@ input[type=number] {
     color: white;
 }
 
+/* Settings menu: group related controls under labeled sections
+   (settings_menu.ts wraps each h3 + its controls in a .settings-section). */
+.settings-section {
+    display: flex;
+    flex-direction: column;
+    padding-bottom: var(--space-sm);
+    border-bottom: 1px solid var(--muted);
+}
+
+.settings-section:last-child {
+    border-bottom: none;
+}
+
+.settings-section>h3:first-child {
+    margin-top: 0;
+}
+
 /** Hosts */
 .host-add {
     background-color: transparent;
@@ -681,6 +932,83 @@ input[type=number] {
     border: none;
     padding: 0;
     margin: 0;
+}
+
+/** Search/Filter */
+.host-search {
+    width: 250px;
+    padding: var(--space-sm) var(--space-md);
+    min-height: 40px;
+    box-sizing: border-box;
+    background: var(--bg-1);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    color: var(--text-1);
+    font-size: var(--font-size-sm);
+    transition: all var(--dur-fast) ease;
+}
+
+.host-search:hover:enabled {
+    border-color: var(--accent-cyan-2);
+    background: var(--bg-2);
+}
+
+.host-search:focus,
+.host-search:focus-visible {
+    outline: none;
+    border-color: var(--accent-cyan-2);
+    background: var(--bg-2);
+    box-shadow: var(--glow-focus);
+}
+
+.host-search::placeholder {
+    color: var(--text-muted);
+}
+
+.host-highlight {
+    background: rgba(255, 202, 40, 0.3);
+    color: var(--warning);
+    font-weight: 600;
+    border-radius: 2px;
+    padding: 0 2px;
+}
+
+/* Theme toggle (top-line control) */
+.theme-toggle {
+    width: 50px;
+    height: 50px;
+    padding: var(--space-xs);
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid var(--border-subtle);
+    border-radius: 50%;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.5rem;
+    transition: all var(--dur-fast) ease;
+}
+
+.theme-toggle:hover {
+    background: rgba(255, 255, 255, 0.16);
+    border-color: var(--accent-cyan-2);
+}
+
+.theme-toggle:focus-visible {
+    outline: none;
+    box-shadow: var(--glow-focus);
+}
+
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(-10px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
 }
 
 .host-list {
@@ -696,12 +1024,18 @@ input[type=number] {
     cursor: pointer;
     margin: 0;
     padding: 0;
+    border-radius: var(--radius-md);
+    position: relative;
 }
 
 .host-element:hover {
-    transition: all 0.2s;
-    background-color: rgba(255, 255, 255, 0.08);
-    border-radius: 8px;
+    background-color: var(--bg-2);
+    border-radius: var(--radius-md);
+}
+
+.host-element:focus-visible {
+    outline: none;
+    box-shadow: var(--glow-focus);
 }
 
 .host-element>div {
@@ -741,8 +1075,185 @@ input[type=number] {
 .host-name {
     margin: 0;
     color: white;
-    font-size: 1.4rem;
+    font-size: var(--font-card-title);
+    font-weight: 600;
     text-align: center;
+}
+
+.host-status-indicator {
+    position: absolute;
+    top: var(--space-sm);
+    right: var(--space-sm);
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 2px solid var(--text-2);
+    transition: background-color var(--dur-fast) ease;
+}
+
+.host-status-indicator.online {
+    background-color: var(--status-online);
+}
+
+.host-status-indicator.offline {
+    background-color: var(--status-offline);
+}
+
+.host-status-indicator.connecting {
+    background-color: var(--status-connecting);
+    animation: pulse-status 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-status {
+
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.4;
+    }
+}
+
+.host-actions {
+    display: flex;
+    gap: var(--space-xs);
+    margin-top: var(--space-sm);
+    opacity: 0;
+    transition: opacity var(--dur-med) ease;
+}
+
+.host-element:hover .host-actions,
+.host-element:focus-within .host-actions {
+    opacity: 1;
+}
+
+.host-action-button {
+    width: 32px;
+    height: 32px;
+    padding: var(--space-xs);
+    font-size: var(--font-size-xs);
+    border-radius: var(--radius-sm);
+    background: var(--bg-3);
+    border: 1px solid var(--border-subtle);
+    color: var(--accent-cyan-light);
+    cursor: pointer;
+    transition: all var(--dur-fast) ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.host-action-button:hover {
+    background: rgba(121, 134, 203, 0.3);
+    border-color: var(--accent-cyan-2);
+}
+
+.host-action-button:focus-visible {
+    outline: none;
+    box-shadow: var(--glow-focus);
+}
+
+.host-action-button.danger {
+    color: var(--error);
+    background: rgba(255, 138, 101, 0.12);
+    border-color: rgba(255, 138, 101, 0.35);
+}
+
+.host-action-button.danger:hover {
+    background: rgba(255, 138, 101, 0.25);
+    border-color: var(--error);
+}
+
+/* Connecting spinner overlay for host tiles */
+@keyframes moonlight-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.host-element.connecting {
+    position: relative;
+    pointer-events: none;
+}
+
+.host-element.connecting::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    border-radius: var(--radius-md);
+}
+
+.host-element.connecting::before {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 28px;
+    height: 28px;
+    margin: -14px 0 0 -14px;
+    border-radius: 50%;
+    border: 3px solid var(--accent-cyan-light);
+    border-top-color: rgba(0, 0, 0, 0);
+    animation: moonlight-spin 1s linear infinite;
+}
+
+/* Loading Overlay */
+.host-loading-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-md);
+    background: rgba(0, 0, 0, 0.6);
+    border-radius: var(--radius-md);
+    z-index: 100;
+    animation: fadeIn var(--dur-med) ease;
+}
+
+.host-loading-spinner {
+    width: 32px;
+    height: 32px;
+    border: 3px solid rgba(255, 255, 255, 0.2);
+    border-top-color: var(--accent-cyan-light);
+    border-radius: 50%;
+    animation: moonlight-spin 0.8s linear infinite;
+}
+
+.host-loading-text {
+    font-size: var(--font-size-sm);
+    color: var(--accent-cyan-light);
+    text-align: center;
+}
+
+.host-loading-cancel {
+    padding: var(--space-sm) var(--space-md);
+    min-height: 40px;
+    background: rgba(255, 138, 101, 0.16);
+    border: 1px solid rgba(255, 138, 101, 0.85);
+    border-radius: var(--radius-md);
+    color: var(--text-2);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    cursor: pointer;
+    transition: background var(--dur-fast) ease, border-color var(--dur-fast) ease;
+}
+
+.host-loading-cancel:hover {
+    background: rgba(255, 138, 101, 0.28);
+}
+
+.host-loading-cancel:active {
+    background: rgba(255, 138, 101, 0.4);
+}
+
+.host-loading-cancel:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 4px rgba(255, 138, 101, 0.3);
 }
 
 /** Apps */
@@ -760,11 +1271,12 @@ input[type=number] {
     flex-direction: column;
     align-items: center;
     margin: 10px;
+    border-radius: var(--radius-sm);
+    transition: background-color var(--dur-fast) ease;
 }
 
 .app-element:hover {
-    transition: all 0.2s;
-    background-color: rgba(255, 255, 255, 0.2);
+    background-color: var(--bg-2);
 }
 
 .app-image {
@@ -788,10 +1300,9 @@ input[type=number] {
 
 .app-active .app-image {
     border-style: solid;
-    /** TODO: gold doesn't fit this theme */
-    border-color: gold;
-    border-width: 4px;
-    border-radius: 4px;
+    border-color: var(--accent-cyan-light);
+    border-width: 3px;
+    border-radius: var(--radius-sm);
 
     transition: all 0.4s ease-in;
 }
@@ -979,20 +1490,20 @@ canvas.video-stream {
 .user-element,
 .role-element {
     margin: 0;
-    padding: 10px;
+    padding: var(--space-sm) var(--space-md);
+    min-height: 40px;
     min-width: 110px;
     cursor: pointer;
-    border-radius: 5px;
+    border-radius: var(--radius-sm);
     /** animation */
-    transition: all 0.15s;
-    background-color: rgba(255, 255, 255, 0);
+    transition: all var(--dur-fast) ease;
+    background-color: transparent;
 }
 
 .user-element:hover,
 .role-element:hover {
     /** animation */
-    transition: all 0.2s;
-    background-color: rgba(255, 255, 255, 0.2);
+    background-color: var(--bg-2);
 }
 
 .user-element p,
@@ -1009,5 +1520,5 @@ canvas.video-stream {
 
 .user-info-delete,
 .role-info-delete {
-    background-color: red;
+    background-color: var(--error);
 }

@@ -431,9 +431,18 @@ impl StreamSurface {
     }
 
     /// Engage immersive mouse capture (M4 Phase B): register the raw
-    /// mouse for WM_INPUT on the child and focus it. The cursor clip is
-    /// re-asserted per frame via [`Self::clip_cursor_to_self`].
-    pub fn engage_mouse_capture(&mut self) {
+    /// mouse for WM_INPUT on the child, focus it, and install the
+    /// Keyboard Lock hook (Phase B2, `input.rs` — Win keys / Alt+Tab /
+    /// Ctrl+Alt+Shift+Q escape hatch; least-invasive signature change:
+    /// callers now pass the capture flag and input sender the hook
+    /// needs, since a `HOOKPROC` gets no user context of its own). The
+    /// cursor clip is re-asserted per frame via
+    /// [`Self::clip_cursor_to_self`].
+    pub fn engage_mouse_capture(
+        &mut self,
+        capture: Arc<crate::input::CaptureShared>,
+        sender: client_transport::session::InputSender,
+    ) {
         if self.capture {
             return;
         }
@@ -452,6 +461,7 @@ impl StreamSurface {
             }
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(self.hwnd));
         }
+        crate::input::install_keyboard_hook(capture, sender);
         self.capture = true;
     }
 
@@ -481,9 +491,13 @@ impl StreamSurface {
 const HID_PAGE_GENERIC: u16 = 0x01;
 const HID_USAGE_MOUSE: u16 = 0x02;
 
-/// Global immersive-capture teardown: deregister the raw mouse and
-/// unclip the cursor. Idempotent, and safe without a live surface (App
-/// reset paths run it after the surface is already gone).
+/// Global immersive-capture teardown: deregister the raw mouse, unclip
+/// the cursor, and uninstall the Keyboard Lock hook (Phase B2,
+/// `input.rs`). Idempotent, and safe without a live surface (App reset
+/// paths run it after the surface is already gone) — every release path
+/// (`StreamSurface::release_mouse_capture`, its `Drop`, and the
+/// session-teardown paths in `main.rs`) converges here, so the hook can
+/// never leak installed.
 pub fn release_mouse_capture_global() {
     use windows::Win32::UI::Input::{RAWINPUTDEVICE, RIDEV_REMOVE, RegisterRawInputDevices};
     use windows::Win32::UI::WindowsAndMessaging::ClipCursor;
@@ -497,6 +511,7 @@ pub fn release_mouse_capture_global() {
         let _ = RegisterRawInputDevices(&[rid], size_of::<RAWINPUTDEVICE>() as u32);
         let _ = ClipCursor(None);
     }
+    crate::input::uninstall_keyboard_hook();
 }
 
 impl Drop for StreamSurface {

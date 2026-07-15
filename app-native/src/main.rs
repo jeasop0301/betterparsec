@@ -771,8 +771,12 @@ impl eframe::App for App {
                                                 i.viewport().focused.unwrap_or(true),
                                             )
                                         });
-                                        for action in
-                                            self.immersive.on_tick(immersive_clicked, fs, focused)
+                                        let exit_requested = self.capture.take_exit_requested();
+                                        for action in self.immersive.on_tick(
+                                            immersive_clicked || exit_requested,
+                                            fs,
+                                            focused,
+                                        )
                                         {
                                             match action {
                                                 immersive::Action::SetFullscreen(on) => {
@@ -782,7 +786,10 @@ impl eframe::App for App {
                                                 }
                                                 immersive::Action::Engage => {
                                                     self.capture.set_relative(true);
-                                                    s.engage_mouse_capture();
+                                                    s.engage_mouse_capture(
+                                                        self.capture.clone(),
+                                                        run.session.input_sender(),
+                                                    );
                                                 }
                                                 immersive::Action::Release => {
                                                     self.capture.set_relative(false);

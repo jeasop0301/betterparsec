@@ -1,0 +1,262 @@
+diff --git a/src/config.cpp b/src/config.cpp
+index 46b546d1..ba9f9114 100644
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -461,6 +461,7 @@ namespace config {
+     {},  // capture_target (default: empty, will be set to "display" in apply_config)
+     {},  // window_title
+     true,  // capture_cursor (default: composite the host mouse cursor)
++    false,  // slice_aligned_fec (BetterParsec U3: default off — stock size-split FEC blocks)
+     (int) display_device::parsed_config_t::device_prep_e::no_operation,  // display_device_prep
+     (int) display_device::parsed_config_t::resolution_change_e::automatic,  // resolution_change
+     {},  // manual_resolution
+@@ -1341,6 +1342,10 @@ namespace config {
+     bool_f(vars, "capture_cursor", video.capture_cursor);
+     display_cursor = video.capture_cursor;
+ 
++    // BetterParsec U3: slice-aligned FEC blocks + multiFecFlags 0x20
++    // (docs/design/slice-qu-constraints.md §6 in the betterparsec repo).
++    bool_f(vars, "slice_aligned_fec", video.slice_aligned_fec);
++
+     // Downscaling quality: "fast" (bilinear+8pt average), "balanced" (bicubic), "high_quality" (future: lanczos)
+     string_f(vars, "downscaling_quality", video.downscaling_quality);
+     if (video.downscaling_quality.empty()) {
+diff --git a/src/config.h b/src/config.h
+index fe8dbdb7..5d2db7f6 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -122,6 +122,7 @@ namespace config {
+     std::string capture_target;  // "display" or "window" - determines whether to capture display or window
+     std::string window_title;     // Window title to capture when capture_target="window"
+     bool capture_cursor;          // Whether to composite the host mouse cursor into the stream (toggle: Ctrl+Alt+Shift+N)
++    bool slice_aligned_fec;       // BetterParsec U3: cut video FEC blocks at slice (VCL-NAL) boundaries and signal multiFecFlags 0x20 (slice-qu-constraints.md §6)
+     int display_device_prep;
+     int resolution_change;
+     std::string manual_resolution;
+diff --git a/src/stream.cpp b/src/stream.cpp
+index 36895775..2c71b636 100644
+--- a/src/stream.cpp
++++ b/src/stream.cpp
+@@ -1053,6 +1053,50 @@ namespace stream {
+     return result;
+   }
+ 
++  /**
++   * BetterParsec U3 (betterparsec docs/design/slice-qu-constraints.md §6):
++   * byte offsets where the 2nd..Nth VCL NALs start — the cut points for
++   * slice-aligned FEC blocks. Annex-B scan; each cut points at a `00 00 01`
++   * prefix, so a preceding zero of a 4-byte start code stays with the
++   * previous group as a legal trailing zero.
++   *
++   * videoFormat: 0 = H.264 (VCL nal_unit_type 1..5),
++   *              1 = HEVC (VCL nal_unit_type 0..31). AV1 is excluded by
++   * the caller (no slices on the wire).
++   */
++  std::vector<size_t>
++  vcl_slice_cut_points(const std::string_view &payload, int videoFormat) {
++    std::vector<size_t> cuts;
++    bool seen_first_vcl = false;
++    const auto *data = (const uint8_t *) payload.data();
++    const size_t size = payload.size();
++    size_t i = 0;
++    while (i + 3 < size) {
++      // Standard start-code scan: a byte > 1 at i+2 can't be part of a
++      // 00 00 01 prefix ending there or later than i+2.
++      if (data[i + 2] > 1) {
++        i += 3;
++        continue;
++      }
++      if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
++        const uint8_t nal = data[i + 3];
++        const bool vcl = videoFormat == 0 ?
++                           ((nal & 0x1F) >= 1 && (nal & 0x1F) <= 5) :
++                           (((nal >> 1) & 0x3F) < 32);
++        if (vcl) {
++          if (seen_first_vcl) {
++            cuts.push_back(i);
++          }
++          seen_first_vcl = true;
++        }
++        i += 3;
++        continue;
++      }
++      ++i;
++    }
++    return cuts;
++  }
++
+   std::vector<uint8_t>
+   replace(const std::string_view &original, const std::string_view &old, const std::string_view &_new) {
+     std::vector<uint8_t> replaced;
+@@ -2412,13 +2456,9 @@ namespace stream {
+ 
+       auto fecPercentage = config::stream.fec_percentage;
+ 
+-      // Insert space for packet headers
++      // Packet layout constants (used by both split strategies below).
+       auto blocksize = session->config.packetsize + MAX_RTP_HEADER_SIZE;
+       auto payload_blocksize = blocksize - sizeof(video_packet_raw_t);
+-      auto payload_new = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize,
+-        std::string_view { (char *) &frame_header, sizeof(frame_header) }, payload);
+-
+-      payload = std::string_view { (char *) payload_new.data(), payload_new.size() };
+ 
+       // There are 2 bits for FEC block count for a maximum of 4 FEC blocks
+       constexpr auto MAX_FEC_BLOCKS = 4;
+@@ -2432,47 +2472,114 @@ namespace stream {
+       // D = (255 * 100) / (100 + F)
+       auto max_data_shards_per_fec_block = (DATA_SHARDS_MAX * 100) / (100 + fecPercentage);
+ 
+-      // Compute the number of FEC blocks needed for this frame using the block size and max shards
+-      auto max_data_per_fec_block = max_data_shards_per_fec_block * blocksize;
+-      auto fec_blocks_needed = (payload.size() + (max_data_per_fec_block - 1)) / max_data_per_fec_block;
++      std::array<std::string_view, MAX_FEC_BLOCKS> fec_blocks;
++      size_t fec_blocks_needed = 0;
++
++      // BetterParsec U3 (betterparsec docs/design/slice-qu-constraints.md §6):
++      // when `slice_aligned_fec` is enabled and the encoded frame carries
++      // 2..4 slices (H.264/HEVC only), cut the FEC blocks at VCL-NAL
++      // boundaries instead of size-equal chunks and signal it with
++      // multiFecFlags 0x20. Each slice group is packetized independently,
++      // so a FEC-block end is also a decode-unit end on the client (a
++      // group's padded tail packet carries legal Annex-B trailing zeros).
++      // Any precondition failure falls back to the stock size-split path
++      // (byte-identical on the wire, no 0x20).
++      bool slice_aligned = false;
++      std::array<std::vector<uint8_t>, MAX_FEC_BLOCKS> slice_group_bufs;
++      const auto stock_last_payload_len = frame_header.lastPayloadLen;
++      if (config::video.slice_aligned_fec && fecPercentage > 0 &&
++          (session->config.monitor.videoFormat == 0 || session->config.monitor.videoFormat == 1)) {
++        auto cuts = vcl_slice_cut_points(payload, session->config.monitor.videoFormat);
++        const size_t groups = cuts.size() + 1;
++        if (groups >= 2 && groups <= MAX_FEC_BLOCKS) {
++          slice_aligned = true;
++
++          // The frame's true last packet now belongs to the last group,
++          // which carries no frame header — recompute the trim length the
++          // client uses for the final packet (stock formula, group-local).
++          const auto trim_modulus = session->config.packetsize - sizeof(NV_VIDEO_PACKET);
++          const size_t last_group_size = payload.size() - cuts.back();
++          frame_header.lastPayloadLen = last_group_size % trim_modulus;
++          if (frame_header.lastPayloadLen == 0) {
++            frame_header.lastPayloadLen = trim_modulus;
++          }
+ 
+-      // If the number of FEC blocks needed exceeds the protocol limit, turn off FEC for this frame.
+-      // For normal FEC percentages, this should only happen for enormous frames (over 800 packets at 20%).
+-      if (fec_blocks_needed > MAX_FEC_BLOCKS) {
+-        BOOST_LOG(warning) << "Skipping FEC for abnormally large encoded frame (needed "sv << fec_blocks_needed << " FEC blocks)"sv;
+-        fecPercentage = 0;
+-        fec_blocks_needed = MAX_FEC_BLOCKS;
++          size_t prev = 0;
++          for (size_t g = 0; g < groups && slice_aligned; ++g) {
++            const size_t end = (g < cuts.size()) ? cuts[g] : payload.size();
++            auto raw = payload.substr(prev, end - prev);
++            prev = end;
++            slice_group_bufs[g] = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize,
++              g == 0 ? std::string_view { (char *) &frame_header, sizeof(frame_header) } : std::string_view {},
++              raw);
++            fec_blocks[g] = std::string_view { (char *) slice_group_bufs[g].data(), slice_group_bufs[g].size() };
++
++            // Every group must fit one FEC block's shard budget.
++            const auto group_packets = (fec_blocks[g].size() + (blocksize - 1)) / blocksize;
++            if (group_packets == 0 || group_packets > (size_t) max_data_shards_per_fec_block) {
++              slice_aligned = false;
++            }
++          }
++          if (slice_aligned) {
++            fec_blocks_needed = groups;
++            BOOST_LOG(verbose) << "Generating "sv << fec_blocks_needed << " slice-aligned FEC blocks"sv;
++          }
++          else {
++            frame_header.lastPayloadLen = stock_last_payload_len;
++          }
++        }
+       }
+ 
+-      std::array<std::string_view, MAX_FEC_BLOCKS> fec_blocks;
+-      decltype(fec_blocks)::iterator
+-        fec_blocks_begin = std::begin(fec_blocks),
+-        fec_blocks_end = std::begin(fec_blocks) + fec_blocks_needed;
++      // Stock path: pack the whole frame once, then size-split.
++      std::vector<uint8_t> payload_new;
++      if (!slice_aligned) {
++        // Insert space for packet headers
++        payload_new = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize,
++          std::string_view { (char *) &frame_header, sizeof(frame_header) }, payload);
+ 
+-      BOOST_LOG(verbose) << "Generating "sv << fec_blocks_needed << " FEC blocks"sv;
++        payload = std::string_view { (char *) payload_new.data(), payload_new.size() };
+ 
+-      // Align individual FEC blocks to blocksize
+-      auto unaligned_size = payload.size() / fec_blocks_needed;
+-      auto aligned_size = ((unaligned_size + (blocksize - 1)) / blocksize) * blocksize;
++        // Compute the number of FEC blocks needed for this frame using the block size and max shards
++        auto max_data_per_fec_block = max_data_shards_per_fec_block * blocksize;
++        fec_blocks_needed = (payload.size() + (max_data_per_fec_block - 1)) / max_data_per_fec_block;
+ 
+-      // If we exceed the 10-bit FEC packet index (which means our frame exceeded 4096 packets),
+-      // the frame will be unrecoverable. Log an error for this case.
+-      if (aligned_size / blocksize >= 1024) {
+-        BOOST_LOG(error) << "Encoder produced a frame too large to send! Is the encoder broken? (needed "sv << (aligned_size / blocksize) << " packets)"sv;
+-      }
++        // If the number of FEC blocks needed exceeds the protocol limit, turn off FEC for this frame.
++        // For normal FEC percentages, this should only happen for enormous frames (over 800 packets at 20%).
++        if (fec_blocks_needed > MAX_FEC_BLOCKS) {
++          BOOST_LOG(warning) << "Skipping FEC for abnormally large encoded frame (needed "sv << fec_blocks_needed << " FEC blocks)"sv;
++          fecPercentage = 0;
++          fec_blocks_needed = MAX_FEC_BLOCKS;
++        }
++
++        BOOST_LOG(verbose) << "Generating "sv << fec_blocks_needed << " FEC blocks"sv;
++
++        // Align individual FEC blocks to blocksize
++        auto unaligned_size = payload.size() / fec_blocks_needed;
++        auto aligned_size = ((unaligned_size + (blocksize - 1)) / blocksize) * blocksize;
+ 
+-      // Split the data into aligned FEC blocks
+-      for (int x = 0; x < fec_blocks_needed; ++x) {
+-        if (x == fec_blocks_needed - 1) {
+-          // The last block must extend to the end of the payload
+-          fec_blocks[x] = payload.substr(x * aligned_size);
++        // If we exceed the 10-bit FEC packet index (which means our frame exceeded 4096 packets),
++        // the frame will be unrecoverable. Log an error for this case.
++        if (aligned_size / blocksize >= 1024) {
++          BOOST_LOG(error) << "Encoder produced a frame too large to send! Is the encoder broken? (needed "sv << (aligned_size / blocksize) << " packets)"sv;
+         }
+-        else {
+-          // Earlier blocks just extend to the next block offset
+-          fec_blocks[x] = payload.substr(x * aligned_size, aligned_size);
++
++        // Split the data into aligned FEC blocks
++        for (size_t x = 0; x < fec_blocks_needed; ++x) {
++          if (x == fec_blocks_needed - 1) {
++            // The last block must extend to the end of the payload
++            fec_blocks[x] = payload.substr(x * aligned_size);
++          }
++          else {
++            // Earlier blocks just extend to the next block offset
++            fec_blocks[x] = payload.substr(x * aligned_size, aligned_size);
++          }
+         }
+       }
+ 
++      decltype(fec_blocks)::iterator
++        fec_blocks_begin = std::begin(fec_blocks),
++        fec_blocks_end = std::begin(fec_blocks) + fec_blocks_needed;
++
+       try {
+         // Use around 80% of 1Gbps          1Gbps            percent    ms     packet      byte
+         size_t ratecontrol_packets_in_1ms = std::giga::num * 80 / 100 / 1000 / blocksize / 8;
+@@ -2503,8 +2610,9 @@ namespace stream {
+             inspect->packet.frameIndex = packet->frame_index();
+             inspect->packet.streamPacketIndex = ((uint32_t) lowseq + x) << 8;
+ 
+-            // Match multiFecFlags with Moonlight
+-            inspect->packet.multiFecFlags = 0x10;
++            // Match multiFecFlags with Moonlight; 0x20 = blocks are
++            // slice-aligned (BetterParsec U3, slice-qu-constraints.md §6).
++            inspect->packet.multiFecFlags = slice_aligned ? 0x30 : 0x10;
+             inspect->packet.multiFecBlocks = (blockIndex << 4) | ((fec_blocks_needed - 1) << 6);
+ 
+             inspect->packet.flags = FLAG_CONTAINS_PIC_DATA;

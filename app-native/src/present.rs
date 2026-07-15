@@ -646,6 +646,21 @@ impl StreamSurface {
         let ptr = Box::into_raw(Box::new(ctx));
         unsafe { SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, ptr as isize) };
         self.input = true;
+        // Korean/CJK IME: detach the client-side IME context from the
+        // stream child so the local IME never composes (Hangul, kana,
+        // pinyin). Raw Win32 VK key-downs then reach `input::translate`
+        // and go on the wire, letting the *host* IME compose — exactly
+        // what the web client gets by suppressing the browser IME.
+        // Without this the client IME swallows letter keys (WM_KEYDOWN
+        // arrives as VK_PROCESSKEY 0xE5) and the composed WM_CHAR text is
+        // dropped, so no Korean ever reaches the host. Moonlight/Parsec
+        // do the same (detach/disable IME for the stream window).
+        unsafe {
+            let _ = windows::Win32::UI::Input::Ime::ImmAssociateContext(
+                self.hwnd,
+                windows::Win32::UI::Input::Ime::HIMC::default(),
+            );
+        }
     }
 
     fn disable_input(&mut self) {

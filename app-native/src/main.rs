@@ -757,14 +757,27 @@ impl eframe::App for App {
                                         let dims = run.video.dims.load(Ordering::Relaxed);
                                         let (vw, vh) =
                                             ((dims >> 32) as f32, (dims & 0xffff_ffff) as f32);
+                                        // Immersive: the stream child covers
+                                        // the whole window (over the egui
+                                        // chrome) so the picture is truly
+                                        // fullscreen and the cursor clip spans
+                                        // the entire screen. Otherwise it is
+                                        // aspect-fit into the viewport rect
+                                        // below the chrome.
+                                        let target = if self.immersive.engaged() {
+                                            ctx.screen_rect()
+                                        } else {
+                                            rect
+                                        };
                                         let fit = if vw > 0.0 && vh > 0.0 {
-                                            let k = (rect.width() / vw).min(rect.height() / vh);
+                                            let k = (target.width() / vw)
+                                                .min(target.height() / vh);
                                             egui::Rect::from_center_size(
-                                                rect.center(),
+                                                target.center(),
                                                 egui::vec2(vw * k, vh * k),
                                             )
                                         } else {
-                                            rect
+                                            target
                                         };
                                         let ppp = ctx.pixels_per_point();
                                         s.set_rect(

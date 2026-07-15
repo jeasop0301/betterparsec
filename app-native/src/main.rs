@@ -785,7 +785,17 @@ impl eframe::App for App {
                                                     )
                                                 }
                                                 immersive::Action::Engage => {
-                                                    self.capture.set_relative(true);
+                                                    // Phase B2: seed the
+                                                    // initial mouse mode
+                                                    // from host cursor
+                                                    // authority rather
+                                                    // than always-relative.
+                                                    self.capture.set_relative(
+                                                        immersive::wants_relative_capture(
+                                                            true,
+                                                            run.session.cursor().visible(),
+                                                        ),
+                                                    );
                                                     s.engage_mouse_capture(
                                                         self.capture.clone(),
                                                         run.session.input_sender(),
@@ -798,7 +808,26 @@ impl eframe::App for App {
                                             }
                                         }
                                         if self.immersive.engaged() {
-                                            s.clip_cursor_to_self();
+                                            // Phase B2 host-authority
+                                            // auto-switch (Parsec/Moonlight
+                                            // parity): mirror the host's
+                                            // reported cursor visibility
+                                            // every frame — fullscreen and
+                                            // the keyboard hook stay
+                                            // engaged for the whole
+                                            // session, only the mouse
+                                            // relative flag + clip follow
+                                            // the host.
+                                            let want_rel = immersive::wants_relative_capture(
+                                                true,
+                                                run.session.cursor().visible(),
+                                            );
+                                            self.capture.set_relative(want_rel);
+                                            if want_rel {
+                                                s.clip_cursor_to_self();
+                                            } else {
+                                                s.release_cursor_clip();
+                                            }
                                         }
                                     }
                                     None => {}

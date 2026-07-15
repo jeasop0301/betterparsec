@@ -4,5 +4,6 @@
 //! Option-3 W1.
 
 pub mod fec;
+pub mod fec_ratio;
 pub mod fec_wire;
 pub mod video_rx;

@@ -9,9 +9,23 @@
 //! (RawInput relative deltas + `ClipCursor`, present.rs/input.rs).
 //!
 //! Phase B1 scope: immersive ⇒ relative capture, always (the gaming
-//! path). Host-authority auto switching inside immersive (CursorShared
-//! visibility, web `auto` parity) and the low-level keyboard hook
-//! (Win/Alt-Tab capture — the Keyboard Lock analog) are Phase B2.
+//! path). Phase B2 adds host-authority auto switching inside immersive
+//! ([`wants_relative_capture`], mirroring Parsec/Moonlight and the web
+//! `auto` mouse mode: relative capture follows whether the *host*
+//! cursor is currently hidden, not a fixed always-relative policy) and
+//! the low-level keyboard hook (Win/Alt-Tab capture — the Keyboard Lock
+//! analog).
+
+/// Host-authority mouse-mode decision (Phase B2; Parsec/Moonlight and
+/// web `auto` parity): while immersive is engaged, relative capture
+/// mirrors the *host's* reported cursor visibility — hidden means the
+/// host (game) has captured the pointer, so the client should too;
+/// visible means the host is showing a cursor (menu/desktop), so the
+/// client releases to absolute so its cursor tracks the host's exactly.
+/// Not engaged ⇒ never relative, regardless of host cursor state.
+pub fn wants_relative_capture(engaged: bool, host_cursor_visible: bool) -> bool {
+    engaged && !host_cursor_visible
+}
 
 /// Side effects the shell must execute, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,5 +234,23 @@ mod tests {
             vec![Action::Release, Action::SetFullscreen(false)]
         );
         assert!(!on.engaged());
+    }
+
+    #[test]
+    fn wants_relative_capture_follows_host_authority() {
+        // (engaged, host_cursor_visible) -> want_relative
+        let cases = [
+            (true, true, false),   // host shows a cursor: release to absolute
+            (true, false, true),   // host hides its cursor: relative capture
+            (false, true, false),  // not engaged: never relative
+            (false, false, false), // not engaged: never relative, even if hidden
+        ];
+        for (engaged, host_cursor_visible, want) in cases {
+            assert_eq!(
+                wants_relative_capture(engaged, host_cursor_visible),
+                want,
+                "engaged={engaged} host_cursor_visible={host_cursor_visible}"
+            );
+        }
     }
 }

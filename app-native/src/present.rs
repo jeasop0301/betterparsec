@@ -486,6 +486,17 @@ impl StreamSurface {
             }
         }
     }
+    /// Undo [`Self::clip_cursor_to_self`] (Phase B2 host-authority
+    /// auto-switch, `immersive::wants_relative_capture`): unclips the
+    /// cursor so it can move freely across the whole desktop again while
+    /// the host shows its own cursor. Idempotent and safe to call
+    /// whenever relative capture is not wanted, even if never clipped.
+    pub fn release_cursor_clip(&self) {
+        use windows::Win32::UI::WindowsAndMessaging::ClipCursor;
+        unsafe {
+            let _ = ClipCursor(None);
+        }
+    }
 }
 
 const HID_PAGE_GENERIC: u16 = 0x01;

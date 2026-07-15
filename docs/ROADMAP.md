@@ -172,9 +172,16 @@ U5/M6 스파이크, f1-ack 소스 확인+0x5509 호스트 패치.
    스모크 ① 부분 통과** (2026-07-15, owner): 픽셀 OK(d3d11va HW
    디코드 확인) · 조작 OK · **이중커서 확인** → 네이티브 로컬 커서
    숨김(WM_SETCURSOR) 즉시 구현·배포(현장 이슈 #2 항 참조) · 오디오
-   **미판정**(same-PC라 호스트 소리와 구분 불가 — 판정법: 볼륨 믹서
-   betterparsec 앱 미터 확인, 다음 세션 항목). 잔여 라이브 = ①오디오
-   판정 + 커서 단일화 확인, ②host 롤 — 임베디드 서버로 paired 접속
+   **렌더 실재 확인**(2026-07-15, owner: 볼륨 믹서 betterparsec 앱
+   미터 동작 목격) — 최종 청취 판정용으로 `BP_AUDIO_DEBUG_DELAY_MS`
+   옵트인 지연(무음 프리롤, 2s 클램프, +1 test) 추가: same-PC에서
+   스트림 사본이 에코로 들리므로 귀로 즉시 판정. **빌드 함정 기록**:
+   `cargo build -p app-native`는 기본 피처가 비어 있어 `--features
+   video` 누락 시 디코더 없는 exe가 나온다(세션·입력·오디오 채널은
+   정상 연결, 화면만 부재 — 2026-07-15 오전 재현·소요). 정식 커맨드 =
+   `cargo build --release -p app-native --features video`. 잔여 라이브
+   = ①오디오 청취 판정(delay 켜고) + 커서 단일화 확인, ②host 롤 —
+   임베디드 서버로 paired 접속
    (`BP_SUNSHINE_STAGE` 관리형 Sunshine은 이 머신에 Foundation
    스테이지 부재 확인(2026-07-15) — MSYS2 UCRT64 재빌드 세션에서) →
    다음 헤드리스 대형 항목: M4 `session-ux`(스톨 워치독 웹 배선 완료

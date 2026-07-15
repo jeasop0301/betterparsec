@@ -368,6 +368,13 @@ fn convert_into(
     }
 }
 
+/// Silence sample count for the opt-in `BP_AUDIO_DEBUG_DELAY_MS` playout
+/// delay (clamped to 2 s — anything longer is a footgun, not a verdict).
+fn debug_delay_samples(rate: u32, channels: u16, delay_ms: u64) -> usize {
+    let delay_ms = delay_ms.min(2_000);
+    (rate as u64 * delay_ms / 1_000) as usize * channels as usize
+}
+
 // ── Audio thread ───────────────────────────────────────────────────────────
 
 /// Audio thread body: drain the session's opus queue, decode, fill the
@@ -402,10 +409,29 @@ pub fn run(core: &RxCore, shared: &AudioShared, stopped: &AtomicBool) {
     // oldest (latency beats continuity for realtime audio).
     let mut fifo: VecDeque<f32> = VecDeque::new();
     let mut pcm: Vec<f32> = Vec::new();
-    let fifo_cap = out
+    let mut fifo_cap = out
         .as_ref()
         .map(|o| o.rate as usize / 4 * o.channels as usize)
         .unwrap_or(0);
+
+    // BP_AUDIO_DEBUG_DELAY_MS (opt-in, clamped to 2 s): constant playout
+    // delay for the same-PC audio verdict — the streamed copy becomes an
+    // audible echo behind the host's direct output, so "is remote audio
+    // really playing?" needs ears, not meter squinting. Implemented as
+    // silence prepended once before the first fill; the FIFO cap grows by
+    // the same amount so drop-oldest cannot erode the offset over time.
+    let delay_ms: u64 = std::env::var("BP_AUDIO_DEBUG_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if delay_ms > 0
+        && let Some(o) = out.as_ref()
+    {
+        let silence = debug_delay_samples(o.rate, o.channels, delay_ms);
+        fifo.extend(std::iter::repeat_n(0.0f32, silence));
+        fifo_cap += silence;
+        tracing::info!(delay_ms, samples = silence, "audio debug delay armed");
+    }
 
     loop {
         match core.wait_audio(Duration::from_millis(20)) {
@@ -452,6 +478,21 @@ mod tests {
     #[test]
     fn opus_decoder_initializes() {
         OpusDecoder::new().expect("libavcodec has the built-in opus decoder");
+    }
+
+    /// Pins the delay→samples math (truncation order) and the 2 s clamp.
+    #[test]
+    fn debug_delay_samples_math_and_clamp() {
+        // 300 ms @ 48 kHz stereo = 14400 frames * 2 channels.
+        assert_eq!(debug_delay_samples(48_000, 2, 300), 28_800);
+        // Truncates sub-millisecond remainders per the u64 division.
+        assert_eq!(debug_delay_samples(44_100, 2, 1), 88);
+        // Clamp: 10 s request behaves as 2 s.
+        assert_eq!(
+            debug_delay_samples(48_000, 2, 10_000),
+            debug_delay_samples(48_000, 2, 2_000)
+        );
+        assert_eq!(debug_delay_samples(48_000, 2, 0), 0);
     }
 
     /// Encode a sine with libavcodec's opus encoder (libopus, or the

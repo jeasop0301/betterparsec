@@ -113,6 +113,11 @@ const FALLBACK_RECONNECT_DELAY_MS = 500
 // M4 stall watchdog tick period. The ladder escalates at most one rung per
 // tick; thresholds live in session_ux.ts DEFAULT_WATCHDOG_CONFIG.
 const WATCHDOG_TICK_MS = 250
+// Recovery restart retry: a fresh session must reach videoReady within
+// this window or the restart is retried, up to the attempt cap (reset on
+// every successful videoReady).
+const RESTART_RETRY_WINDOW_MS = 15000
+const RESTART_MAX_ATTEMPTS = 5
 
 export class Stream implements Component {
     private logger: Logger = new Logger()
@@ -285,6 +290,11 @@ export class Stream implements Component {
         }
 
         this.hasDispatchedVideoReady = true
+        // Recovery landed: the session is healthy again — reset the
+        // restart-retry machinery (field report 2026-07-15: a reconnect
+        // onto a dead session used to stick forever).
+        this.restartAttempts = 0
+        this.clearRestartRetry()
         const event: InfoEvent = new CustomEvent("stream-info", {
             detail: { type: "videoReady" }
         })
@@ -477,6 +487,14 @@ export class Stream implements Component {
     private async restartSessionWithFreshWs(): Promise<void> {
         this.stopWatchdog()
         this.resetVideoReadyState()
+        // Field report 2026-07-15 (immersive stall x2, F5 needed): the
+        // ladder's reconnect was one-shot — if the fresh session never
+        // reached videoReady (dead streamer handoff, flaky WAN), nothing
+        // ever retried. Arm a bounded retry: no videoReady within the
+        // window → restart again, up to RESTART_MAX_ATTEMPTS, then a
+        // fatal message (same bug family as the "fallback needs a
+        // refresh" report — this retries the fallback path too).
+        this.armRestartRetry()
 
         if (this.transport) {
             await this.transport.close()
@@ -501,6 +519,41 @@ export class Stream implements Component {
 
         this.ws = this.createControlWebSocket()
         this.sendInitMessage()
+    }
+
+    // ── Recovery retry (bounded) ────────────────────────────────────────────
+
+    private restartAttempts = 0
+    private restartRetryTimer: number | null = null
+
+    private clearRestartRetry() {
+        if (this.restartRetryTimer != null) {
+            window.clearTimeout(this.restartRetryTimer)
+            this.restartRetryTimer = null
+        }
+    }
+    private armRestartRetry() {
+        this.clearRestartRetry()
+        this.restartAttempts += 1
+        if (this.restartAttempts > RESTART_MAX_ATTEMPTS) {
+            this.debugLog(
+                `Recovery gave up after ${RESTART_MAX_ATTEMPTS} restart attempts — reload the page`,
+                { type: "fatalDescription" },
+            )
+            return
+        }
+        const attempt = this.restartAttempts
+        this.restartRetryTimer = window.setTimeout(() => {
+            this.restartRetryTimer = null
+            if (this.hasDispatchedVideoReady) {
+                return // healthy — videoReady also reset the counter
+            }
+            this.debugLog(
+                `Restart attempt ${attempt} did not reach videoReady within ${RESTART_RETRY_WINDOW_MS}ms — retrying`,
+                { type: "ifErrorDescription" },
+            )
+            void this.restartSessionWithFreshWs()
+        }, RESTART_RETRY_WINDOW_MS)
     }
 
     // ── M4 stall watchdog wiring (field issue #1) ──────────────────────────

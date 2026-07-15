@@ -360,6 +360,9 @@ export class WebRTCTransport implements Transport {
     }
 
     private audioTrackHolder: TrackHolder = { ontrack: null, track: null }
+    // Audio playout latency truth (field report 2026-07-15): kept for
+    // receiver-scoped jitter-buffer stats in getStats().
+    private audioReceiver: RTCRtpReceiver | null = null
 
     private onTrack(event: RTCTrackEvent) {
         const track = event.track
@@ -387,6 +390,7 @@ export class WebRTCTransport implements Transport {
             }
             this.videoTrackHolder.ontrack()
         } else if (track.kind == "audio") {
+            this.audioReceiver = receiver
             this.audioTrackHolder.track = track
             if (!this.audioTrackHolder.ontrack) {
                 throw "No audio track listener registered!"
@@ -744,6 +748,50 @@ export class WebRTCTransport implements Transport {
                 )
                 if (interval) {
                     statsData.webrtcRtpHeaderReceiveBitrateKbps = interval.delta * 8 / interval.elapsedMs
+                }
+            }
+        }
+
+        // Audio jitter-buffer truth (field report 2026-07-15: audible audio
+        // delay over WAN): NetEQ grows the playout buffer under jitter and
+        // only shrinks it slowly — surface the average per-sample buffer
+        // delay + target so the overlay quantifies the drift instead of
+        // guessing. Receiver-scoped, so the video loop above never sees
+        // these dictionaries.
+        if (this.audioReceiver) {
+            const audioStats = await this.audioReceiver.getStats()
+            for (const [key, value] of audioStats.entries()) {
+                if (value.type != "inbound-rtp") {
+                    continue
+                }
+                const statsId = typeof value.id == "string" ? value.id : key
+                const timestampMs = value.timestamp
+                const audioEmitted = value.jitterBufferEmittedCount
+                if (
+                    typeof timestampMs != "number" ||
+                    !Number.isFinite(timestampMs) ||
+                    typeof audioEmitted != "number"
+                ) {
+                    continue
+                }
+                const audioJitterMetrics = [
+                    ["jitterBufferDelay", "audioJitterBufferDelayMs"],
+                    ["jitterBufferTargetDelay", "audioJitterBufferTargetDelayMs"],
+                ] as const
+                for (const [metric, destination] of audioJitterMetrics) {
+                    const totalSeconds = value[metric]
+                    if (typeof totalSeconds == "number") {
+                        const averageMs = this.sampleAverageMilliseconds(
+                            statsId,
+                            metric,
+                            totalSeconds,
+                            audioEmitted,
+                            timestampMs,
+                        )
+                        if (averageMs != null) {
+                            statsData[destination] = averageMs
+                        }
+                    }
                 }
             }
         }

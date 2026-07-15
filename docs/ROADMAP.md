@@ -67,6 +67,17 @@ Tetrys FEC · 서브프레임 슬라이스 · QU · 네이티브 클라이언트
    host processing latency 보통 ≤3ms(우수), streamer→browser RTT는
    출렁이며 피크 60ms대(인천↔호스트 WAN — bufferbloat/무선 구간 의심,
    Gate B 상관 계측 대상. CC가 이 출렁임을 먹고 사는 신호다).
+   **현장 이슈 2건 추가(2026-07-15 밤, 유튜브 시청 세션)**: ⑴ **오디오
+   지연 체감** — 원인 미확정(NetEQ 지터버퍼 성장 가설: WAN 지터에서
+   버퍼가 크고 느리게만 수축). 대응 = 오디오 리시버 지터버퍼
+   지연/타깃을 stats 오버레이에 노출(`audioJitterBufferDelayMs` 등,
+   receiver-scoped getStats 별도 조회) — 다음 세션에서 지연 체감 시
+   오버레이 수치로 판정. ⑵ **immersive 중 스톨 2회 + 복구 실패, F5
+   필요** — 원인: 워치독 사다리의 reconnect가 **원샷**이라 새 세션이
+   videoReady에 못 닿으면 영구 정지("폴백 첫 시도 실패"와 동일 버그
+   패밀리). 수정 = 재시작 후 15s 내 videoReady 미도달 시 자동
+   재시도(최대 5회, videoReady 시 카운터 리셋, 소진 시 fatal 안내) —
+   폴백 경로에도 동일 적용.
 
 ### 경쟁사 갭 감사 (2026-07-15 — "불가/저기대/스터글" 항목 vs Parsec·DCV·GFN 실물)
 

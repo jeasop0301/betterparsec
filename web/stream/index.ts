@@ -6,7 +6,7 @@ import { Settings, TransportType } from "../component/settings_menu.js"
 import { AudioPlayer } from "./audio/index.js"
 import { buildAudioPipeline } from "./audio/pipeline.js"
 import { BIG_BUFFER, ByteBuffer } from "./buffer.js"
-import { defaultStreamInputConfig, StreamInput } from "./input.js"
+import { defaultStreamInputConfig, MouseMode, StreamInput } from "./input.js"
 import { CursorAutoAction, CursorAutoMode } from "./cursor_auto.js"
 import { parseCursorMessage } from "./cursor_wire.js"
 import { Logger, LogMessageInfo } from "./log.js"
@@ -125,6 +125,14 @@ export class Stream implements Component {
     // behavior change otherwise). Recreated in createVideoRenderer() so it
     // survives transport restarts, matching the FEC/QU wiring pattern.
     private cursorAutoMode: CursorAutoMode | null = null
+    // M4 auto-runtime (mid-session mouseMode switch): tracks the physical
+    // RTCDataChannel a 'message' listener has been attached to. setOnCursorChannel
+    // re-registration is harmless (it just overwrites the transport's stash
+    // callback), but a second addEventListener on the SAME channel would
+    // double-fire cursorAutoMode.onVisibility — this guards setCursorAutoEnabled()
+    // against that when it's called repeatedly at runtime (enable/disable/
+    // re-enable) against a still-live transport.
+    private cursorChannelWired: RTCDataChannel | null = null
 
     private input: StreamInput
     private stats: StreamStats
@@ -522,6 +530,87 @@ export class Stream implements Component {
             return
         }
         this.emitCursorAutoState(action.type === 'lock')
+    }
+    // M4 auto-runtime (field report: picking "auto" mid-session did nothing):
+    // enable/disable the host-authority auto mouse mode wiring at runtime,
+    // not just at pipeline creation. createVideoRenderer() calls this with
+    // the startup value; onMouseModeChanged() calls it again on every
+    // runtime mouseMode switch.
+    private setCursorAutoEnabled(enabled: boolean) {
+        if (!enabled) {
+            if (!this.cursorAutoMode) {
+                // Already disabled (or never enabled) — nothing to reset, and
+                // no spurious emit for non-auto sessions (#5: no behavior
+                // change otherwise).
+                return
+            }
+            this.cursorAutoMode = null
+            // Reset StreamInput/ViewerApp to the non-auto baseline: cursor:none
+            // off, autoLocked false. The cursor channel's 'message' listener
+            // (if attached — see cursorChannelWired) stays registered; it just
+            // becomes a no-op since it routes through this.cursorAutoMode,
+            // which is now null.
+            this.emitCursorAutoState(false)
+            return
+        }
+
+        if (!(this.transport instanceof WebRTCTransport)) {
+            return
+        }
+
+        const cursorTransport = this.transport
+        // Re-created on every enable (startup or runtime) so it always starts
+        // back in the default unlocked (follow) state instead of carrying
+        // over stale lock state from a prior enable/disable cycle.
+        const cursorAutoMode = new CursorAutoMode()
+        this.cursorAutoMode = cursorAutoMode
+
+        // Seed the UI/input with the initial (unlocked/follow) state: the
+        // host only sends POS on change, so nothing else would ever emit
+        // this baseline if the host cursor stays visible the whole session.
+        this.emitCursorAutoState(cursorAutoMode.locked)
+
+        // setOnCursorChannel's stash callback fires immediately if the
+        // channel already arrived (see webrtc.ts) — this is what makes
+        // enabling mid-session (after the channel is already live) work.
+        // Re-registering here on every enable is harmless: the transport
+        // only ever keeps the latest callback.
+        cursorTransport.setOnCursorChannel((cursorCh: RTCDataChannel) => {
+            if (this.cursorChannelWired === cursorCh) {
+                // Already listening on this physical channel from a prior
+                // enable — attaching a second 'message' listener would
+                // double-fire cursorAutoMode.onVisibility per host sample.
+                return
+            }
+            this.cursorChannelWired = cursorCh
+
+            cursorCh.addEventListener('message', (ev: MessageEvent) => {
+                // Read the field (not the `cursorAutoMode` closed over above)
+                // so a machine swapped in by a later disable/re-enable cycle
+                // takes over immediately without needing its own listener.
+                const activeCursorAutoMode = this.cursorAutoMode
+                if (!activeCursorAutoMode) {
+                    return
+                }
+                const buf: ArrayBuffer = ev.data instanceof ArrayBuffer
+                    ? ev.data : ev.data.buffer
+                const msg = parseCursorMessage(buf)
+                if (msg) {
+                    this.applyCursorAutoAction(activeCursorAutoMode.onVisibility(msg.visible, performance.now()))
+                }
+            })
+        })
+    }
+    // M4 auto-runtime: call when mouseMode changes at runtime (e.g. the
+    // sidebar mouse-mode selector) so the cursor-channel wiring engages or
+    // disengages immediately instead of only at the next pipeline creation
+    // (field report: picking "auto" mid-session used to do nothing because
+    // the wiring was gated on settings.mouseMode read once in
+    // createVideoRenderer). Persists the choice onto settings so a later
+    // transport restart/reconnect also honors it.
+    onMouseModeChanged(mode: MouseMode) {
+        this.settings.mouseMode = mode
+        this.setCursorAutoEnabled(mode === "auto")
     }
     private runWatchdogActions(actions: WatchdogAction[]) {
         for (const action of actions) {
@@ -1000,33 +1089,11 @@ export class Stream implements Component {
                 this.debugLog('enableVideoQu=true but renderer element not found in divElement; overlay skipped', { type: 'ifErrorDescription' })
             }
         }
-        // ── M4 cursor P1: host-authority auto mouse mode ────────────────────────
-        // When mouseMode == "auto" and a WebRTC transport is active, drive a
-        // CursorAutoMode instance off the `cursor` DataChannel (visibility
-        // samples) and off the watchdog tick (hysteresis commits). Re-created
-        // per call so a transport restart starts back in the default unlocked
-        // (follow) state instead of carrying stale lock state across sessions.
-        if (this.settings.mouseMode === "auto" && this.transport instanceof WebRTCTransport) {
-            const cursorTransport = this.transport
-            const cursorAutoMode = new CursorAutoMode()
-            this.cursorAutoMode = cursorAutoMode
-
-            // Seed the UI/input with the initial (unlocked/follow) state: the
-            // host only sends POS on change, so nothing else would ever emit
-            // this baseline if the host cursor stays visible the whole session.
-            this.emitCursorAutoState(cursorAutoMode.locked)
-
-            cursorTransport.setOnCursorChannel((cursorCh: RTCDataChannel) => {
-                cursorCh.addEventListener('message', (ev: MessageEvent) => {
-                    const buf: ArrayBuffer = ev.data instanceof ArrayBuffer
-                        ? ev.data : ev.data.buffer
-                    const msg = parseCursorMessage(buf)
-                    if (msg) {
-                        this.applyCursorAutoAction(cursorAutoMode.onVisibility(msg.visible, performance.now()))
-                    }
-                })
-            })
-        }
+        // M4 auto-runtime: startup gate — mid-session mouseMode switches go
+        // through onMouseModeChanged() -> setCursorAutoEnabled() instead, so
+        // picking "auto" mid-session (previously a no-op) takes effect
+        // immediately rather than only on the next createVideoRenderer() call.
+        this.setCursorAutoEnabled(this.settings.mouseMode === "auto")
 
         return pipelineCodecSupport
     }

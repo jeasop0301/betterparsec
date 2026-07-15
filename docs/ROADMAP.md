@@ -393,10 +393,20 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   3면 락스텝 + `CursorShared` atomic readback, x/y u64 패킹) + 세션
   cursor 채널 스태시 — immersive(Phase B) 기반. 검증: tsc + 웹 32
   tests(cursor_resolve 3 포함), client-transport 46, clippy·fmt 클린,
-  streamer.exe·static/ 배포 세트 갱신. 잔여 = 라이브: auto 모드로 FPS
-  게임 lock/메뉴 unlock 실동작 → [ ] **P2** 모양 채널 zero-latency 커서
-- [ ] **immersive 모드** — 전체화면 + pointer lock + Keyboard Lock 일괄
-  토글 (cursor P1 클라 상태머신에 배선)
+  streamer.exe·static/ 배포 세트 갱신. **런타임 전환 지원** (2026-07-15,
+  현장 리포트 "세션 중 auto 선택 무반응" 대응): 사이드바 선택기에 auto
+  추가 + `Stream.onMouseModeChanged` → `setCursorAutoEnabled`(채널
+  리스너 dedup — 물리 채널당 1회, 머신은 필드 경유라 스왑 즉시 반영;
+  전환이 settings에 반영돼 재접속에도 유지). 잔여 = 라이브: auto 모드로
+  FPS 게임 lock/메뉴 unlock 실동작 → [ ] **P2** 모양 채널 zero-latency
+  커서
+- [~] **immersive 모드** — 전체화면 + pointer lock + Keyboard Lock 일괄
+  토글. **웹 완성** (2026-07-15, 헤드리스 검증): 사이드바 Immersive
+  버튼 — 진입 = fullscreen 확인 후 keyboard.lock(가드) +
+  `wantsPointerLock`(relative 또는 auto+wantsLock, DOM-free 헬퍼 +3
+  tests) 시 pointer lock; 이탈 = 버튼/fullscreen 상실/lock 상실 3경로가
+  동일 teardown으로 수렴(키보드 unlock 누수 없음). 잔여 = 라이브 확인 +
+  네이티브 셸 immersive(RawInput, Phase B)
 - [ ] 보안 감사(ARCHITECTURE §보안 6항: 서명·짧은토큰·상수시간·replay·안전인코딩·revocation)
 - [ ] 입력(Gamepad/Keyboard Lock) secure-context 동작, 오디오, 재접속 안정성
 - [ ] upstream 병합 전략 정리

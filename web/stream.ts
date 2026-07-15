@@ -15,6 +15,7 @@ import { streamStatsToText } from "./stream/stats.js";
 import { adoptRoleDefaultLanguage, getCurrentLanguage, getTranslations, Language, normalizeLanguage} from "./i18n.js";
 import { requestKeyboardLock } from "./iframe.js";
 import { download } from "./util.js";
+import { wantsPointerLock } from "./stream/immersive_lock.js"
 
 let I = getTranslations(getCurrentLanguage())
 
@@ -165,6 +166,11 @@ class ViewerApp implements Component {
     private hasShownFullscreenEscapeWarning = false
     private keyboardViewportBaselineHeight: number | null = null
     private streamVideoTopOffsetPx: number = 0
+    // M4 immersive mode (unified-app-architecture.md D-list): fullscreen +
+    // pointer lock + (web) Keyboard Lock bundled behind one toggle, distinct
+    // from the plain "Fullscreen" sidebar button/Ctrl+Shift+I keybind above
+    // (both left behavior-identical — see toggleImmersive()/exitImmersive()).
+    private immersive = false
 
     constructor(api: Api, hostId: number, appId: number, bootstrapRole: DetailedRole, options?: Partial<Settings>) {
         this.api = api
@@ -479,8 +485,9 @@ class ViewerApp implements Component {
         // press on the gesture that re-acquires the lock. "auto" mode never
         // rewrites inputConfig.mouseMode (see requestPointerLock), so it needs
         // its own check against the last cursorAutoMode InfoEvent.
-        const wantsLockNow = this.inputConfig.mouseMode == "relative"
-            || (this.inputConfig.mouseMode == "auto" && this.autoModeWantsLock)
+        // M4 immersive mode: shared with toggleImmersive() via the DOM-free
+        // wantsPointerLock() helper (web/stream/immersive_lock.ts).
+        const wantsLockNow = wantsPointerLock(this.inputConfig.mouseMode, this.autoModeWantsLock)
         if (wantsLockNow && !document.pointerLockElement) {
             this.requestPointerLock().catch((error) => {
                 console.warn("Pointer lock re-arm failed", error)
@@ -692,12 +699,83 @@ class ViewerApp implements Component {
             if (this.autoEnterFullscreenOnStart && !manualExit) {
                 this.armFullscreenOnNextInteraction()
             }
+
+            // M4 immersive mode: fullscreen can be left through paths outside
+            // our own toggle (Keyboard Lock does not capture every exit route
+            // on every browser/OS). Treat any exit while immersive as an
+            // immersive exit so Keyboard Lock doesn't outlive fullscreen.
+            void this.endImmersiveKeyboardLock()
         }
 
         this.checkFullyImmersed()
     }
     markManualFullscreenExitRequested() {
         this.manualFullscreenExitRequested = true
+    }
+    // M4 immersive mode (unified-app-architecture.md D-list): fullscreen +
+    // pointer lock + Keyboard Lock as one toggle. Distinct from the plain
+    // "Fullscreen" button/Ctrl+Shift+I keybind, which stay untouched — those
+    // still enter bare fullscreen (requestFullscreen() already opportunistically
+    // requests Keyboard Lock for every fullscreen entry via the iframe-aware
+    // requestKeyboardLock() helper, and pointer-locks only for literal
+    // "relative" mouseMode; immersive additionally covers the "auto"+
+    // autoModeWantsLock case below).
+    isImmersive(): boolean {
+        return this.immersive
+    }
+    async toggleImmersive() {
+        if (this.immersive) {
+            await this.exitImmersive()
+            return
+        }
+
+        await this.requestFullscreen()
+        if (!this.isFullscreen()) {
+            // Browser refused fullscreen (unsupported, or requestFullscreen()
+            // already surfaced a message) — do not claim immersive mode over
+            // a fullscreen request that didn't take effect.
+            return
+        }
+        this.immersive = true
+
+        // Defensive re-affirmation: requestFullscreen() above already
+        // requests Keyboard Lock as a side effect, but not every browser
+        // implements the Keyboard Lock API at all, so this must never throw
+        // past the toggle.
+        try {
+            await navigator.keyboard?.lock?.()
+        } catch (e) {
+            console.debug("Keyboard lock failed while entering immersive mode", e)
+        }
+
+        if (wantsPointerLock(this.inputConfig.mouseMode, this.autoModeWantsLock)) {
+            await this.requestPointerLock()
+        }
+    }
+    private async exitImmersive() {
+        await this.endImmersiveKeyboardLock()
+        await this.exitPointerLock()
+
+        if (this.isFullscreen()) {
+            this.markManualFullscreenExitRequested()
+            await this.exitFullscreen()
+        }
+    }
+    // Shared teardown for every immersive exit path: the manual toggle
+    // above, onFullscreenChange() when fullscreen is left through a route
+    // outside our own toggle (e.g. an OS-level exit), and the
+    // onPointerLockChange() fallback below. Always clears the flag and
+    // releases Keyboard Lock; a no-op when not currently immersive.
+    private async endImmersiveKeyboardLock() {
+        if (!this.immersive) {
+            return
+        }
+        this.immersive = false
+        try {
+            await navigator.keyboard?.unlock?.()
+        } catch (e) {
+            console.debug("Keyboard unlock failed while exiting immersive mode", e)
+        }
     }
 
     // Pointer Lock
@@ -774,6 +852,18 @@ class ViewerApp implements Component {
         if (!document.pointerLockElement) {
             this.inputConfig.mouseMode = this.previousMouseMode
             this.setInputConfig(this.inputConfig)
+
+            // M4 immersive mode: while immersive, Escape is captured by
+            // Keyboard Lock and does not reach the browser chrome (see
+            // toggleImmersive()) — the sidebar "Immersive" button and
+            // OS-level paths (Ctrl+Alt+Del, Alt+Tab, task switch) are the
+            // intended exits. This is a long-press-Escape-style fallback for
+            // the case where pointer lock is dropped through some other
+            // route (e.g. focus loss) that also already left fullscreen:
+            // don't strand the immersive flag/Keyboard Lock.
+            if (!this.isFullscreen()) {
+                void this.endImmersiveKeyboardLock()
+            }
         }
     }
 
@@ -1089,6 +1179,8 @@ class ViewerSidebar implements Component, Sidebar {
 
     private lockMouseButton = document.createElement("button")
     private fullscreenButton = document.createElement("button")
+    // M4 immersive mode: fullscreen + pointer lock + Keyboard Lock as one toggle.
+    private immersiveButton = document.createElement("button")
 
     private statsButton = document.createElement("button")
     private exportBenchmarkButton = document.createElement("button")
@@ -1164,6 +1256,16 @@ class ViewerSidebar implements Component, Sidebar {
             }
         })
         this.buttonDiv.appendChild(this.fullscreenButton)
+        // M4 immersive mode (unified-app-architecture.md D-list): fullscreen
+        // + pointer lock + Keyboard Lock as one toggle, next to the plain
+        // Fullscreen button. No translation key yet — literal label matches
+        // the "auto (host-controlled)" mouse-mode option's convention for
+        // untranslated technical labels.
+        this.immersiveButton.innerText = "Immersive"
+        this.immersiveButton.addEventListener("click", async () => {
+            await this.app.toggleImmersive()
+        })
+        this.buttonDiv.appendChild(this.immersiveButton)
 
         // Stats
         this.statsButton.innerText = I.stream.stats
@@ -1213,7 +1315,13 @@ class ViewerSidebar implements Component, Sidebar {
             { value: "relative", name: I.stream.relative },
             { value: "follow", name: I.stream.follow },
             { value: "localCursor", name: I.stream.localCursor },
-            { value: "pointAndDrag", name: I.stream.pointAndDrag }
+            { value: "pointAndDrag", name: I.stream.pointAndDrag },
+            // M4 auto-runtime: host-authority auto mode, now switchable
+            // mid-session (previously startup-only via settings_menu.ts,
+            // which already carries this same option/label). No translation
+            // key yet — literal label matches that selector's existing
+            // untranslated-technical-label convention.
+            { value: "auto", name: "auto (host-controlled)" }
         ], {
             displayName: I.stream.mouseMode,
             preSelectedOption: this.app.getInputConfig().mouseMode
@@ -1265,8 +1373,25 @@ class ViewerSidebar implements Component, Sidebar {
     // -- Mouse Mode
     private onMouseModeChange() {
         const config = this.app.getInputConfig()
-        config.mouseMode = this.mouseMode.getValue() as any
+        const previousMode = config.mouseMode
+        const newMode = this.mouseMode.getValue() as MouseMode
+        config.mouseMode = newMode
         this.app.setInputConfig(config)
+
+        // M4 auto-runtime: the cursor-channel wiring used to only engage at
+        // pipeline creation (settings.mouseMode read once), so picking
+        // "auto" mid-session was a no-op until the next reconnect (field
+        // report). Route every runtime switch through Stream.onMouseModeChanged
+        // so it takes effect immediately.
+        this.app.getStream()?.onMouseModeChanged(newMode)
+
+        // Leaving "auto" while pointer-locked: onCursorAutoMode is no longer
+        // driving the lock for this session (mouseMode isn't "auto"
+        // anymore), so nothing else would release it — exit explicitly
+        // rather than stranding the lock under a mode that no longer wants it.
+        if (previousMode === "auto" && newMode !== "auto" && document.pointerLockElement) {
+            void this.app.exitPointerLock()
+        }
     }
 
     // -- Touch Mode

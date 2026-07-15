@@ -8,9 +8,13 @@
 //! so keyboard translation is a passthrough).
 //!
 //! A2 scope: absolute mouse (position scaled to the stream reference),
-//! buttons with drag capture, high-res wheel, keyboard. Relative mouse
-//! (RawInput + cursor lock) arrives with the `session-ux` immersive
-//! state machine (M4/Phase B).
+//! buttons with drag capture, high-res wheel, keyboard. The local
+//! cursor is hidden over the stream area (WM_SETCURSOR → SetCursor
+//! NULL): Sunshine blends the host cursor into the video whenever it
+//! is visible, so showing the local arrow too produces a double cursor
+//! (field issue #2; cursor-channel.md P1 "cursor:none over video").
+//! Relative mouse (RawInput + cursor lock) arrives with the
+//! `session-ux` immersive state machine (M4/Phase B).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -26,9 +30,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    GetClientRect, HTCLIENT, SetCursor, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use crate::VideoShared;
@@ -56,6 +60,13 @@ fn lo_i16(v: isize) -> i32 {
 
 fn hi_i16(v: isize) -> i16 {
     ((v >> 16) & 0xFFFF) as u16 as i16
+}
+
+/// WM_SETCURSOR policy (pure, unit-tested): hide the local cursor only
+/// over the client area — non-client hits (borders of a future
+/// top-level stream window) keep the system cursor.
+fn setcursor_hides(lparam: isize) -> bool {
+    (lparam as usize & 0xFFFF) as u32 == HTCLIENT
 }
 
 /// Pure Win32-message → wire-packet translation (unit-tested headless).
@@ -151,6 +162,15 @@ fn current_modifiers() -> KeyModifiers {
 /// thread). `Some(_)` = handled (message consumed — also suppresses the
 /// Alt/F10 system-menu default for SYSKEY messages).
 pub fn handle(ctx: &InputCtx, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    // Single-cursor: the host cursor lives in the video (module doc).
+    if msg == WM_SETCURSOR {
+        if !setcursor_hides(lparam.0) {
+            return None; // DefWindowProc → normal system cursor
+        }
+        unsafe { SetCursor(None) };
+        return Some(LRESULT(1)); // TRUE: cursor handled, no arrow reset
+    }
+
     // Focus and drag-capture side effects first.
     match msg {
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => unsafe {
@@ -299,5 +319,16 @@ mod tests {
     #[test]
     fn unrelated_messages_are_ignored() {
         assert!(translate(0x0083 /* WM_NCCALCSIZE */, 0, 0, VP, KeyModifiers::empty()).is_none());
+    }
+
+    #[test]
+    fn setcursor_hides_only_client_area() {
+        use windows::Win32::UI::WindowsAndMessaging::{HTBORDER, HTCAPTION};
+        // WM_SETCURSOR lparam: low word = hit-test code.
+        assert!(setcursor_hides(HTCLIENT as isize));
+        assert!(!setcursor_hides(HTCAPTION as isize));
+        assert!(!setcursor_hides(HTBORDER as isize));
+        // High word (trigger message) must not affect the decision.
+        assert!(setcursor_hides(((0x0200_isize) << 16) | HTCLIENT as isize));
     }
 }

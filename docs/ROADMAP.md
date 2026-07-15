@@ -42,10 +42,14 @@ Tetrys FEC · 서브프레임 슬라이스 · QU · 네이티브 클라이언트
 2. **커서 미해결 + immersive 모드** — 설계는 완료
    (docs/design/cursor-channel.md: Parsec=모양 채널+클라 렌더,
    DCV=호스트 권위 자동 lock/unlock. P1=`cursor` DataChannel 자동 모드
-   전환, P2=모양 채널 zero-latency 커서). 구현 착수 필요. 추가로
-   **immersive 모드**(전체화면 + pointer lock + Keyboard Lock
-   Win/Alt-Tab 캡처 일괄 토글) 요구 — cursor P1과 같은 클라 상태머신에
-   함께 배선.
+   전환, P2=모양 채널 zero-latency 커서). **네이티브 클라 소형 레버 완료**
+   (2026-07-15): 스트림 자식 HWND `WM_SETCURSOR`→`SetCursor(NULL)`로
+   로컬 커서 숨김 — Sunshine이 visible 커서를 영상에 구워주므로
+   데스크톱 이중커서 해소(P1의 "video 영역 cursor:none" 등가물,
+   app-native 23 tests). 웹 P1(`cursor` 채널 + auto lock/unlock)은
+   구현 착수 필요. 추가로 **immersive 모드**(전체화면 + pointer lock +
+   Keyboard Lock Win/Alt-Tab 캡처 일괄 토글) 요구 — cursor P1과 같은
+   클라 상태머신에 함께 배선.
 3. **UDP-only 접속 — TCP fallback 미동작** — 현재 UDP가 막힌 망에서는
    접속 자체가 안 되고 WARP(1.1.1.1)로만 우회 가능. 목표는 UDP 기본 +
    실패 시 자동 fallback = **M1 그 자체**. 소스 확인(2026-07-14):
@@ -164,10 +168,16 @@ U5/M6 스파이크, f1-ack 소스 확인+0x5509 호스트 패치.
    SunshineService 스왑·해시 검증·워치독은 의도적으로 벤치 스크립트
    잔류(테스트 전용 보호 기계). 검증 = app-native 7/22 tests(인자
    계약 정확 일치, identity 복사, 스텁 exe 사망 경로, 포트/exe 조기
-   실패), clippy 클린. **A0+A1 헤드리스 기계 전부 완성.** 잔여 =
-   **라이브 스모크**(owner: ①클라 5분 — 픽셀·소리·조작, ②host 롤 —
-   `BP_SUNSHINE_STAGE` 설정 후 Start host, 웹/네이티브 클라 paired
-   접속) → 다음 헤드리스 대형 항목: M4 `session-ux` 상태머신(커서
+   실패), clippy 클린. **A0+A1 헤드리스 기계 전부 완성.** **라이브
+   스모크 ① 부분 통과** (2026-07-15, owner): 픽셀 OK(d3d11va HW
+   디코드 확인) · 조작 OK · **이중커서 확인** → 네이티브 로컬 커서
+   숨김(WM_SETCURSOR) 즉시 구현·배포(현장 이슈 #2 항 참조) · 오디오
+   **미판정**(same-PC라 호스트 소리와 구분 불가 — 판정법: 볼륨 믹서
+   betterparsec 앱 미터 확인, 다음 세션 항목). 잔여 라이브 = ①오디오
+   판정 + 커서 단일화 확인, ②host 롤 — 임베디드 서버로 paired 접속
+   (`BP_SUNSHINE_STAGE` 관리형 Sunshine은 이 머신에 Foundation
+   스테이지 부재 확인(2026-07-15) — MSYS2 UCRT64 재빌드 세션에서) →
+   다음 헤드리스 대형 항목: M4 `session-ux` 상태머신(커서
    P1·스톨 워치독·immersive, Rust+TS 미러) · U3 per-slice DU
    depacketizer 패치. 이후는 전부 라이브 게이트(Gate B/C).
 5. Gate B 2-machine 첫 신뢰 run — 이후 U1 CC 신호 판정, U2 P2 손실 복구

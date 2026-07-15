@@ -120,6 +120,83 @@ test("loss beyond capacity yields LossSpan(2,6) with seqs 0,1,6,7 recovered", ()
     for (const s of [2, 3, 4, 5]) assert.ok(!seqs.has(s), `seq ${s} must NOT be recovered`)
 })
 
+// ── U2 P2 groundwork: recovery/loss-span counters (mirrors fec.rs) ────────
+
+test("stats: clean stream -> all recovery counters zero, source count matches", () => {
+    const enc = makeEnc(1, 8)
+    const dec = makeDec()
+    for (let i = 0; i < 16; i++) {
+        pushThrough(enc, dec, i, new Uint8Array([i & 0xFF]))
+    }
+    const stats = dec.getStats()
+    assert.equal(stats.sourceSymbolsReceived, 16, "source count must match symbols fed")
+    assert.equal(stats.symbolsRecovered, 0)
+    assert.equal(stats.lossSpans, 0)
+    assert.equal(stats.lossSpansRecovered, 0)
+})
+
+test("stats: single loss recovered counts one span and one recovery", () => {
+    // 1/1 ratio: every source gets a repair; drop seq 4 and recover it.
+    const enc = makeEnc(1, 1)
+    const dec = makeDec()
+    for (let i = 0; i < 8; i++) {
+        pushThrough(enc, dec, i, new Uint8Array([i]), i === 4)
+    }
+    const stats = dec.getStats()
+    assert.equal(stats.sourceSymbolsReceived, 7, "seq 4 was dropped on the wire")
+    assert.equal(stats.symbolsRecovered, 1, "exactly seq 4 recovered via FEC")
+    assert.equal(stats.lossSpans, 1, "one loss episode observed")
+    assert.equal(stats.lossSpansRecovered, 1, "the episode closed fully healed")
+})
+
+test("stats: burst healed by FEC counts one span, not two", () => {
+    // Custom delivery (not the uniform pushThrough helper): 2/1 redundancy
+    // emits 2 independent repairs (different repairSeq -> independent GF
+    // equations) per push, but only the pair built once the window already
+    // spans both seq 2 and seq 3 (i.e. built by pushSource(3)) is delivered
+    // -- modelling repairs from the earlier, redundant-at-that-point pushes
+    // being dropped on the wire. This guarantees both equations covering
+    // the 2-wide gap [2,4) land and resolve together in one tryRecover
+    // batch, strictly before seq 4's direct arrival could otherwise
+    // bound/abandon the gap (existing Bug-1 logic).
+    const enc = makeEnc(2, 1)
+    const dec = makeDec()
+
+    dec.pushSymbol(enc.pushSource(0, new Uint8Array([0])).source)
+    dec.pushSymbol(enc.pushSource(1, new Uint8Array([1])).source)
+    // seq 2: source dropped, its repairs discarded (dropped on the wire).
+    enc.pushSource(2, new Uint8Array([2]))
+    // seq 3: source dropped; both repairs (window now spans [0,4)) delivered.
+    const out3 = enc.pushSource(3, new Uint8Array([3]))
+    for (const r of out3.repairs) dec.pushSymbol(r)
+    // seq 4: delivered directly.
+    dec.pushSymbol(enc.pushSource(4, new Uint8Array([4])).source)
+
+    const stats = dec.getStats()
+    assert.equal(stats.symbolsRecovered, 2, "both seq 2 and 3 recovered")
+    assert.equal(stats.lossSpans, 1, "one contiguous episode, not two")
+    assert.equal(stats.lossSpansRecovered, 1)
+})
+
+test("stats: unrecoverable gap counts a span but not a recovery", () => {
+    // Same scenario as the "loss beyond capacity" test above: 1/4 ratio,
+    // seqs 2..5 dropped (4 losses, only 2 repairs) -> the gap is bounded by
+    // seq 6 arriving and is abandoned, never healed via FEC.
+    const enc = makeEnc(1, 4)
+    const dec = makeDec()
+    const allEvents = []
+    for (let i = 0; i < 8; i++) {
+        allEvents.push(...pushThrough(enc, dec, i, new Uint8Array([i]), i >= 2 && i <= 5))
+    }
+    assert.equal(
+        collectLossSpans(allEvents).length, 1,
+        "exactly one LossSpan event for the abandoned gap",
+    )
+    const stats = dec.getStats()
+    assert.equal(stats.lossSpans, 1, "one loss episode observed")
+    assert.equal(stats.lossSpansRecovered, 0, "the episode was skipped, not healed")
+})
+
 // ── Duplicate source ignored ──────────────────────────────────────────────
 
 test("duplicate source: second push for same seq returns no events", () => {

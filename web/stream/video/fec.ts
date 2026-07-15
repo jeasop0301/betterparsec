@@ -97,6 +97,7 @@ export type RecoveredEvent = {
     kind: 'recovered';
     seq: number;       // u32
     payload: Uint8Array;
+    viaFec: boolean;   // true if reconstructed via FEC decode, false if directly received
 };
 
 export type LossSpanEvent = {
@@ -233,6 +234,33 @@ export class FecEncoder {
     }
 }
 
+// ── U2 P2 groundwork: recovery/loss-span counters ──────────────────────────
+//
+// Pure instrumentation for a future Gate-B rig to measure recovery rate vs
+// redundancy ratio (docs/design/fec-framing.md §8: "Recovered/LossSpan
+// counters"). No behavioural effect: with the returned snapshot ignored,
+// decoder output (events, highestFullyDecoded) is byte-identical to before
+// these counters existed. Rust mirror: fec.rs FecDecoderStats.
+//
+// Chosen seams (each counter incremented at exactly one authoritative
+// point), matching transport-core/src/fec.rs exactly:
+// - sourceSymbolsReceived — pushSource, at the point a new (non-duplicate)
+//   source payload is recorded as 'received'.
+// - repairSymbolsReceived — pushRepair, right after the dedup +
+//   oversized-window guards, where the repair is committed to seenRepairKeys.
+// - symbolsRecovered — tryRecover, once per (seq, payload) pair a
+//   Gaussian-elimination pass resolves.
+// - lossSpans / lossSpansRecovered — advanceContiguous / noteOpenSpanAtFrontier
+//   / closeOpenSpanStep; see their doc comments for the exact (approximated)
+//   span-tracking algorithm.
+export interface FecDecoderStats {
+    sourceSymbolsReceived: number;
+    repairSymbolsReceived: number;
+    symbolsRecovered: number;
+    lossSpans: number;
+    lossSpansRecovered: number;
+}
+
 // ── FecDecoder ────────────────────────────────────────────────────────────
 
 type SourceState =
@@ -256,6 +284,21 @@ export class FecDecoder {
     // Value stored as a number so we can evict stale entries without a reverse map.
     private seenRepairKeys = new Map<string, number>();
     private highestContiguous: number | null = null; // null = None
+    private stats: FecDecoderStats = {
+        sourceSymbolsReceived: 0,
+        repairSymbolsReceived: 0,
+        symbolsRecovered: 0,
+        lossSpans: 0,
+        lossSpansRecovered: 0,
+    };
+    // Start seq of the loss span currently open (blocking highestContiguous
+    // advancement) if one has already been counted, else null. See
+    // advanceContiguous / noteOpenSpanAtFrontier / closeOpenSpanStep.
+    private openLossSpan: number | null = null;
+    // Whether at least one seq resolved so far within openLossSpan was a
+    // genuine FEC recovery ('recovered') rather than a late direct arrival
+    // ('received').
+    private openLossSpanHasRecovery = false;
 
     constructor(maxSymbols: number, maxBytes: number) {
         this.maxSymbols = Math.min(Math.max(maxSymbols, 1), 128);
@@ -276,17 +319,25 @@ export class FecDecoder {
         return this.highestContiguous;
     }
 
+    /** Snapshot of recovery/loss-span counters accumulated so far. Returns a
+     * fresh copy; safe to call at any time. */
+    getStats(): FecDecoderStats {
+        return { ...this.stats };
+    }
+
     private pushSource(seq: number, payload: Uint8Array): DecoderEvent[] {
         const s = seq >>> 0;
         const existing = this.sources.get(s);
         if (existing !== undefined && existing.kind !== 'missing') {
             return []; // already Received or Recovered
         }
+        this.noteOpenSpanAtFrontier();
         this.sources.set(s, { kind: 'received', payload });
-        const events: DecoderEvent[] = [{ kind: 'recovered', seq: s, payload }];
+        this.stats.sourceSymbolsReceived++;
+        const events: DecoderEvent[] = [{ kind: 'recovered', seq: s, payload, viaFec: false }];
         const recovered = this.tryRecover();
         for (const [rs, rp] of recovered) {
-            events.push({ kind: 'recovered', seq: rs, payload: rp });
+            events.push({ kind: 'recovered', seq: rs, payload: rp, viaFec: true });
         }
         events.push(...this.advanceContiguous());
         return events;
@@ -311,6 +362,7 @@ export class FecDecoder {
         // Commit dedup key now that the window has been validated.
         // Stored value is windowBase so the pruning pass can identify stale entries.
         this.seenRepairKeys.set(key, wb);
+        this.stats.repairSymbolsReceived++;
 
         // Register all seqs in this repair's window as at least Missing
         for (let seq = wb; seq !== we; seq = (seq + 1) >>> 0) {
@@ -319,11 +371,13 @@ export class FecDecoder {
             }
         }
 
+        this.noteOpenSpanAtFrontier();
+
         this.repairs.push({ repairSeq: repairSeq & 0xFFFF, windowBase: wb, windowEnd: we, payload });
 
         const recovered = this.tryRecover();
         const events: DecoderEvent[] = recovered.map(
-            ([s, p]) => ({ kind: 'recovered' as const, seq: s, payload: p }),
+            ([s, p]) => ({ kind: 'recovered' as const, seq: s, payload: p, viaFec: true }),
         );
         events.push(...this.advanceContiguous());
 
@@ -352,6 +406,7 @@ export class FecDecoder {
         for (;;) {
             const batch = this.oneElimPass();
             if (batch.length === 0) break;
+            this.stats.symbolsRecovered += batch.length;
             for (const [seq, payload] of batch) {
                 this.sources.set(seq, { kind: 'recovered', payload });
             }
@@ -436,9 +491,24 @@ export class FecDecoder {
     }
 
     /**
-     * Advance highestContiguous and emit LossSpan for permanently missing ranges.
+     * Advance highestContiguous, emit LossSpan for permanently missing
+     * ranges, and update the loss-span counters (stats.lossSpans,
+     * stats.lossSpansRecovered).
+     *
      * Bug-2 fix: start from 0 when highestContiguous is null.
      * Bug-1 fix: emit LossSpan for Missing spans bounded by a known seq.
+     *
+     * Loss-span counter approximation (U2 P2 groundwork, mirrors fec.rs):
+     * this decoder has no independent structure tracking arbitrary loss
+     * episodes, and `sources` entries are never evicted, so the only place
+     * a gap is ever truly discovered is right here (plus
+     * noteOpenSpanAtFrontier for the instant-resolution case — see below).
+     * Spans are counted lazily, at the moment the contiguous frontier
+     * reaches them, not the instant a repair's window first registers a seq
+     * as 'missing'. Because `next` is always exactly `highestContiguous+1`,
+     * at most one span can ever be "open" (blocking the frontier) at a
+     * time, so `openLossSpan`/`openLossSpanHasRecovery` need only track a
+     * single in-flight span.
      */
     private advanceContiguous(): DecoderEvent[] {
         const events: DecoderEvent[] = [];
@@ -450,9 +520,18 @@ export class FecDecoder {
 
             if (state === undefined) {
                 break;
-            } else if (state.kind !== 'missing') {
+            } else if (state.kind === 'received') {
+                this.closeOpenSpanStep(next, false);
+                this.highestContiguous = next;
+            } else if (state.kind === 'recovered') {
+                this.closeOpenSpanStep(next, true);
                 this.highestContiguous = next;
             } else {
+                if (this.openLossSpan === null) {
+                    this.stats.lossSpans++;
+                    this.openLossSpan = next;
+                    this.openLossSpanHasRecovery = false;
+                }
                 // Scan forward to find whether the Missing span is bounded
                 const spanStart = next;
                 let scan = (next + 1) >>> 0;
@@ -464,6 +543,8 @@ export class FecDecoder {
                         // Bounded gap: emit LossSpan and advance
                         events.push({ kind: 'lossSpan', fromSeq: spanStart, toSeqExclusive: scan });
                         this.highestContiguous = (scan - 1 + 0x100000000) >>> 0;
+                        this.openLossSpan = null;
+                        this.openLossSpanHasRecovery = false;
                         continue outer;
                     } else {
                         scan = (scan + 1) >>> 0;
@@ -472,6 +553,56 @@ export class FecDecoder {
             }
         }
         return events;
+    }
+
+    /**
+     * If the frontier (highestContiguous + 1, or 0 if unset) is already
+     * 'missing' and no span is currently open, open one and count
+     * stats.lossSpans++.
+     *
+     * Called explicitly at the top of pushSource (before the seq being
+     * pushed can resolve the frontier) and after the Missing-registration
+     * loop in pushRepair (before tryRecover can cascade-resolve it). This
+     * is necessary because tryRecover runs *within* the same
+     * pushSource/pushRepair call that can also be the one supplying the
+     * last missing piece of a gap — the common "one symbol lost, one repair
+     * received" case resolves the frontier before advanceContiguous ever
+     * gets a chance to observe it as 'missing'. advanceContiguous keeps its
+     * own (guarded, no-op-if-already-open) span-open check for the
+     * complementary case: a gap that was registered 'missing' earlier and
+     * only reached once the frontier advances up to it on a later call.
+     */
+    private noteOpenSpanAtFrontier(): void {
+        if (this.openLossSpan !== null) return;
+        const frontier = this.highestContiguous === null
+            ? 0
+            : (this.highestContiguous + 1) >>> 0;
+        const state = this.sources.get(frontier);
+        if (state !== undefined && state.kind === 'missing') {
+            this.stats.lossSpans++;
+            this.openLossSpan = frontier;
+            this.openLossSpanHasRecovery = false;
+        }
+    }
+
+    /**
+     * Loss-span bookkeeping for one seq resolving to 'received'/'recovered'
+     * while advanceContiguous walks the frontier. No-op when no span is
+     * currently open. Closes the open span (counting lossSpansRecovered
+     * when healed) once the seq immediately after resolvedSeq is no longer
+     * 'missing', i.e. the whole originally-contiguous run has been
+     * consumed.
+     */
+    private closeOpenSpanStep(resolvedSeq: number, viaFec: boolean): void {
+        if (this.openLossSpan === null) return;
+        if (viaFec) this.openLossSpanHasRecovery = true;
+        const nextState = this.sources.get((resolvedSeq + 1) >>> 0);
+        const stillMissing = nextState !== undefined && nextState.kind === 'missing';
+        if (!stillMissing) {
+            if (this.openLossSpanHasRecovery) this.stats.lossSpansRecovered++;
+            this.openLossSpan = null;
+            this.openLossSpanHasRecovery = false;
+        }
     }
 }
 

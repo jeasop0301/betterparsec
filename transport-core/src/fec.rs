@@ -333,6 +333,7 @@ pub enum DecoderEvent {
     Recovered {
         seq: u32,
         payload: Vec<u8>,
+        via_fec: bool,
     },
     LossSpan {
         from_seq: u32,
@@ -368,6 +369,45 @@ struct ReceivedRepair {
     payload: Vec<u8>,
 }
 
+/// ── U2 P2 groundwork: recovery/loss-span counters ──────────────────────
+///
+/// Pure instrumentation for a future Gate-B rig to measure recovery rate vs
+/// redundancy ratio (docs/design/fec-framing.md §8: "Recovered/LossSpan
+/// counters"). No behavioural effect: with the returned snapshot ignored,
+/// decoder output (events, `highest_fully_decoded`) is byte-identical to
+/// before these counters existed.
+///
+/// Chosen seams (each counter incremented at exactly one authoritative
+/// point):
+/// - `source_symbols_received` — [`FecDecoder::push_source`], at the point a
+///   new (non-duplicate) source payload is recorded as `Received`.
+/// - `repair_symbols_received` — [`FecDecoder::push_repair`], right after the
+///   dedup + oversized-window guards, where the repair is accepted into
+///   `seen_repair_keys`.
+/// - `symbols_recovered` — [`FecDecoder::try_recover`], once per `(seq,
+///   payload)` pair a Gaussian-elimination pass resolves.
+/// - `loss_spans` / `loss_spans_recovered` — [`FecDecoder::advance_contiguous`],
+///   the sole place a `Missing` gap blocking `highest_contiguous` is
+///   discovered and closed; see that method's doc comment for the exact
+///   (approximated) span-tracking algorithm.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FecDecoderStats {
+    /// Count of accepted (non-duplicate) source symbols.
+    pub source_symbols_received: u64,
+    /// Count of accepted (non-duplicate, in-spec) repair symbols.
+    pub repair_symbols_received: u64,
+    /// Count of individual symbols reconstructed via FEC decode rather than
+    /// direct receipt.
+    pub symbols_recovered: u64,
+    /// Count of loss episodes observed: a maximal run of one-or-more
+    /// consecutive missing sequence numbers, counted once at first
+    /// observation (span start).
+    pub loss_spans: u64,
+    /// Subset of `loss_spans` that closed fully healed — every member seq
+    /// became known and at least one was FEC-recovered (not just a late
+    /// direct arrival).
+    pub loss_spans_recovered: u64,
+}
 /// 체계적 슬라이딩 윈도우 FEC 디코더.
 #[derive(Debug)]
 pub struct FecDecoder {
@@ -383,6 +423,17 @@ pub struct FecDecoder {
     highest_contiguous: Option<u32>,
     /// Lowest seq we still care about (eviction watermark).
     window_base: Option<u32>,
+    /// Cheap instrumentation counters (see [`FecDecoderStats`] doc comment).
+    /// Monotonic, default-zero, no allocation on the hot path.
+    stats: FecDecoderStats,
+    /// Start seq of the loss span currently open (blocking `highest_contiguous`
+    /// advancement) if one has already been counted, else `None`. See
+    /// `advance_contiguous`.
+    open_loss_span: Option<u32>,
+    /// Whether at least one seq resolved so far within `open_loss_span` was a
+    /// genuine FEC recovery (`SourceState::Recovered`) rather than a late
+    /// direct arrival (`SourceState::Received`).
+    open_loss_span_has_recovery: bool,
 }
 
 impl FecDecoder {
@@ -395,6 +446,9 @@ impl FecDecoder {
             seen_repair_keys: std::collections::HashSet::new(),
             highest_contiguous: None,
             window_base: None,
+            stats: FecDecoderStats::default(),
+            open_loss_span: None,
+            open_loss_span_has_recovery: false,
         }
     }
 
@@ -414,6 +468,43 @@ impl FecDecoder {
         self.highest_contiguous
     }
 
+    /// Snapshot of recovery/loss-span counters accumulated so far (Copy
+    /// struct; cheap to call at any time — no allocation, no traversal).
+    pub fn stats(&self) -> FecDecoderStats {
+        self.stats
+    }
+
+    /// If the frontier (`highest_contiguous + 1`, or 0 if unset) is already
+    /// `Missing` and no span is currently open, open one and count
+    /// `stats.loss_spans += 1`.
+    ///
+    /// Called explicitly at the top of `push_source` (before the seq being
+    /// pushed can resolve the frontier) and after the Missing-registration
+    /// loop in `push_repair` (before `try_recover` can cascade-resolve it).
+    /// This is necessary because `try_recover` runs *within* the same
+    /// `push_source`/`push_repair` call that can also be the one supplying
+    /// the last missing piece of a gap — the common "one symbol lost, one
+    /// repair received" case resolves the frontier before
+    /// `advance_contiguous` ever gets a chance to observe it as `Missing`.
+    /// `advance_contiguous` keeps its own (guarded, no-op-if-already-open)
+    /// span-open check for the complementary case: a gap that was
+    /// registered `Missing` earlier and only reached once the frontier
+    /// advances up to it on a later call.
+    fn note_open_span_at_frontier(&mut self) {
+        if self.open_loss_span.is_some() {
+            return;
+        }
+        let frontier = match self.highest_contiguous {
+            None => 0u32,
+            Some(h) => h.wrapping_add(1),
+        };
+        if matches!(self.sources.get(&frontier), Some(SourceState::Missing)) {
+            self.stats.loss_spans += 1;
+            self.open_loss_span = Some(frontier);
+            self.open_loss_span_has_recovery = false;
+        }
+    }
+
     fn push_source(&mut self, seq: u32, payload: Vec<u8>) -> Vec<DecoderEvent> {
         // Ignore if already known
         if matches!(
@@ -423,17 +514,24 @@ impl FecDecoder {
             return Vec::new();
         }
 
+        self.note_open_span_at_frontier();
+
         self.sources
             .insert(seq, SourceState::Received(payload.clone()));
+        self.stats.source_symbols_received += 1;
 
-        let mut events = vec![DecoderEvent::Recovered { seq, payload }];
+        let mut events = vec![DecoderEvent::Recovered {
+            seq,
+            payload,
+            via_fec: false,
+        }];
         // Try to cascade-recover missing symbols using available repairs
         let recovered = self.try_recover();
-        events.extend(
-            recovered
-                .into_iter()
-                .map(|(s, p)| DecoderEvent::Recovered { seq: s, payload: p }),
-        );
+        events.extend(recovered.into_iter().map(|(s, p)| DecoderEvent::Recovered {
+            seq: s,
+            payload: p,
+            via_fec: true,
+        }));
         events.extend(self.advance_contiguous());
         events
     }
@@ -462,6 +560,7 @@ impl FecDecoder {
             return Vec::new();
         }
         self.seen_repair_keys.insert(key);
+        self.stats.repair_symbols_received += 1;
 
         // Register all seqs in this repair's window as at least Missing.
         // Use wrapping iteration (seq != window_end) to handle the case where
@@ -474,6 +573,8 @@ impl FecDecoder {
             seq = seq.wrapping_add(1);
         }
 
+        self.note_open_span_at_frontier();
+
         self.repairs.push(ReceivedRepair {
             repair_seq,
             window_base,
@@ -484,7 +585,11 @@ impl FecDecoder {
         let recovered = self.try_recover();
         let mut events: Vec<DecoderEvent> = recovered
             .into_iter()
-            .map(|(s, p)| DecoderEvent::Recovered { seq: s, payload: p })
+            .map(|(s, p)| DecoderEvent::Recovered {
+                seq: s,
+                payload: p,
+                via_fec: true,
+            })
             .collect();
         events.extend(self.advance_contiguous());
         events
@@ -499,6 +604,7 @@ impl FecDecoder {
             if batch.is_empty() {
                 break;
             }
+            self.stats.symbols_recovered += batch.len() as u64;
             for (seq, payload) in &batch {
                 self.sources
                     .insert(*seq, SourceState::Recovered(payload.clone()));
@@ -611,8 +717,9 @@ impl FecDecoder {
         result
     }
 
-    /// Advance `highest_contiguous` and emit `LossSpan` for permanently missing
-    /// ranges.
+    /// Advance `highest_contiguous`, emit `LossSpan` for permanently missing
+    /// ranges, and update the loss-span counters (`stats.loss_spans`,
+    /// `stats.loss_spans_recovered`).
     ///
     /// **Bug-2 fix**: when `highest_contiguous == None` the search starts from
     /// seq 0, not from `sources.keys().next()`.  The old code would set
@@ -627,6 +734,29 @@ impl FecDecoder {
     /// advanced past it so the outer loop can continue.  Open-ended gaps (no
     /// known seq after the last Missing) are left pending — more repairs might
     /// still arrive.
+    ///
+    /// **Loss-span counter approximation (U2 P2 groundwork)**: this decoder
+    /// has no independent structure tracking arbitrary loss episodes, and
+    /// `sources` entries are never evicted (window sliding is dead code here
+    /// — see the unused `max_symbols`/`max_bytes` fields), so the only place
+    /// a gap is ever truly discovered is right here, as `highest_contiguous`
+    /// walks forward. Spans are therefore counted lazily, at the moment the
+    /// contiguous frontier reaches them, not the instant a repair's window
+    /// first registers a seq as `Missing`. Because `next` is always exactly
+    /// `highest_contiguous + 1`, at most one span can ever be "open" (blocking
+    /// the frontier) at a time, so `open_loss_span` / `open_loss_span_has_recovery`
+    /// need only track a single in-flight span:
+    /// - First time `next` resolves to `Missing`: if no span is already open,
+    ///   count `stats.loss_spans += 1` and open one at `next`.
+    /// - Bounded-gap resolution (existing Bug-1 path): the whole run was
+    ///   never healed — it is abandoned/skipped. Close the span without
+    ///   touching `loss_spans_recovered`.
+    /// - Per-seq resolution to `Received`/`Recovered` while a span is open
+    ///   (see `close_open_span_step`): record whether the seq was
+    ///   FEC-recovered; once the seq right after `next` is no longer
+    ///   `Missing`, the run is fully consumed — close the span and, if at
+    ///   least one member was FEC-recovered, count `stats.loss_spans_recovered
+    ///   += 1`.
     fn advance_contiguous(&mut self) -> Vec<DecoderEvent> {
         let mut events = Vec::new();
         'outer: loop {
@@ -637,10 +767,20 @@ impl FecDecoder {
             };
 
             match self.sources.get(&next) {
-                Some(SourceState::Received(_) | SourceState::Recovered(_)) => {
+                Some(SourceState::Received(_)) => {
+                    self.close_open_span_step(next, false);
+                    self.highest_contiguous = Some(next);
+                }
+                Some(SourceState::Recovered(_)) => {
+                    self.close_open_span_step(next, true);
                     self.highest_contiguous = Some(next);
                 }
                 Some(SourceState::Missing) => {
+                    if self.open_loss_span.is_none() {
+                        self.stats.loss_spans += 1;
+                        self.open_loss_span = Some(next);
+                        self.open_loss_span_has_recovery = false;
+                    }
                     // Scan forward to determine whether the Missing span is bounded
                     // by a Received/Recovered seq (permanent loss) or open-ended
                     // (might still be recovered by a future repair).
@@ -661,6 +801,8 @@ impl FecDecoder {
                                     to_seq_exclusive: scan,
                                 });
                                 self.highest_contiguous = Some(scan.wrapping_sub(1));
+                                self.open_loss_span = None;
+                                self.open_loss_span_has_recovery = false;
                                 continue 'outer;
                             }
                             None => {
@@ -676,6 +818,32 @@ impl FecDecoder {
             }
         }
         events
+    }
+
+    /// Loss-span bookkeeping for one seq resolving to `Received`/`Recovered`
+    /// while `advance_contiguous` walks the frontier. No-op when no span is
+    /// currently open (i.e. this seq did not follow an observed gap). Closes
+    /// the open span (counting `loss_spans_recovered` when healed) once the
+    /// seq immediately after `resolved_seq` is no longer `Missing`, i.e. the
+    /// whole originally-contiguous run has been consumed.
+    fn close_open_span_step(&mut self, resolved_seq: u32, via_fec: bool) {
+        if self.open_loss_span.is_none() {
+            return;
+        }
+        if via_fec {
+            self.open_loss_span_has_recovery = true;
+        }
+        let still_missing = matches!(
+            self.sources.get(&resolved_seq.wrapping_add(1)),
+            Some(SourceState::Missing)
+        );
+        if !still_missing {
+            if self.open_loss_span_has_recovery {
+                self.stats.loss_spans_recovered += 1;
+            }
+            self.open_loss_span = None;
+            self.open_loss_span_has_recovery = false;
+        }
     }
 }
 
@@ -987,6 +1155,13 @@ mod tests {
             .collect()
     }
 
+    fn count_loss_spans(events: &[DecoderEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, DecoderEvent::LossSpan { .. }))
+            .count()
+    }
+
     // ── 5-C: 라운드트립 테스트 ───────────────────────────────────────────
 
     #[test]
@@ -1218,7 +1393,9 @@ mod tests {
             "single-symbol window recovery failed"
         );
         // Also verify payload
-        if let Some(DecoderEvent::Recovered { seq: 0, payload }) = events
+        if let Some(DecoderEvent::Recovered {
+            seq: 0, payload, ..
+        }) = events
             .iter()
             .find(|e| matches!(e, DecoderEvent::Recovered { seq: 0, .. }))
         {
@@ -1260,7 +1437,9 @@ mod tests {
             recovered.contains(&2),
             "variable-length seq 2 not recovered"
         );
-        if let Some(DecoderEvent::Recovered { seq: 2, payload }) = events
+        if let Some(DecoderEvent::Recovered {
+            seq: 2, payload, ..
+        }) = events
             .iter()
             .find(|e| matches!(e, DecoderEvent::Recovered { seq: 2, .. }))
         {
@@ -1857,7 +2036,9 @@ mod tests {
         // The key test: no panic, and the decoder did not silently emit a wrong
         // Recovered event for u32::MAX from an empty coefficient row.
         for e in &all_events {
-            if let DecoderEvent::Recovered { seq: s, payload } = e
+            if let DecoderEvent::Recovered {
+                seq: s, payload, ..
+            } = e
                 && *s == u32::MAX
             {
                 // Recovery succeeded — verify payload correctness.
@@ -1878,6 +2059,7 @@ mod tests {
                 if let DecoderEvent::Recovered {
                     seq: u32::MAX,
                     payload,
+                    ..
                 } = e
                 {
                     assert_eq!(payload.as_slice(), b"before_wrap");
@@ -1945,7 +2127,7 @@ mod tests {
         let recovered = events.iter().any(|e| {
             matches!(
                 e,
-                DecoderEvent::Recovered { seq: 0, payload } if payload.as_slice() == b"payload_zero"
+                DecoderEvent::Recovered { seq: 0, payload, .. } if payload.as_slice() == b"payload_zero"
             )
         });
         assert!(
@@ -2005,7 +2187,7 @@ mod tests {
         let recovered = events.iter().any(|e| {
             matches!(
                 e,
-                DecoderEvent::Recovered { seq: 0, payload } if payload.as_slice() == [0u8]
+                DecoderEvent::Recovered { seq: 0, payload, .. } if payload.as_slice() == [0u8]
             )
         });
         assert!(
@@ -2121,5 +2303,110 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── U2 P2 groundwork: recovery/loss-span counters ─────────────────────
+    // Scenario parity with the counter tests in tests/fec_decoder.test.mjs.
+
+    #[test]
+    fn stats_clean_stream_all_recovery_counters_zero() {
+        let mut s = Scenario::new(1, 8, 64);
+        for i in 0..16u32 {
+            s.push(i, b"data", false);
+        }
+        let stats = s.dec.stats();
+        assert_eq!(
+            stats.source_symbols_received, 16,
+            "source count must match symbols fed"
+        );
+        assert_eq!(stats.symbols_recovered, 0);
+        assert_eq!(stats.loss_spans, 0);
+        assert_eq!(stats.loss_spans_recovered, 0);
+    }
+
+    #[test]
+    fn stats_single_loss_recovered_counts_one_span_and_one_recovery() {
+        // 1/1 ratio: every source gets a repair; drop seq 4 and recover it.
+        let mut s = Scenario::new(1, 1, 64);
+        for i in 0..8u32 {
+            let drop = i == 4;
+            s.push(i, b"hello", drop);
+        }
+        let stats = s.dec.stats();
+        assert_eq!(
+            stats.source_symbols_received, 7,
+            "seq 4 was dropped on the wire"
+        );
+        assert_eq!(
+            stats.symbols_recovered, 1,
+            "exactly seq 4 recovered via FEC"
+        );
+        assert_eq!(stats.loss_spans, 1, "one loss episode observed");
+        assert_eq!(
+            stats.loss_spans_recovered, 1,
+            "the episode closed fully healed"
+        );
+    }
+
+    #[test]
+    fn stats_burst_healed_by_fec_counts_one_span_not_two() {
+        // Custom delivery (not the uniform Scenario helper): 2/1 redundancy
+        // emits 2 independent repairs (different repair_seq -> independent
+        // GF equations) per push, but only the pair built once the window
+        // already spans both seq 2 and seq 3 (i.e. built by push_source(3))
+        // is delivered — modelling repairs from the earlier, redundant-at-
+        // that-point pushes being dropped on the wire. This guarantees both
+        // equations covering the 2-wide gap [2,4) land and resolve together
+        // in one try_recover batch, strictly before seq 4's direct arrival
+        // could otherwise bound/abandon the gap (existing Bug-1 logic).
+        let config = FecConfig {
+            redundancy_numerator: 2,
+            redundancy_denominator: 1,
+            window_max_symbols: 64,
+            window_max_bytes: 1 << 24,
+        };
+        let mut enc = FecEncoder::new(config);
+        let mut dec = FecDecoder::new(64, 1 << 24);
+
+        dec.push_symbol(enc.push_source(0, b"a").source);
+        dec.push_symbol(enc.push_source(1, b"b").source);
+        // seq 2: source dropped, its repairs discarded (dropped on the wire).
+        enc.push_source(2, b"c");
+        // seq 3: source dropped; both repairs (window now spans [0,4)) delivered.
+        let out3 = enc.push_source(3, b"d");
+        for repair in out3.repairs {
+            dec.push_symbol(repair);
+        }
+        // seq 4: delivered directly.
+        dec.push_symbol(enc.push_source(4, b"e").source);
+
+        let stats = dec.stats();
+        assert_eq!(stats.symbols_recovered, 2, "both seq 2 and 3 recovered");
+        assert_eq!(stats.loss_spans, 1, "one contiguous episode, not two");
+        assert_eq!(stats.loss_spans_recovered, 1);
+    }
+
+    #[test]
+    fn stats_unrecoverable_gap_counts_span_but_not_recovered() {
+        // Same scenario as pin_loss_span_emitted_for_bounded_missing_gap:
+        // 1/4 ratio, seqs 2..6 dropped (4 losses, only 2 repairs) -> the gap
+        // is bounded by seq 6 arriving and is abandoned, never healed.
+        let mut s = Scenario::new(1, 4, 64);
+        let mut all_events = Vec::new();
+        for i in 0..8u32 {
+            let drop = (2..6).contains(&i);
+            all_events.extend(s.push(i, b"burst", drop));
+        }
+        assert_eq!(
+            count_loss_spans(&all_events),
+            1,
+            "exactly one LossSpan event for the abandoned gap"
+        );
+        let stats = s.dec.stats();
+        assert_eq!(stats.loss_spans, 1, "one loss episode observed");
+        assert_eq!(
+            stats.loss_spans_recovered, 0,
+            "the episode was skipped, not healed"
+        );
     }
 }

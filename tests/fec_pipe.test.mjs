@@ -115,6 +115,15 @@ test("two frames interleaved chunks both deliver", () => {
     assert.deepEqual(new Uint8Array(renderer.units[0].data), data0)
     assert.deepEqual(new Uint8Array(renderer.units[1].data), data1)
     assert.equal(renderer.units[1].type, "key")
+
+    // U2 P2 groundwork: clean stream (no loss) -> all recovery counters
+    // zero; source count matches the 4 symbols fed.
+    const stats = pipe.getStats()
+    assert.equal(stats.sourceSymbolsReceived, 4)
+    assert.equal(stats.symbolsRecovered, 0)
+    assert.equal(stats.framesRecovered, 0)
+    assert.equal(stats.lossSpans, 0)
+    assert.equal(stats.lossSpansRecovered, 0)
 })
 
 // ── Test: repair-recovered chunk completes a frame ────────────────────────
@@ -155,6 +164,14 @@ test("repair recovery: drop one source symbol, repair recovers it, frame assembl
     assert.deepEqual(assembled, new Uint8Array([0xAA, 0xBB, 0xCC, 0xDD]))
     assert.equal(unit.type, "delta")
     assert.equal(unit.timestampMicroseconds, 5000)
+
+    // U2 P2 groundwork: the frame used a recovered symbol (seq 0), and the
+    // decoder-level counters passthrough correctly.
+    const stats = pipe.getStats()
+    assert.equal(stats.framesRecovered, 1, "frame used a recovered symbol")
+    assert.equal(stats.symbolsRecovered, 1, "exactly seq 0 recovered via FEC")
+    assert.equal(stats.lossSpans, 1)
+    assert.equal(stats.lossSpansRecovered, 1)
 })
 
 // ── Test: LossSpan drops pending frame, pollRequestIdr returns true once ──
@@ -214,6 +231,33 @@ test("pending-map cap at 8 frames sets needsIdr on eviction", () => {
     pipe.submitPacket(sourceMsg(16, chunk9))
     assert.equal(pipe.pollRequestIdr(), true, "eviction at 9th frame sets needsIdr")
     assert.equal(pipe.pollRequestIdr(), false, "cleared after one poll")
+})
+
+// ── Test: unrecoverable gap counts a loss span but not a recovery ─────────
+
+test("stats: unrecoverable gap increments lossSpans, not lossSpansRecovered", () => {
+    // Same scenario as fec.rs's pin_loss_span_emitted_for_bounded_missing_gap
+    // / fec_decoder.test.mjs's "unrecoverable gap" stats test: 1/4 ratio,
+    // seqs 2..5 dropped (4 losses, only 2 repairs) -> the gap is bounded and
+    // abandoned, never healed via FEC. Each seq carries a single-chunk frame.
+    const renderer = makeRenderer()
+    const pipe = new FecDecodePipe(renderer)
+    const enc = makeEnc(1, 4, 64)
+
+    for (let i = 0; i < 8; i++) {
+        const chunk = buildChunkPayload(i, 0, 1, 0, i * 1000, new Uint8Array([i]))
+        const out = enc.pushSource(i, chunk)
+        const drop = i >= 2 && i <= 5
+        if (!drop) pipe.submitPacket(sourceMsg(i, chunk))
+        for (const r of out.repairs) pipe.submitPacket(repairMsg(r))
+    }
+
+    const stats = pipe.getStats()
+    assert.equal(stats.lossSpans, 1, "one loss episode observed")
+    assert.equal(stats.lossSpansRecovered, 0, "the episode was skipped, not healed")
+    // needs-IDR latch/clear contract is unaffected by the new counters.
+    const first = pipe.pollRequestIdr()
+    assert.equal(pipe.pollRequestIdr(), false, "needsIdr cleared after one poll")
 })
 
 // ── Test: ACK cadence — 32 symbol trigger ────────────────────────────────

@@ -8,7 +8,7 @@ import { Pipe, PipeInfo } from "../pipeline/index.js"
 import { addPipePassthrough, DataPipe } from "../pipeline/pipes.js"
 import { allVideoCodecs } from "../video.js"
 import { DataVideoRenderer, VideoDecodeUnit, VideoRendererSetup } from "./index.js"
-import { FecDecoder } from "./fec.js"
+import { FecDecoder, FecDecoderStats } from "./fec.js"
 import { parseSymbolMessage, parseChunkHeader, CHUNK_HEADER_SIZE } from "./fec_wire.js"
 
 // ── Types ─────────────────────────────────────────────────────────────────
@@ -21,6 +21,9 @@ interface PendingFrame {
     /** Sparse array; index = chunkIndex, value = fragment bytes. */
     parts: (Uint8Array | undefined)[]
     receivedCount: number
+    /** Set once any delivered chunk arrived via FEC recovery rather than
+     * direct receipt. Feeds stats.framesRecovered on completion. */
+    usedRecovery: boolean
 }
 
 export interface FecDecodePipeOptions {
@@ -31,6 +34,14 @@ export interface FecDecodePipeOptions {
     onAck?: (highest: number) => void
     /** Injectable clock for tests. Default: () => Date.now() */
     now?: () => number
+}
+
+// Recovery/loss-span counters for one FecDecodePipe (U2 P2 groundwork).
+// Symbol-level counters passthrough FecDecoder.getStats(); framesRecovered
+// is tracked here, since only the chunk-reassembly seam knows which source
+// seqs (recovered vs directly received) contributed to a completed frame.
+export interface FecDecodePipeStats extends FecDecoderStats {
+    framesRecovered: number
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────
@@ -63,6 +74,7 @@ export class FecDecodePipe implements DataPipe {
     private base: DataVideoRenderer
     private decoder: FecDecoder
 
+    private framesRecovered = 0
     // Reassembly state
     private pending = new Map<number, PendingFrame>()
     // Eviction order — insertion-ordered frame_ids
@@ -145,7 +157,7 @@ export class FecDecodePipe implements DataPipe {
         const events = this.decoder.pushSymbol(sym)
         for (const ev of events) {
             if (ev.kind === 'recovered') {
-                this.deliverChunk(ev.payload)
+                this.deliverChunk(ev.payload, ev.viaFec)
                 this.tickAck()
             } else if (ev.kind === 'lossSpan') {
                 this.handleLossSpan(ev.fromSeq, ev.toSeqExclusive)
@@ -174,10 +186,16 @@ export class FecDecodePipe implements DataPipe {
         return this.base
     }
 
+    /** Snapshot of recovery/loss-span counters accumulated so far. Returns a
+     * fresh copy; safe to call at any time. */
+    getStats(): FecDecodePipeStats {
+        return { ...this.decoder.getStats(), framesRecovered: this.framesRecovered }
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────
 
     /** Deliver one chunk (source-symbol payload) into the reassembly map. */
-    private deliverChunk(payload: Uint8Array): void {
+    private deliverChunk(payload: Uint8Array, viaFec: boolean): void {
         // payload = chunk layer: 13-byte header + Annex-B fragment
         if (payload.byteLength < CHUNK_HEADER_SIZE) return
 
@@ -204,6 +222,7 @@ export class FecDecodePipe implements DataPipe {
                 chunkCount,
                 parts: new Array(chunkCount),
                 receivedCount: 0,
+                usedRecovery: false,
             }
             this.pending.set(frameId, frame)
             this.pendingOrder.push(frameId)
@@ -211,6 +230,7 @@ export class FecDecodePipe implements DataPipe {
 
         // Guard against duplicate delivery
         if (frame.parts[chunkIndex] !== undefined) return
+        frame.usedRecovery = frame.usedRecovery || viaFec
         frame.parts[chunkIndex] = fragment
         frame.receivedCount++
 
@@ -234,6 +254,9 @@ export class FecDecodePipe implements DataPipe {
                 data.set(part, offset)
                 offset += part.byteLength
             }
+        }
+        if (frame.usedRecovery) {
+            this.framesRecovered++
         }
 
         const duration = frame.timestampUs - this.lastTimestampUs

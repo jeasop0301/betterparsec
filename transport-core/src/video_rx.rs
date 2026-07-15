@@ -66,6 +66,26 @@ pub enum RxEvent {
 
 // ── Internal reassembly state ─────────────────────────────────────────────
 
+/// Recovery/loss-span counters for one [`VideoReceiver`] (U2 P2 groundwork —
+/// see the seam documentation on `fec::FecDecoderStats`). Symbol-level
+/// counters are a passthrough snapshot of the underlying [`FecDecoder`];
+/// `frames_recovered` is the one counter this layer owns, since only the
+/// chunk-reassembly seam here knows which source seqs (recovered vs
+/// directly received) contributed to a completed frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VideoReceiverStats {
+    pub source_symbols_received: u64,
+    pub repair_symbols_received: u64,
+    pub symbols_recovered: u64,
+    /// Completed frames that used at least one FEC-recovered source symbol
+    /// (chosen seam: [`VideoReceiver::assemble_frame`], checking the
+    /// `used_recovery` flag accumulated in [`PendingFrame`] as chunks
+    /// arrived — set at [`VideoReceiver::deliver_chunk`]).
+    pub frames_recovered: u64,
+    pub loss_spans: u64,
+    pub loss_spans_recovered: u64,
+}
+
 #[derive(Debug)]
 struct PendingFrame {
     /// Header fields from the first chunk seen (TS mirror: later chunks'
@@ -76,6 +96,9 @@ struct PendingFrame {
     /// index = chunk_index, value = fragment bytes.
     parts: Vec<Option<Vec<u8>>>,
     received_count: u16,
+    /// Set once any delivered chunk arrived via FEC recovery rather than
+    /// direct receipt. Feeds `stats.frames_recovered` on completion.
+    used_recovery: bool,
 }
 
 // ── VideoReceiver ─────────────────────────────────────────────────────────
@@ -106,6 +129,9 @@ pub struct VideoReceiver {
     symbols_since_ack: u32,
     last_ack_time_ms: u64,
     last_acked_highest: Option<u32>,
+    /// Completed frames that used >=1 FEC-recovered symbol (see
+    /// [`VideoReceiverStats::frames_recovered`]).
+    frames_recovered: u64,
 }
 
 impl VideoReceiver {
@@ -120,6 +146,7 @@ impl VideoReceiver {
             symbols_since_ack: 0,
             last_ack_time_ms: now_ms,
             last_acked_highest: None,
+            frames_recovered: 0,
         }
     }
 
@@ -135,8 +162,10 @@ impl VideoReceiver {
         let mut out = Vec::new();
         for ev in self.decoder.push_symbol(sym) {
             match ev {
-                DecoderEvent::Recovered { payload, .. } => {
-                    if let Some(unit) = self.deliver_chunk(&payload) {
+                DecoderEvent::Recovered {
+                    payload, via_fec, ..
+                } => {
+                    if let Some(unit) = self.deliver_chunk(&payload, via_fec) {
                         out.push(RxEvent::Frame(unit));
                     }
                     if let Some(ack) = self.tick_ack(now_ms) {
@@ -166,11 +195,26 @@ impl VideoReceiver {
         self.decoder.highest_fully_decoded()
     }
 
+    /// Snapshot of recovery/loss-span counters accumulated so far (Copy
+    /// struct; cheap to call at any time). Symbol-level fields passthrough
+    /// [`FecDecoder::stats`]; `frames_recovered` is tracked here.
+    pub fn stats(&self) -> VideoReceiverStats {
+        let d = self.decoder.stats();
+        VideoReceiverStats {
+            source_symbols_received: d.source_symbols_received,
+            repair_symbols_received: d.repair_symbols_received,
+            symbols_recovered: d.symbols_recovered,
+            frames_recovered: self.frames_recovered,
+            loss_spans: d.loss_spans,
+            loss_spans_recovered: d.loss_spans_recovered,
+        }
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────
 
     /// Deliver one chunk (source-symbol payload) into the reassembly map.
     /// Returns the finished frame when this chunk completes it.
-    fn deliver_chunk(&mut self, payload: &[u8]) -> Option<DecodeUnit> {
+    fn deliver_chunk(&mut self, payload: &[u8], via_fec: bool) -> Option<DecodeUnit> {
         if payload.len() < CHUNK_HEADER_LEN {
             return None;
         }
@@ -199,6 +243,7 @@ impl VideoReceiver {
                     chunk_count: hdr.chunk_count,
                     parts: vec![None; hdr.chunk_count as usize],
                     received_count: 0,
+                    used_recovery: false,
                 },
             );
             self.pending_order.push(hdr.frame_id);
@@ -208,6 +253,7 @@ impl VideoReceiver {
             .pending
             .get_mut(&hdr.frame_id)
             .expect("inserted above if absent");
+        frame.used_recovery |= via_fec;
 
         // A later chunk's count may disagree with the first-seen one (never
         // produced by our encoder); bound by the allocated parts length.
@@ -243,6 +289,9 @@ impl VideoReceiver {
         let mut data = Vec::with_capacity(total);
         for part in frame.parts.iter().flatten() {
             data.extend_from_slice(part);
+        }
+        if frame.used_recovery {
+            self.frames_recovered += 1;
         }
 
         let duration_us = i64::from(frame.timestamp_us) - i64::from(self.last_timestamp_us);
@@ -409,6 +458,15 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, [30, 40]);
         assert!(frames[0].is_key, "frame 1 is a key frame");
+
+        // U2 P2 groundwork: clean stream (no loss) -> all recovery counters
+        // zero; source count matches the 4 symbols fed.
+        let stats = rx.stats();
+        assert_eq!(stats.source_symbols_received, 4);
+        assert_eq!(stats.symbols_recovered, 0);
+        assert_eq!(stats.frames_recovered, 0);
+        assert_eq!(stats.loss_spans, 0);
+        assert_eq!(stats.loss_spans_recovered, 0);
     }
 
     #[test]
@@ -441,6 +499,17 @@ mod tests {
         assert_eq!(frames.len(), 1, "frame assembled via FEC recovery");
         assert_eq!(frames[0].data, [0xAA, 0xBB, 0xCC, 0xDD]);
         assert_eq!(frames[0].timestamp_us, 5000);
+
+        // U2 P2 groundwork: the frame used a recovered symbol (seq 0), and
+        // the decoder-level counters passthrough correctly.
+        let stats = rx.stats();
+        assert_eq!(stats.frames_recovered, 1, "frame used a recovered symbol");
+        assert_eq!(
+            stats.symbols_recovered, 1,
+            "exactly seq 0 recovered via FEC"
+        );
+        assert_eq!(stats.loss_spans, 1);
+        assert_eq!(stats.loss_spans_recovered, 1);
     }
 
     #[test]
@@ -473,6 +542,53 @@ mod tests {
         // Whether a LossSpan fired already depends on decoder advance logic
         // (TS test makes the same allowance): the contract under test is the
         // latch-then-clear behaviour of the poll.
+        let _ = rx.poll_needs_idr();
+        assert!(!rx.poll_needs_idr(), "needs_idr cleared after one poll");
+
+        // U2 P2 groundwork: whatever the exact LossSpan count (ambiguous per
+        // the comment above), no frame ever used a recovered symbol here
+        // (the recovered payload, if any, is too short to be a valid chunk
+        // header) -- needs-IDR behaviour is unaffected by the new counters.
+        let stats = rx.stats();
+        assert_eq!(
+            stats.frames_recovered, 0,
+            "no frame used a recovered symbol"
+        );
+    }
+
+    #[test]
+    fn stats_unrecoverable_gap_counts_span_but_not_recovered() {
+        // Same scenario as fec.rs's pin_loss_span_emitted_for_bounded_missing_gap:
+        // 1/4 ratio, seqs 2..6 dropped (4 losses, only 2 repairs) -> the gap
+        // is bounded and abandoned, never healed via FEC.
+        let mut rx = VideoReceiver::new(0);
+        let mut enc = FecEncoder::new(FecConfig {
+            redundancy_numerator: 1,
+            redundancy_denominator: 4,
+            window_max_symbols: 64,
+            window_max_bytes: 1 << 24,
+        });
+
+        for i in 0..8u32 {
+            let chunk = build_chunk_payload(i, 0, 1, false, i * 1000, &[i as u8]);
+            let out = enc.push_source(i, &chunk);
+            let drop = (2..6).contains(&i);
+            if !drop {
+                rx.on_message(&encode_symbol_msg(&out.source), 0);
+            }
+            for repair in out.repairs {
+                rx.on_message(&encode_symbol_msg(&repair), 0);
+            }
+        }
+
+        let stats = rx.stats();
+        assert_eq!(stats.loss_spans, 1, "one loss episode observed");
+        assert_eq!(
+            stats.loss_spans_recovered, 0,
+            "the episode was skipped, not healed"
+        );
+        // needs-IDR latch/clear contract is unaffected by the new counters:
+        // whatever the first read is, a second read must be false.
         let _ = rx.poll_needs_idr();
         assert!(!rx.poll_needs_idr(), "needs_idr cleared after one poll");
     }

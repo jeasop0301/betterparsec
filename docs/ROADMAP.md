@@ -375,10 +375,13 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   (`GetCursorInfo` 폴링, CURSOR_SUPPRESSED=hidden, 변화 시만 송신,
   ptScreenPos+GetSystemMetrics 단일 좌표공간 — 정규화 사상엔 일관성만
   필요) + POS 와이어(14B LE) 양측 바이트-핀(`cursor_wire.rs` ↔
-  `web/stream/cursor_wire.ts`, streamer 182 + 웹 5 tests). 잔여 =
-  클라 auto 모드(순수 상태머신: visible→unlock+follow+cursor:none /
-  hidden→pointer lock, 히스테리시스 150ms) + 배선 → [ ] **P2** 모양
-  채널 zero-latency 커서
+  `web/stream/cursor_wire.ts`, streamer 182 + 웹 5 tests). **클라 순수
+  머신 완성** (2026-07-15, `web/stream/cursor_auto.ts` `CursorAutoMode`
+  + 9 tests): visible→unlock / hidden→lock, 히스테리시스 150ms(깜빡임
+  내성·클록 재시작), 전이당 액션 1회, 샘플/틱 양쪽에서 커밋. `cursor`
+  채널 스태시(webrtc.ts, video_qu 패턴)까지 완료. 잔여 = 배선(mouseMode
+  "auto" 옵션 + pointer lock 오케스트레이션(ViewerApp) + follow 전환 +
+  video 영역 cursor:none) → [ ] **P2** 모양 채널 zero-latency 커서
 - [ ] **immersive 모드** — 전체화면 + pointer lock + Keyboard Lock 일괄
   토글 (cursor P1 클라 상태머신에 배선)
 - [ ] 보안 감사(ARCHITECTURE §보안 6항: 서명·짧은토큰·상수시간·replay·안전인코딩·revocation)

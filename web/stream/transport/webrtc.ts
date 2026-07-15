@@ -301,6 +301,22 @@ export class WebRTCTransport implements Transport {
         }
     }
 
+    // cursor channel (M4 cursor P1): reliable + ordered, host → client
+    // visibility/position messages (cursor-channel.md §3).
+    private cursorDataChannel: RTCDataChannel | null = null
+    private onCursorChannelCallback: ((ch: RTCDataChannel) => void) | null = null
+
+    /**
+     * Register a callback that fires when the cursor channel arrives.
+     * If the channel was already received, the callback fires immediately.
+     */
+    setOnCursorChannel(cb: (ch: RTCDataChannel) => void): void {
+        this.onCursorChannelCallback = cb
+        if (this.cursorDataChannel) {
+            cb(this.cursorDataChannel)
+        }
+    }
+
     private channels: Array<TransportChannel | null> = []
     private initChannels() {
         if (!this.peer) {
@@ -419,6 +435,12 @@ export class WebRTCTransport implements Transport {
             this.logger?.debug("Stashing video_qu DataChannel")
             this.quDataChannel = remoteChannel
             this.onQuChannelCallback?.(remoteChannel)
+            return
+        }
+        if (label === "cursor") {
+            this.logger?.debug("Stashing cursor DataChannel")
+            this.cursorDataChannel = remoteChannel
+            this.onCursorChannelCallback?.(remoteChannel)
             return
         }
 

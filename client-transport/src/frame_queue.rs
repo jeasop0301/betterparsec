@@ -336,7 +336,10 @@ mod tests {
         assert_eq!(q.wait_pop(Duration::from_millis(10)), Some(vec![2, 2]));
         let t = Instant::now();
         assert_eq!(q.wait_pop(Duration::from_millis(30)), None);
-        assert!(t.elapsed() >= Duration::from_millis(25), "timed out, not spun");
+        assert!(
+            t.elapsed() >= Duration::from_millis(25),
+            "timed out, not spun"
+        );
     }
 
     #[test]
@@ -362,7 +365,10 @@ mod tests {
         assert_eq!(q.wait_pop(Duration::from_secs(5)), Some(vec![7]));
         let t = Instant::now();
         assert_eq!(q.wait_pop(Duration::from_secs(5)), None);
-        assert!(t.elapsed() < Duration::from_millis(100), "closed pop returns fast");
+        assert!(
+            t.elapsed() < Duration::from_millis(100),
+            "closed pop returns fast"
+        );
     }
 
     #[test]

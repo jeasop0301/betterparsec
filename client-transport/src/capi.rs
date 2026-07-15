@@ -698,7 +698,10 @@ mod tests {
         unsafe {
             // NULL buf with non-zero len must be rejected, not dereferenced.
             ct_receiver_on_message(rx.p(), std::ptr::null(), 5, 0);
-            assert_eq!(ct_receiver_wait_audio(rx.p(), 0, std::ptr::null_mut(), 8), -1);
+            assert_eq!(
+                ct_receiver_wait_audio(rx.p(), 0, std::ptr::null_mut(), 8),
+                -1
+            );
             // NULL out pointer.
             assert_eq!(ct_receiver_poll_ack(rx.p(), std::ptr::null_mut()), 0);
         }

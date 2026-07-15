@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BetterParsec — 초저지연 게임 스트리밍</title>
+<meta name="description" content="직접 만든 초저지연 원격 게임 스트리밍. 서브프레임 파이프라인, FEC 손실 복구, 제로레이턴시 커서.">
+<style>
+:root {
+    --bg: #0b0e14;
+    --panel: #121722;
+    --panel-2: #171d2b;
+    --line: #232c40;
+    --text: #e8ecf4;
+    --muted: #97a3b8;
+    --accent: #5b8cff;
+    --accent-2: #7c5bff;
+    --ok: #3ecf8e;
+    --err: #ff5b6e;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body {
+    background:
+        radial-gradient(1200px 600px at 80% -10%, rgba(91, 140, 255, 0.14), transparent 60%),
+        radial-gradient(900px 500px at 10% 0%, rgba(124, 91, 255, 0.10), transparent 55%),
+        var(--bg);
+    color: var(--text);
+    font-family: "Pretendard", "Segoe UI", "Malgun Gothic", system-ui, sans-serif;
+    line-height: 1.6;
+    min-height: 100vh;
+}
+.wrap { max-width: 980px; margin: 0 auto; padding: 0 24px; }
+header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 22px 0;
+}
+.logo { display: flex; align-items: center; gap: 10px; font-weight: 800; font-size: 18px; letter-spacing: 0.2px; }
+.logo .mark {
+    width: 28px; height: 28px; border-radius: 8px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    box-shadow: 0 0 24px rgba(91, 140, 255, 0.45);
+}
+nav a { color: var(--muted); text-decoration: none; margin-left: 22px; font-size: 14px; }
+nav a:hover { color: var(--text); }
+.hero { padding: 72px 0 48px; text-align: center; }
+.hero h1 {
+    font-size: clamp(34px, 6vw, 56px); font-weight: 900; line-height: 1.15;
+    letter-spacing: -0.5px;
+}
+.hero h1 .grad {
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.hero p { margin: 18px auto 0; max-width: 620px; color: var(--muted); font-size: 17px; }
+.cta { margin-top: 34px; display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+.btn {
+    display: inline-block; padding: 13px 26px; border-radius: 12px;
+    font-weight: 700; font-size: 15px; text-decoration: none; cursor: pointer;
+    border: 1px solid transparent; transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+.btn:hover { transform: translateY(-1px); }
+.btn-primary {
+    color: #fff; background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    box-shadow: 0 8px 30px rgba(91, 140, 255, 0.35);
+}
+.btn-ghost { color: var(--text); border-color: var(--line); background: var(--panel); }
+.badges { margin-top: 22px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+.badge {
+    font-size: 12.5px; color: var(--muted); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px;
+}
+section { padding: 48px 0; }
+h2 { font-size: 26px; font-weight: 800; margin-bottom: 8px; }
+.sub { color: var(--muted); margin-bottom: 28px; font-size: 15px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+.card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+    padding: 22px;
+}
+.card h3 { font-size: 16px; margin-bottom: 8px; }
+.card p { color: var(--muted); font-size: 14px; }
+.card .tag {
+    display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: 0.6px;
+    color: var(--accent); margin-bottom: 10px; text-transform: uppercase;
+}
+.dl {
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    border: 1px solid var(--line); border-radius: 20px; padding: 36px;
+    display: grid; grid-template-columns: 1.2fr 1fr; gap: 32px; align-items: center;
+}
+.dl .meta { color: var(--muted); font-size: 14px; margin-top: 12px; }
+.dl .meta li { margin: 6px 0 6px 18px; }
+.dl form { display: flex; flex-direction: column; gap: 12px; }
+.dl label { font-size: 13px; color: var(--muted); }
+.dl input[type="password"] {
+    background: #0d1220; color: var(--text); border: 1px solid var(--line);
+    border-radius: 12px; padding: 13px 16px; font-size: 15px; outline: none;
+}
+.dl input[type="password"]:focus { border-color: var(--accent); }
+.error { display: none; color: var(--err); font-size: 13.5px; }
+.error.show { display: block; }
+.steps { counter-reset: step; margin-top: 8px; }
+.steps li {
+    list-style: none; counter-increment: step; margin: 10px 0; padding-left: 40px;
+    position: relative; color: var(--muted); font-size: 14px;
+}
+.steps li::before {
+    content: counter(step); position: absolute; left: 0; top: 1px;
+    width: 26px; height: 26px; border-radius: 8px; text-align: center; line-height: 26px;
+    font-weight: 800; font-size: 13px; color: #fff;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+}
+code { background: #0d1220; border: 1px solid var(--line); border-radius: 6px; padding: 1px 7px; font-size: 13px; }
+footer { border-top: 1px solid var(--line); margin-top: 40px; padding: 28px 0 40px; color: var(--muted); font-size: 13px; text-align: center; }
+@media (max-width: 760px) { .dl { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+    <header>
+        <div class="logo"><span class="mark"></span>BetterParsec</div>
+        <nav>
+            <a href="#features">기능</a>
+            <a href="#download">다운로드</a>
+            <a href="#howto">사용법</a>
+        </nav>
+    </header>
+
+    <div class="hero">
+        <h1>내 손으로 만든<br><span class="grad">초저지연 게임 스트리밍</span></h1>
+        <p>Parsec보다 빠르게, 어디서든 내 PC로. 서브프레임 전송 파이프라인과
+           FEC 손실 복구, 제로레이턴시 커서로 원격인 걸 잊게 만드는 것이 목표.</p>
+        <div class="cta">
+            <a class="btn btn-primary" href="#download">네이티브 클라이언트 다운로드</a>
+            <a class="btn btn-ghost" href="https://121.167.176.91:8080" target="_blank" rel="noopener">웹에서 바로 접속</a>
+        </div>
+        <div class="badges">
+            <span class="badge">Windows x64</span>
+            <span class="badge">H.264 / HEVC</span>
+            <span class="badge">1080p 60fps</span>
+            <span class="badge">WebRTC + TCP 폴백</span>
+        </div>
+    </div>
+
+    <section id="features">
+        <h2>왜 BetterParsec인가</h2>
+        <p class="sub">기성품이 대충 넘어가는 지점을 전부 직접 계측하고 고쳤다.</p>
+        <div class="grid">
+            <div class="card">
+                <span class="tag">Latency</span>
+                <h3>서브프레임 파이프라인</h3>
+                <p>호스트 처리 지연 3ms 이하. 프레임이 완성되기 전에 슬라이스 단위로
+                   전송을 시작하는 파이프라인을 향해 설계됨.</p>
+            </div>
+            <div class="card">
+                <span class="tag">Reliability</span>
+                <h3>FEC 손실 복구</h3>
+                <p>패킷이 사라져도 재전송을 기다리지 않는다. RaptorQ 계열 FEC로
+                   손실 스팬을 그 자리에서 복원.</p>
+            </div>
+            <div class="card">
+                <span class="tag">Input</span>
+                <h3>제로레이턴시 커서</h3>
+                <p>커서를 클라이언트에서 직접 그린다. 마우스가 네트워크를 기다리지
+                   않는 로컬 반응성. FPS용 포인터락 자동 전환 포함.</p>
+            </div>
+            <div class="card">
+                <span class="tag">Session</span>
+                <h3>스톨 워치독</h3>
+                <p>화면이 멈추면 IDR 재요청, ICE 재시작, 세션 재접속까지 자동
+                   사다리로 복구. 새로고침할 일이 없어야 정상.</p>
+            </div>
+            <div class="card">
+                <span class="tag">Immersive</span>
+                <h3>몰입 모드</h3>
+                <p>전체화면 + 키보드락 + 포인터락 원터치. Alt+Tab, Win키까지
+                   원격 PC로 전달되는 게이밍 모드.</p>
+            </div>
+            <div class="card">
+                <span class="tag">Workflow</span>
+                <h3>클립보드 동기화</h3>
+                <p>양방향 텍스트 클립보드. 복사는 저쪽에서, 붙여넣기는 이쪽에서.</p>
+            </div>
+        </div>
+    </section>
+
+    <section id="download">
+        <h2>다운로드</h2>
+        <p class="sub">네이티브 클라이언트는 웹보다 한 단계 낮은 지연과 하드웨어 디코딩 제어를 제공한다.</p>
+        <div class="dl">
+            <div>
+                <h3>BetterParsec Portable (Windows x64)</h3>
+                <ul class="meta">
+                    <li>압축 해제 후 설치 없이 바로 실행</li>
+                    <li>FFmpeg 하드웨어 디코더 포함 (약 62 MB)</li>
+                    <li>동봉된 <code>run-incheon.bat</code> 실행이면 끝</li>
+                </ul>
+            </div>
+            <form method="post" action="/api/download">
+                <label for="pw">다운로드 비밀번호</label>
+                <input id="pw" name="password" type="password" autocomplete="current-password" placeholder="비밀번호 입력" required>
+                <p class="error" id="pw-error">비밀번호가 올바르지 않습니다.</p>
+                <button class="btn btn-primary" type="submit">zip 다운로드</button>
+            </form>
+        </div>
+    </section>
+
+    <section id="howto">
+        <h2>사용법</h2>
+        <p class="sub">처음 받는 사람 기준 3단계.</p>
+        <ol class="steps">
+            <li>zip을 받아 원하는 폴더에 압축 해제한다.</li>
+            <li><code>run-incheon.bat</code>을 실행한다. 자체 서명 인증서 경고가 뜨면 계속을 누른다.</li>
+            <li>계정으로 로그인하면 호스트 PC 화면이 뜬다. 웹 접속은 상단의 "웹에서 바로 접속" 버튼.</li>
+        </ol>
+    </section>
+
+    <footer>
+        BetterParsec — 개인 프로젝트. 배포 빌드는 호스트에서 서명 없이 패키징된다.
+    </footer>
+</div>
+<script>
+// Surface the wrong-password bounce (?error=1) from the worker.
+if (new URLSearchParams(location.search).get("error") === "1") {
+    document.getElementById("pw-error").classList.add("show");
+    document.getElementById("pw").focus();
+}
+</script>
+</body>
+</html>

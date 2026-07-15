@@ -1,0 +1,4 @@
+# Local dev secrets and wrangler state
+.dev.vars
+.wrangler/
+node_modules/

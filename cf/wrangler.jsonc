@@ -1,0 +1,18 @@
+// BetterParsec distribution site: static landing page (Workers Assets)
+// plus a password-gated download endpoint streaming the portable zip
+// from R2 (the 62 MB zip exceeds the 25 MiB static-asset limit).
+{
+    "name": "betterparsec",
+    "main": "src/worker.js",
+    "compatibility_date": "2026-07-01",
+    "assets": {
+        "directory": "./public",
+        "binding": "ASSETS"
+    },
+    "r2_buckets": [
+        {
+            "binding": "DIST",
+            "bucket_name": "betterparsec-dist"
+        }
+    ]
+}

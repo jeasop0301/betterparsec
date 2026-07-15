@@ -306,9 +306,16 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
 - **검증:** 동일 delivered bitrate에서 AV1 4:2:0 / HEVC 4:2:0 / HEVC 4:4:4 정지·모션·색텍스트 채점.
 
 ## M4 — 하드닝 + 세션 UX (owner 요구로 선택 → 필수 승격, 2026-07-14)
-- [ ] **스톨 감지·복구 사다리** (현장 이슈 #1): 클라 프레임 수신 워치독 →
+- [~] **스톨 감지·복구 사다리** (현장 이슈 #1): 클라 프레임 수신 워치독 →
   IDR 요청 → ICE restart → 전체 재접속 에스컬레이션 + 가시 상태 표시.
   hard gate 복원력(freeze/min, 15분 disconnect 0)의 전제.
+  **순수 상태머신 완성** (2026-07-15, `web/stream/session_ux.ts`
+  `StallWatchdog` + 15 tests): 틱 구동 사다리(indicator 1s → IDR 2s/4s/6s
+  → ICE restart 10s → reconnect 20s, 미튜닝 기본값), 틱당 최대 1단
+  에스컬레이션(백그라운드 탭 타이머 스로틀 시 사다리 일괄 발화 방지),
+  pause/resume(document-hidden), 회복 시 `recovered{stalledMs}` + 사다리
+  리셋. 잔여 = 배선(index.ts 프레임 신호·`RequestVideoIdr`·ICE
+  restart·재접속 + 인디케이터 DOM) + Rust 미러(네이티브 세션).
 - [ ] **커서 P1** — `cursor` DataChannel + 호스트 권위 자동 lock/unlock
   (cursor-channel.md §3 P1, 설계 완료) → [ ] **P2** 모양 채널
   zero-latency 커서

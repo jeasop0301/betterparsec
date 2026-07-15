@@ -335,6 +335,30 @@ export class WebRTCTransport implements Transport {
     private videoTrackHolder: TrackHolder = { ontrack: null, track: null }
     private videoReceiver: RTCRtpReceiver | null = null
 
+    /**
+     * M4 stall watchdog frame signal for videotrack pipelines: cumulative
+     * decoded frame count of the inbound video receiver, or null when no
+     * receiver/stat is available yet. Polled from the watchdog tick driver.
+     */
+    async getVideoFramesDecoded(): Promise<number | null> {
+        const receiver = this.videoReceiver
+        if (!receiver) {
+            return null
+        }
+        try {
+            const stats = await receiver.getStats()
+            let framesDecoded: number | null = null
+            stats.forEach((value) => {
+                if (value.type === "inbound-rtp" && typeof value.framesDecoded === "number") {
+                    framesDecoded = value.framesDecoded
+                }
+            })
+            return framesDecoded
+        } catch {
+            return null
+        }
+    }
+
     private audioTrackHolder: TrackHolder = { ontrack: null, track: null }
 
     private onTrack(event: RTCTrackEvent) {

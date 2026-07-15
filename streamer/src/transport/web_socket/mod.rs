@@ -282,6 +282,11 @@ impl TransportSender for WebSocketTransportSender {
                     return Err(TransportError::Closed);
                 }
             }
+            // M4 stall watchdog: signaling-socket IDR request (RestartIce is
+            // WebRTC-only and intentionally falls through to `_`).
+            ServerIpcMessage::WebSocket(StreamClientMessage::RequestIdr) => {
+                self.needs_idr.store(true, Ordering::Release);
+            }
             _ => {}
         }
         Ok(())

@@ -141,6 +141,13 @@ impl WebRtcVideo {
         self.supported_video_formats = supported_codecs;
     }
 
+    /// M4 stall watchdog: the client asked for an IDR over the signaling
+    /// socket. Same flag the RTCP PLI handler sets — consumed by the next
+    /// `send_video_unit` poll.
+    pub fn request_idr(&self) {
+        self.needs_idr.store(true, Ordering::Release);
+    }
+
     /// Sets the ABR ceiling from the stream's initial bitrate (kbps), and seeds
     /// the live target to it. Called at StartStream, before [`Self::setup`].
     pub fn set_configured_bitrate_kbps(&mut self, kbps: u32) {

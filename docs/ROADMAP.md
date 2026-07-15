@@ -177,8 +177,8 @@ U5/M6 스파이크, f1-ack 소스 확인+0x5509 호스트 패치.
    판정 + 커서 단일화 확인, ②host 롤 — 임베디드 서버로 paired 접속
    (`BP_SUNSHINE_STAGE` 관리형 Sunshine은 이 머신에 Foundation
    스테이지 부재 확인(2026-07-15) — MSYS2 UCRT64 재빌드 세션에서) →
-   다음 헤드리스 대형 항목: M4 `session-ux` 상태머신(커서
-   P1·스톨 워치독·immersive, Rust+TS 미러) · U3 per-slice DU
+   다음 헤드리스 대형 항목: M4 `session-ux`(스톨 워치독 웹 배선 완료
+   2026-07-15 — 잔여: Rust 미러, 커서 P1, immersive) · U3 per-slice DU
    depacketizer 패치. 이후는 전부 라이브 게이트(Gate B/C).
 5. Gate B 2-machine 첫 신뢰 run — 이후 U1 CC 신호 판정, U2 P2 손실 복구
    실측·비율 튜닝, U3/U5 지연 계측이 전부 이 위에서 순차 판정된다.
@@ -314,8 +314,16 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   → ICE restart 10s → reconnect 20s, 미튜닝 기본값), 틱당 최대 1단
   에스컬레이션(백그라운드 탭 타이머 스로틀 시 사다리 일괄 발화 방지),
   pause/resume(document-hidden), 회복 시 `recovered{stalledMs}` + 사다리
-  리셋. 잔여 = 배선(index.ts 프레임 신호·`RequestVideoIdr`·ICE
-  restart·재접속 + 인디케이터 DOM) + Rust 미러(네이티브 세션).
+  리셋. **웹 배선 완료** (2026-07-15, 헤드리스 검증): 250ms 틱 드라이버 +
+  프레임 신호(FEC/data 경로는 수신 리스너 직결, videotrack 경로는 receiver
+  `framesDecoded` 폴링) + 인디케이터 DOM(`.stream-stall-indicator`, 양
+  테마) + 신규 시그널링 메시지 `StreamClientMessage::RequestIdr`(전
+  전송에서 needs_idr — 데이터 경로 사망에도 생존)·`RestartIce`(스트리머
+  webrtc `send_offer(ice_restart=true)` 재-offer, 클라 answer 경로 기존) +
+  reconnect = 기존 fresh-ws 재접속 경로 재사용(`restartSessionWithFreshWs`
+  추출). 검증: tsc + 웹 70 tests, streamer 180 + common 81(신규 wire-pin
+  1), clippy·fmt 클린. 잔여 = Rust 미러(네이티브 세션) + 라이브 스톨 주입
+  스모크(clumsy full-block) + Gate B/C 임계 튜닝.
 - [ ] **커서 P1** — `cursor` DataChannel + 호스트 권위 자동 lock/unlock
   (cursor-channel.md §3 P1, 설계 완료) → [ ] **P2** 모양 채널
   zero-latency 커서

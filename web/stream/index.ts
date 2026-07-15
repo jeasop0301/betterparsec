@@ -10,6 +10,7 @@ import { defaultStreamInputConfig, StreamInput } from "./input.js"
 import { Logger, LogMessageInfo } from "./log.js"
 import { gatherPipeInfo } from "./pipeline/index.js"
 import { BenchmarkContext, StreamStats } from "./stats.js"
+import { StallWatchdog, WatchdogAction } from "./session_ux.js"
 import { Transport, TransportShutdown } from "./transport/index.js"
 import { WebSocketTransport } from "./transport/web_socket.js"
 import { WebRTCTransport } from "./transport/webrtc.js"
@@ -91,6 +92,9 @@ function isFirefox(): boolean {
 
 const WEBRTC_CONNECT_TIMEOUT_MS = 15000
 const FALLBACK_RECONNECT_DELAY_MS = 500
+// M4 stall watchdog tick period. The ladder escalates at most one rung per
+// tick; thresholds live in session_ux.ts DEFAULT_WATCHDOG_CONFIG.
+const WATCHDOG_TICK_MS = 250
 
 export class Stream implements Component {
     private logger: Logger = new Logger()
@@ -120,6 +124,13 @@ export class Stream implements Component {
     private hasConnectionComplete = false
     private hasVideoReady = false
     private hasDispatchedVideoReady = false
+
+    // ── M4 stall watchdog (field issue #1): pure ladder + thin wiring ──────
+    private watchdog = new StallWatchdog()
+    private watchdogInterval: number | null = null
+    private watchdogBusy = false
+    private lastFramesDecoded: number | null = null
+    private stallIndicator = document.createElement("div")
 
     constructor(api: Api, hostId: number, appId: number, settings: Settings, viewerScreenSize: [number, number], permissions: StreamPermissions) {
         this.logger.addInfoListener((info, type) => {
@@ -171,6 +182,20 @@ export class Stream implements Component {
             },
         }
         this.stats = new StreamStats(this.logger, benchmarkContext)
+
+        // M4 stall watchdog: user-visible indicator + hidden-tab pause (a
+        // hidden tab legitimately stops rendering; it must not escalate).
+        this.stallIndicator.classList.add("stream-stall-indicator")
+        this.stallIndicator.textContent = "Connection stalled — recovering…"
+        this.stallIndicator.hidden = true
+        this.divElement.appendChild(this.stallIndicator)
+        document.addEventListener("visibilitychange", () => {
+            if (document.visibilityState === "visible") {
+                this.watchdog.resume(performance.now())
+            } else {
+                this.watchdog.pause()
+            }
+        })
     }
 
     private debugLog(message: string, additional?: LogMessageInfo) {
@@ -205,6 +230,7 @@ export class Stream implements Component {
             detail: { type: "videoReady" }
         })
         this.eventTarget.dispatchEvent(event)
+        this.startWatchdog()
     }
 
     private async onMessage(message: StreamServerMessage) {
@@ -287,6 +313,7 @@ export class Stream implements Component {
             const code = message.ConnectionTerminated.error_code
 
             this.debugLog(`ConnectionTerminated with code ${code}`, { type: "fatalDescription" })
+            this.stopWatchdog()
         }
         // -- WebRTC Config
         else if ("Setup" in message) {
@@ -332,6 +359,7 @@ export class Stream implements Component {
             await this.tryWebSocketTransport()
         }
 
+        this.stopWatchdog()
         this.debugLog("Tried all configured transport options but no connection was possible", { type: "fatal" })
     }
 
@@ -380,6 +408,15 @@ export class Stream implements Component {
     }
     private async restartWithFreshTransportFallback(transport: TransportType): Promise<void> {
         this.transportOverride = transport
+        await this.restartSessionWithFreshWs()
+    }
+    /**
+     * Full session restart (transport fallback + M4 watchdog `reconnect`
+     * rung): tears down the transport and the control socket, then re-inits.
+     * The server spawns a fresh streamer for the new control socket.
+     */
+    private async restartSessionWithFreshWs(): Promise<void> {
+        this.stopWatchdog()
         this.resetVideoReadyState()
 
         if (this.transport) {
@@ -405,6 +442,85 @@ export class Stream implements Component {
 
         this.ws = this.createControlWebSocket()
         this.sendInitMessage()
+    }
+
+    // ── M4 stall watchdog wiring (field issue #1) ──────────────────────────
+    // The pure ladder lives in session_ux.ts; this layer only feeds it wall
+    // clock / frame signals and executes the returned actions.
+
+    private startWatchdog() {
+        this.stopWatchdog()
+        this.lastFramesDecoded = null
+        this.watchdog.start(performance.now())
+        this.watchdogInterval = window.setInterval(() => { void this.watchdogTick() }, WATCHDOG_TICK_MS)
+    }
+    private stopWatchdog() {
+        if (this.watchdogInterval != null) {
+            window.clearInterval(this.watchdogInterval)
+            this.watchdogInterval = null
+        }
+        this.watchdog.stop()
+        this.stallIndicator.hidden = true
+    }
+    /** Frame signal from the data-channel pipelines (FEC / websocket data). */
+    private watchdogFrameReceived() {
+        this.runWatchdogActions(this.watchdog.frameReceived(performance.now()))
+    }
+    private async watchdogTick(): Promise<void> {
+        if (this.watchdogBusy) {
+            return
+        }
+        this.watchdogBusy = true
+        try {
+            // Videotrack pipelines deliver frames inside the browser media
+            // stack (no per-frame callback in this layer): poll the receiver's
+            // cumulative framesDecoded counter as the frame signal. Data
+            // pipelines signal directly from their receive listeners instead.
+            if (this.transport instanceof WebRTCTransport) {
+                const decoded = await this.transport.getVideoFramesDecoded()
+                if (decoded != null && decoded !== this.lastFramesDecoded) {
+                    const first = this.lastFramesDecoded == null
+                    this.lastFramesDecoded = decoded
+                    if (!first) {
+                        this.watchdogFrameReceived()
+                    }
+                }
+            }
+        } finally {
+            this.watchdogBusy = false
+        }
+        this.runWatchdogActions(this.watchdog.tick(performance.now()))
+    }
+    private runWatchdogActions(actions: WatchdogAction[]) {
+        for (const action of actions) {
+            switch (action.type) {
+                case "stall":
+                    this.debugLog("Stall watchdog: no frames delivered — showing indicator", { type: "informError" })
+                    this.stallIndicator.hidden = false
+                    break
+                case "recovered":
+                    this.debugLog(`Stall watchdog: recovered after ${Math.round(action.stalledMs)}ms`, { type: "recover" })
+                    this.stallIndicator.hidden = true
+                    break
+                case "requestIdr":
+                    // Over the signaling socket — survives a dead data path.
+                    this.debugLog(`Stall watchdog: requesting IDR (attempt ${action.attempt})`)
+                    this.sendWsMessage("RequestIdr")
+                    break
+                case "restartIce":
+                    // WebRTC only: the websocket transport has no ICE — the
+                    // ladder proceeds to the reconnect rung on its own.
+                    if (this.transport instanceof WebRTCTransport) {
+                        this.debugLog("Stall watchdog: requesting ICE restart")
+                        this.sendWsMessage("RestartIce")
+                    }
+                    break
+                case "reconnect":
+                    this.debugLog("Stall watchdog: escalating to full reconnect", { type: "ifErrorDescription" })
+                    void this.restartSessionWithFreshWs()
+                    break
+            }
+        }
     }
 
     private setTransport(transport: Transport) {
@@ -742,6 +858,7 @@ export class Stream implements Component {
                             ? event.data
                             : event.data.buffer
                         this.markVideoReady()
+                        this.watchdogFrameReceived()
                         videoRenderer.submitPacket(buf)
 
                         // After each symbol, check if IDR is needed
@@ -795,6 +912,7 @@ export class Stream implements Component {
 
             video.addReceiveListener((data) => {
                 this.markVideoReady()
+                this.watchdogFrameReceived()
                 videoRenderer.submitPacket(data)
 
                 // data pipeline support requesting idrs over video channel

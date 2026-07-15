@@ -473,6 +473,12 @@ pub enum StreamClientMessage {
     StartStream {
         settings: StreamSettings,
     },
+    /// M4 stall watchdog: ask the encoder for an IDR frame via the signaling
+    /// socket — survives a dead data path (all transports honor it).
+    RequestIdr,
+    /// M4 stall watchdog: ask the host to send a fresh offer with new ICE
+    /// credentials (ICE restart). WebRTC transport only; others ignore it.
+    RestartIce,
 }
 
 #[derive(Serialize, Deserialize, Debug, TS, Clone, Default)]
@@ -1214,3 +1220,33 @@ ts_consts!(
     pub const AV1_HIGH8_444: u32 = VideoFormats::AV1_HIGH8_444.bits();
     pub const AV1_HIGH10_444: u32 = VideoFormats::AV1_HIGH10_444.bits();
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the JSON wire form the web client sends for the M4 stall-watchdog
+    /// control messages (unit variants must serialize to bare strings — the
+    /// TS side sends the string literal over the signaling WebSocket).
+    #[test]
+    fn watchdog_ws_messages_serialize_as_bare_strings() {
+        assert_eq!(
+            serde_json::to_string(&StreamClientMessage::RequestIdr).expect("serialize RequestIdr"),
+            "\"RequestIdr\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StreamClientMessage::RestartIce).expect("serialize RestartIce"),
+            "\"RestartIce\""
+        );
+        assert!(matches!(
+            serde_json::from_str::<StreamClientMessage>("\"RequestIdr\"")
+                .expect("deserialize RequestIdr"),
+            StreamClientMessage::RequestIdr
+        ));
+        assert!(matches!(
+            serde_json::from_str::<StreamClientMessage>("\"RestartIce\"")
+                .expect("deserialize RestartIce"),
+            StreamClientMessage::RestartIce
+        ));
+    }
+}

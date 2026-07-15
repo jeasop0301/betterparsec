@@ -47,6 +47,7 @@ use webrtc::{
     peer_connection::{
         RTCPeerConnection,
         configuration::RTCConfiguration,
+        offer_answer_options::RTCOfferOptions,
         peer_connection_state::RTCPeerConnectionState,
         sdp::{sdp_type::RTCSdpType, session_description::RTCSessionDescription},
     },
@@ -409,8 +410,15 @@ impl WebRtcInner {
     }
 
     // -- Handle Signaling
-    async fn send_offer(&self) -> bool {
-        let local_description = match self.peer.create_offer(None).await {
+    /// `ice_restart = true` creates the offer with fresh ICE credentials
+    /// (M4 stall watchdog `RestartIce` rung); the client answers the re-offer
+    /// through the normal signaling path.
+    async fn send_offer(&self, ice_restart: bool) -> bool {
+        let offer_options = ice_restart.then(|| RTCOfferOptions {
+            ice_restart: true,
+            ..Default::default()
+        });
+        let local_description = match self.peer.create_offer(offer_options).await {
             Err(err) => {
                 error!("[Signaling]: failed to create offer: {err:?}");
                 return false;
@@ -525,6 +533,21 @@ impl WebRtcInner {
                     .await
                 {
                     warn!("[Signaling]: failed to add ice candidate: {err:?}");
+                }
+            }
+            // M4 stall watchdog: the client detected a stall and asks for an
+            // IDR over the signaling socket (works even when the data path is
+            // dead — PLI would need working RTCP).
+            StreamClientMessage::RequestIdr => {
+                debug!("[Watchdog]: client requested IDR via signaling");
+                self.video.lock().await.request_idr();
+            }
+            // M4 stall watchdog: ICE restart rung — re-offer with fresh ICE
+            // credentials so both sides re-gather candidate pairs.
+            StreamClientMessage::RestartIce => {
+                debug!("[Watchdog]: client requested ICE restart");
+                if !self.send_offer(true).await {
+                    warn!("[Watchdog]: failed to send ICE-restart offer");
                 }
             }
             _ => {}
@@ -740,7 +763,7 @@ impl TransportSender for WebRTCTransportSender {
     }
 
     async fn on_setup_complete(&self) {
-        if !self.inner.send_offer().await {
+        if !self.inner.send_offer(false).await {
             error!("Failed to send offer to client. Requesting Termination");
             self.inner.request_terminate().await;
         }

@@ -1248,6 +1248,26 @@ canvas.video-stream {
     z-index: 1;
 }
 
+/* M4 stall watchdog indicator (stream/index.ts) */
+.stream-stall-indicator {
+    position: fixed;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 5;
+    pointer-events: none;
+    padding: 6px 14px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.65);
+    color: #ffb84d;
+    font-size: 14px;
+    text-shadow: 0 0 4px black;
+}
+
+.stream-stall-indicator[hidden] {
+    display: none;
+}
+
 .local-touch-cursor {
     position: fixed;
     width: 10px;

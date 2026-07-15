@@ -110,6 +110,10 @@ struct VideoShared {
     decoded: AtomicU64,
     decode_errors: AtomicU64,
     hw_device: AtomicBool,
+    /// Client-side sharpen strength, integer percent 0..100 (0 = off).
+    /// Live-adjustable from the shell UI; the present thread reads it each
+    /// frame. Seeded from `BP_SHARPEN` at surface creation.
+    sharpen_pct: std::sync::atomic::AtomicU32,
 }
 
 #[cfg(feature = "video")]
@@ -396,6 +400,11 @@ struct App {
     immersive: immersive::Immersive,
     #[cfg(all(windows, feature = "video"))]
     capture: std::sync::Arc<input::CaptureShared>,
+    /// Client-side sharpen strength (0..100 percent), live UI slider.
+    /// Seeded from `BP_SHARPEN`; pushed to `VideoShared::sharpen_pct` each
+    /// frame so the present thread applies it (present.rs sharpen pass).
+    #[cfg(feature = "video")]
+    sharpen_pct: u32,
 }
 
 impl App {
@@ -424,6 +433,12 @@ impl App {
             immersive: immersive::Immersive::default(),
             #[cfg(all(windows, feature = "video"))]
             capture: std::sync::Arc::default(),
+            #[cfg(feature = "video")]
+            sharpen_pct: std::env::var("BP_SHARPEN")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(0)
+                .min(100),
         }
     }
 
@@ -648,6 +663,19 @@ impl eframe::App for App {
                             run.audio.packets.load(Ordering::Relaxed),
                             run.audio.decode_errors.load(Ordering::Relaxed),
                         ));
+                    }
+
+                    // Client-side sharpen (present.rs CAS/unsharp pass):
+                    // a live slider so it's adjustable without env/batch.
+                    #[cfg(feature = "video")]
+                    {
+                        ui.horizontal(|ui| {
+                            ui.label("sharpen");
+                            ui.add(egui::Slider::new(&mut self.sharpen_pct, 0..=100).suffix("%"));
+                        });
+                        run.video
+                            .sharpen_pct
+                            .store(self.sharpen_pct, Ordering::Relaxed);
                     }
                     ui.add_space(8.0);
                     let disconnect = ui.button("Disconnect").clicked();

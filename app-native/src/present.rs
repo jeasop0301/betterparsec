@@ -846,6 +846,8 @@ fn render_loop(hwnd: HWND, shared: &Arc<VideoShared>) {
             }
         }
         let r = renderer.as_mut().expect("initialized above");
+        // Live sharpen strength from the shell UI (0..100 percent).
+        r.sharpen = (shared.sharpen_pct.load(Ordering::Relaxed).min(100) as f32) / 100.0;
         if let Err(e) = r.draw(&frame).and_then(|()| r.present()) {
             // Device removed/reset etc.: retry a fresh device once per
             // frame; latch fallback only if recreation also fails.

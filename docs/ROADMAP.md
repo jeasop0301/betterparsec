@@ -481,8 +481,20 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   `wantsPointerLock`(relative 또는 auto+wantsLock, DOM-free 헬퍼 +3
   tests) 시 pointer lock; 이탈 = 버튼/fullscreen 상실/lock 상실 3경로가
   동일 teardown으로 수렴(키보드 unlock 누수 없음). **라이브 판정 PASS**
-  (2026-07-15, owner: "굉장히 잘 작동"). 잔여 = 네이티브 셸
-  immersive(RawInput, Phase B)
+  (2026-07-15, owner: "굉장히 잘 작동"). **네이티브 Phase B1 기계 완성**
+  (2026-07-16 새벽, 헤드리스 검증): `immersive.rs` 순수 틱 머신(웹
+  시맨틱 미러 — 진입은 fullscreen+focus 확인 후에만 Engage, 이탈은
+  버튼/fullscreen 상실/포커스 상실 3경로가 단일 Release로 수렴,
+  reset은 상태별 owed 액션 반환, 8 tests) + RawInput 상대 마우스
+  (`RegisterRawInputDevices` 자식 HWND 타깃, WM_INPUT→`raw_mouse_delta`
+  순수 변환: absolute 플래그/제로 모션 드롭·i16 클램프, 델타 무스케일
+  전송 = moonlight-native 시맨틱, MOUSE_RELATIVE 채널) + 캡처 중 절대
+  WM_MOUSEMOVE 억제·커서 강제 숨김 + `ClipCursor` 매 프레임
+  재단언(이동/리사이즈 이벤트 플러밍 불요) + egui viewport fullscreen
+  토글 + 전역 해제 안전망(surface Drop·세션 리셋 3경로, 클립/등록
+  잔류 없음). app-native 43 tests. 잔여 = Phase B2: LL 키보드 훅
+  (Win/Alt-Tab 캡처 — Keyboard Lock 등가) + immersive 중 host-authority
+  auto 전환(CursorShared visibility) + 라이브 판정.
 - [ ] 보안 감사(ARCHITECTURE §보안 6항: 서명·짧은토큰·상수시간·replay·안전인코딩·revocation)
 - [ ] 입력(Gamepad/Keyboard Lock) secure-context 동작, 오디오, 재접속 안정성
 - [ ] upstream 병합 전략 정리

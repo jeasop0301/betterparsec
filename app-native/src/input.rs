@@ -30,9 +30,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, HTCLIENT, SetCursor, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    GetClientRect, HTCLIENT, SetCursor, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
+    WM_XBUTTONUP,
 };
 
 use crate::VideoShared;
@@ -47,6 +48,71 @@ pub struct InputCtx {
     /// Cursor the child should show over its client area (0 = hide) —
     /// written by the shell pump (M4 cursor P2, cursor_icon.rs).
     pub cursor: Arc<ActiveCursor>,
+    /// Immersive relative-capture flag (M4 Phase B, immersive.rs) —
+    /// while set, WM_INPUT raw deltas own mouse movement and the
+    /// absolute WM_MOUSEMOVE translation is suppressed.
+    pub capture: Arc<CaptureShared>,
+}
+
+/// Shell→wndproc shared immersive capture state.
+#[derive(Debug, Default)]
+pub struct CaptureShared(std::sync::atomic::AtomicBool);
+
+impl CaptureShared {
+    pub fn set_relative(&self, on: bool) {
+        self.0.store(on, Ordering::Release);
+    }
+
+    pub fn relative(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// RAWMOUSE.usFlags bit 0 — absolute-coordinate packet (tablets,
+/// injected input). Phase B1 consumes relative packets only.
+const MOUSE_MOVE_ABSOLUTE_FLAG: u16 = 0x01;
+
+/// Pure raw-mouse translation (unit-tested): relative packets clamp to
+/// the wire's i16 delta; absolute-flagged and zero-motion packets are
+/// dropped. Deltas go on the wire unscaled (mickeys), matching
+/// moonlight-native semantics — the host injects them as relative
+/// motion, so pointer-speed/accel of the client OS never applies.
+fn raw_mouse_delta(us_flags: u16, dx: i32, dy: i32) -> Option<(i16, i16)> {
+    if us_flags & MOUSE_MOVE_ABSOLUTE_FLAG != 0 {
+        return None;
+    }
+    if dx == 0 && dy == 0 {
+        return None;
+    }
+    Some((
+        dx.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+        dy.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+    ))
+}
+
+/// Reads one WM_INPUT packet's mouse delta from the given HRAWINPUT
+/// lparam. `None` for non-mouse packets, absolute packets, or API
+/// failure.
+fn read_raw_mouse(lparam: LPARAM) -> Option<(i16, i16)> {
+    use windows::Win32::UI::Input::{
+        GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTHEADER, RID_INPUT, RIM_TYPEMOUSE,
+    };
+    let mut raw = RAWINPUT::default();
+    let mut size = size_of::<RAWINPUT>() as u32;
+    let got = unsafe {
+        GetRawInputData(
+            HRAWINPUT(lparam.0 as *mut core::ffi::c_void),
+            RID_INPUT,
+            Some(&mut raw as *mut RAWINPUT as *mut core::ffi::c_void),
+            &mut size,
+            size_of::<RAWINPUTHEADER>() as u32,
+        )
+    };
+    if got == u32::MAX || raw.header.dwType != RIM_TYPEMOUSE.0 {
+        return None;
+    }
+    let mouse = unsafe { raw.data.mouse };
+    raw_mouse_delta(mouse.usFlags.0, mouse.lLastX, mouse.lLastY)
 }
 
 /// Geometry needed to map client coordinates onto the stream.
@@ -182,9 +248,14 @@ fn current_modifiers() -> KeyModifiers {
 }
 
 /// Applies the shell-published stream cursor (0 = hide — the P1 posture;
-/// non-zero = client-rendered host shape, M4 cursor P2).
+/// non-zero = client-rendered host shape, M4 cursor P2). Immersive
+/// relative capture force-hides regardless of the shape slot.
 fn apply_cursor(ctx: &InputCtx) {
-    let handle = ctx.cursor.get();
+    let handle = if ctx.capture.relative() {
+        0
+    } else {
+        ctx.cursor.get()
+    };
     let cursor = (handle != 0).then_some(windows::Win32::UI::WindowsAndMessaging::HCURSOR(
         handle as *mut core::ffi::c_void,
     ));
@@ -221,6 +292,21 @@ pub fn handle(
     // through to translate() below.
     if msg == WM_MOUSEMOVE {
         apply_cursor(ctx);
+        // Immersive relative capture: WM_INPUT owns movement — never
+        // translate clipped-cursor moves into absolute positions.
+        if ctx.capture.relative() {
+            return Some(LRESULT(0));
+        }
+    }
+    // Immersive relative capture: raw deltas → MOUSE_RELATIVE channel.
+    if msg == WM_INPUT {
+        if ctx.capture.relative()
+            && let Some((delta_x, delta_y)) = read_raw_mouse(lparam)
+        {
+            ctx.sender
+                .send(&InboundPacket::MouseMove { delta_x, delta_y });
+        }
+        return None; // DefWindowProc performs WM_INPUT cleanup
     }
 
     // Focus and drag-capture side effects first.
@@ -415,5 +501,31 @@ mod tests {
         assert!(!setcursor_hides(HTBORDER as isize));
         // High word (trigger message) must not affect the decision.
         assert!(setcursor_hides(((0x0200_isize) << 16) | HTCLIENT as isize));
+    }
+
+    #[test]
+    fn raw_mouse_delta_relative_clamps_and_filters() {
+        // Relative packets pass through.
+        assert_eq!(raw_mouse_delta(0, -2, 300), Some((-2, 300)));
+        // Clamp to the wire's i16.
+        assert_eq!(
+            raw_mouse_delta(0, 100_000, -100_000),
+            Some((i16::MAX, i16::MIN))
+        );
+        // Zero motion (button-only packets) is dropped.
+        assert_eq!(raw_mouse_delta(0, 0, 0), None);
+        // Absolute-flagged packets (tablets/injected) are dropped.
+        assert_eq!(raw_mouse_delta(MOUSE_MOVE_ABSOLUTE_FLAG, 5, 5), None);
+        assert_eq!(raw_mouse_delta(MOUSE_MOVE_ABSOLUTE_FLAG | 0x02, 5, 5), None);
+    }
+
+    #[test]
+    fn capture_shared_roundtrip() {
+        let c = CaptureShared::default();
+        assert!(!c.relative());
+        c.set_relative(true);
+        assert!(c.relative());
+        c.set_relative(false);
+        assert!(!c.relative());
     }
 }

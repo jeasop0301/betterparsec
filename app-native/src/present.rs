@@ -349,6 +349,8 @@ pub struct StreamSurface {
     last_rect: (i32, i32, i32, i32),
     /// An `InputCtx` is attached to the window (owned via USERDATA).
     input: bool,
+    /// Immersive mouse capture engaged (RawInput registration + clip).
+    capture: bool,
 }
 
 impl StreamSurface {
@@ -369,6 +371,7 @@ impl StreamSurface {
             thread: Some(thread),
             last_rect: (0, 0, 0, 0),
             input: false,
+            capture: false,
         })
     }
 
@@ -426,11 +429,80 @@ impl StreamSurface {
     pub fn failed(&self) -> bool {
         self.shared.raw_present_failed.load(Ordering::Acquire)
     }
+
+    /// Engage immersive mouse capture (M4 Phase B): register the raw
+    /// mouse for WM_INPUT on the child and focus it. The cursor clip is
+    /// re-asserted per frame via [`Self::clip_cursor_to_self`].
+    pub fn engage_mouse_capture(&mut self) {
+        if self.capture {
+            return;
+        }
+        use windows::Win32::UI::Input::{
+            RAWINPUTDEVICE, RAWINPUTDEVICE_FLAGS, RegisterRawInputDevices,
+        };
+        let rid = RAWINPUTDEVICE {
+            usUsagePage: HID_PAGE_GENERIC,
+            usUsage: HID_USAGE_MOUSE,
+            dwFlags: RAWINPUTDEVICE_FLAGS(0),
+            hwndTarget: self.hwnd,
+        };
+        unsafe {
+            if RegisterRawInputDevices(&[rid], size_of::<RAWINPUTDEVICE>() as u32).is_err() {
+                tracing::warn!("RegisterRawInputDevices failed — relative input unavailable");
+            }
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(self.hwnd));
+        }
+        self.capture = true;
+    }
+
+    /// Release immersive mouse capture (idempotent).
+    pub fn release_mouse_capture(&mut self) {
+        if !self.capture {
+            return;
+        }
+        self.capture = false;
+        release_mouse_capture_global();
+    }
+
+    /// Re-assert the cursor clip onto the child window rect — called
+    /// every frame while immersive, so moves/resizes need no event
+    /// plumbing.
+    pub fn clip_cursor_to_self(&self) {
+        use windows::Win32::UI::WindowsAndMessaging::ClipCursor;
+        let mut rect = RECT::default();
+        unsafe {
+            if GetWindowRect(self.hwnd, &mut rect).is_ok() {
+                let _ = ClipCursor(Some(&rect));
+            }
+        }
+    }
+}
+
+const HID_PAGE_GENERIC: u16 = 0x01;
+const HID_USAGE_MOUSE: u16 = 0x02;
+
+/// Global immersive-capture teardown: deregister the raw mouse and
+/// unclip the cursor. Idempotent, and safe without a live surface (App
+/// reset paths run it after the surface is already gone).
+pub fn release_mouse_capture_global() {
+    use windows::Win32::UI::Input::{RAWINPUTDEVICE, RIDEV_REMOVE, RegisterRawInputDevices};
+    use windows::Win32::UI::WindowsAndMessaging::ClipCursor;
+    let rid = RAWINPUTDEVICE {
+        usUsagePage: HID_PAGE_GENERIC,
+        usUsage: HID_USAGE_MOUSE,
+        dwFlags: RIDEV_REMOVE,
+        hwndTarget: HWND::default(),
+    };
+    unsafe {
+        let _ = RegisterRawInputDevices(&[rid], size_of::<RAWINPUTDEVICE>() as u32);
+        let _ = ClipCursor(None);
+    }
 }
 
 impl Drop for StreamSurface {
     fn drop(&mut self) {
         // Same thread as the wndproc — no message can race the teardown.
+        self.release_mouse_capture();
         self.disable_input();
         self.shared.present_stop.store(true, Ordering::Release);
         self.shared.frame_ready.notify_all();

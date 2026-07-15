@@ -17,6 +17,8 @@ mod audio;
 mod cursor_icon;
 mod host;
 #[cfg(all(windows, feature = "video"))]
+mod immersive;
+#[cfg(all(windows, feature = "video"))]
 mod input;
 #[cfg(all(windows, feature = "video"))]
 mod present;
@@ -388,6 +390,12 @@ struct App {
     client_cursor: bool,
     #[cfg(all(windows, feature = "video"))]
     cursor_state: cursor_icon::ClientCursor,
+    /// Immersive mode (M4 Phase B): fullscreen + RawInput relative mouse
+    /// + cursor clip, one toggle (immersive.rs machine).
+    #[cfg(all(windows, feature = "video"))]
+    immersive: immersive::Immersive,
+    #[cfg(all(windows, feature = "video"))]
+    capture: std::sync::Arc<input::CaptureShared>,
 }
 
 impl App {
@@ -412,6 +420,29 @@ impl App {
             client_cursor: std::env::var("BP_CLIENT_CURSOR").is_ok_and(|v| v == "1"),
             #[cfg(all(windows, feature = "video"))]
             cursor_state: cursor_icon::ClientCursor::default(),
+            #[cfg(all(windows, feature = "video"))]
+            immersive: immersive::Immersive::default(),
+            #[cfg(all(windows, feature = "video"))]
+            capture: std::sync::Arc::default(),
+        }
+    }
+
+    /// Session teardown half of the immersive machine: run the owed
+    /// actions with the surface possibly already gone (global capture
+    /// release is surface-independent).
+    #[cfg(all(windows, feature = "video"))]
+    fn reset_immersive(&mut self, ctx: &eframe::egui::Context) {
+        for action in self.immersive.reset() {
+            match action {
+                immersive::Action::SetFullscreen(on) => {
+                    ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Fullscreen(on))
+                }
+                immersive::Action::Release => {
+                    self.capture.set_relative(false);
+                    present::release_mouse_capture_global();
+                }
+                immersive::Action::Engage => {} // reset never engages
+            }
         }
     }
 
@@ -532,6 +563,7 @@ impl eframe::App for App {
                         {
                             self.surface_failed = false;
                             self.cursor_state.reset(); // per-connection shapes
+                            self.reset_immersive(ctx);
                         }
                         self.running = Some(Running::start(self.form.clone(), ctx.clone()));
                     }
@@ -619,6 +651,16 @@ impl eframe::App for App {
                     }
                     ui.add_space(8.0);
                     let disconnect = ui.button("Disconnect").clicked();
+                    // M4 Phase B: one toggle = fullscreen + RawInput
+                    // relative mouse + cursor clip (immersive.rs).
+                    #[cfg(all(windows, feature = "video"))]
+                    let immersive_clicked = ui
+                        .button(if self.immersive.engaged() {
+                            "Exit immersive"
+                        } else {
+                            "Immersive"
+                        })
+                        .clicked();
                     ui.add_space(4.0);
                     #[cfg(feature = "video")]
                     ui.small("A0/A2: FFmpeg decode + raw D3D11 surface + WASAPI audio + mouse/keyboard to host");
@@ -651,6 +693,7 @@ impl eframe::App for App {
                                                     sender: run.session.input_sender(),
                                                     video: run.video.clone(),
                                                     cursor: self.cursor_state.active_slot(),
+                                                    capture: self.capture.clone(),
                                                 });
                                                 self.surface = Some(s);
                                             }
@@ -718,6 +761,38 @@ impl eframe::App for App {
                                         if self.client_cursor {
                                             self.cursor_state.pump(run.session.cursor());
                                         }
+                                        // M4 Phase B: immersive machine —
+                                        // fullscreen confirmed first, then
+                                        // capture; exits converge on one
+                                        // Release (immersive.rs).
+                                        let (fs, focused) = ctx.input(|i| {
+                                            (
+                                                i.viewport().fullscreen.unwrap_or(false),
+                                                i.viewport().focused.unwrap_or(true),
+                                            )
+                                        });
+                                        for action in
+                                            self.immersive.on_tick(immersive_clicked, fs, focused)
+                                        {
+                                            match action {
+                                                immersive::Action::SetFullscreen(on) => {
+                                                    ctx.send_viewport_cmd(
+                                                        egui::ViewportCommand::Fullscreen(on),
+                                                    )
+                                                }
+                                                immersive::Action::Engage => {
+                                                    self.capture.set_relative(true);
+                                                    s.engage_mouse_capture();
+                                                }
+                                                immersive::Action::Release => {
+                                                    self.capture.set_relative(false);
+                                                    s.release_mouse_capture();
+                                                }
+                                            }
+                                        }
+                                        if self.immersive.engaged() {
+                                            s.clip_cursor_to_self();
+                                        }
                                     }
                                     None => {}
                                 }
@@ -775,6 +850,7 @@ impl eframe::App for App {
                         {
                             self.surface = None; // joins the present thread
                             self.cursor_state.reset();
+                            self.reset_immersive(ctx);
                         }
                         run.stop();
                         #[cfg(feature = "video")]
@@ -790,6 +866,7 @@ impl eframe::App for App {
                             self.surface = None; // joins the present thread
                             self.surface_failed = false; // per-connection latch
                             self.cursor_state.reset();
+                            self.reset_immersive(ctx);
                         }
                         run.stop();
                         #[cfg(feature = "video")]

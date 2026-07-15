@@ -89,6 +89,11 @@ Tetrys FEC · 서브프레임 슬라이스 · QU · 네이티브 클라이언트
 | 게임패드 럼블 | Parsec 출하 | **갭 아님** — 이미 풀배선 확인(capability 광고 → 호스트 이벤트 → vibrationActuator, input.ts) |
 | 마이크 패스스루 | DCV 출하 | 백로그 등재 — vendor에 Foundation mic 훅 잔존(`send_microphone_opus_data` 미사용 경고들), 중형 |
 | 펜/스타일러스 | DCV 출하 | 백로그 — Moonlight 펜 이벤트 존재, 웹 PointerEvent 매핑 미구현, 중형 |
+| **HDR10 end-to-end** | Parsec·Moonlight·GFN 전부 출하 | **미추적 갭(2026-07-16 감사)** — 현 로드맵엔 "게이트 통과 후 주장"으로만 존재, 빌드 트랙 부재. 호스트 HDR 인코드(NVENC 10-bit, Foundation은 HEVC 10-bit YUV444 encode 확인됨) + PQ/HLG 메타데이터 전달 + 브라우저/네이티브 HDR 디코드·프레젠트. **화질 최강 주장의 필수 조건.** 대형(호스트+와이어+클라). Gate E 계열 |
+| **멀티모니터** | Parsec·DCV·Moonlight 전부 출하 | **미추적 갭(2026-07-16 감사)** — 로드맵 전체 언급 0. 모니터 선택(단일 전환) + 스팬/개별 스트림. Sunshine은 output 선택 config 존재 → 클라 모니터 피커 + 와이어가 헤드리스 착수 가능, 호스트 다중 캡처는 포크/config. 데스크톱 실사용의 핵심. 중~대형 |
+| **프라이버시 모드** | Parsec·DCV 출하(호스트 화면 블랭크 + 로컬 입력 차단) | **미추적 갭(2026-07-16 감사)** — **owner 시나리오 직결**(집/사무실에 다른 사람 있을 때 물리 모니터·키보드 차단). 호스트측(Sunshine/포크): 스트림 중 물리 디스플레이 블랭크 + 로컬 HID 차단 토글. 중형, 호스트 포크 |
+| **서라운드 오디오 5.1/7.1** | Moonlight·Sunshine 출하 | **미추적 갭(2026-07-16 감사)** — 현재 opus 스테레오 전용. 클라 멀티채널 opus 디코드 + 채널맵 + WASAPI 멀티채널 렌더(app-native 오디오 변환 테스트 패턴으로 헤드리스 검증 가능). 호스트는 Sunshine 서라운드 config. 중형, 클라측 헤드리스 착수 가능 |
+| **이미지/파일 클립보드 + 파일 전송** | Parsec·DCV 이미지 클립보드, Parsec 파일 드래그드롭 | **미추적 갭(2026-07-16 감사)** — 현 클립보드 텍스트 전용. 이미지 = CLIPBOARD 채널에 PNG kind 추가(호스트 CF_DIB→PNG 워처 + 웹 Clipboard API image), 헤드리스 와이어/코덱 검증 가능. 파일 전송은 별도 reliable 채널. 중형 |
 
 ### ultra 성능 코어 트랙 (must-do)
 

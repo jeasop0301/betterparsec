@@ -41,6 +41,10 @@ export type Settings = {
     // U4 P1: enable QU lossless overlay over video_qu DataChannel.
     // Default false (zero hot-path cost). Set true to receive QU_TILE overlays.
     enableVideoQu: boolean
+    // Clipboard sync v1 (text-only, research/05 gap vs Parsec/DCV): default
+    // true — browser clipboard permission prompts provide the actual
+    // consent gate (Parsec ships this default-on too).
+    clipboardSync: boolean
 }
 
 export type StreamCodec = "h264" | "auto" | "h265" | "av1"
@@ -197,6 +201,7 @@ export class StreamSettingsComponent implements Component {
     private pageStyle: SelectComponent
 
     private useSelectElementPolyfill: InputComponent
+    private clipboardSync: InputComponent
 
     constructor(permissions: StreamPermissions, settings: Settings) {
         // Sometimes the normal settings object doesn't have some values, because they change between versions.
@@ -541,6 +546,14 @@ export class StreamSettingsComponent implements Component {
         })
         this.useSelectElementPolyfill.addChangeListener(this.onSettingsChange.bind(this))
         this.useSelectElementPolyfill.mount(this.divElement)
+        // Clipboard sync v1 (text-only, research/05 gap vs Parsec/DCV) — no
+        // translation key exists yet, literal string per convention used
+        // elsewhere for untranslated technical labels (see mouseMode "auto").
+        this.clipboardSync = new InputComponent("clipboardSync", "checkbox", "Clipboard sync", {
+            checked: settings?.clipboardSync ?? defaultSettings_.clipboardSync
+        })
+        this.clipboardSync.addChangeListener(this.onSettingsChange.bind(this))
+        this.clipboardSync.mount(this.divElement)
 
         this.onSettingsChange()
     }
@@ -608,6 +621,7 @@ export class StreamSettingsComponent implements Component {
         settings.hdr = this.hdr.isChecked()
 
         settings.useSelectElementPolyfill = this.useSelectElementPolyfill.isChecked()
+        settings.clipboardSync = this.clipboardSync.isChecked()
 
         makeSettingsValid(this.permissions, settings)
 

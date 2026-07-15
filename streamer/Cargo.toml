@@ -27,10 +27,14 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [target.'cfg(windows)'.dependencies]
-# Cursor P1 tracker (GetCursorInfo 60 Hz poll — cursor-channel.md §3).
+# Cursor P1 tracker (GetCursorInfo 60 Hz poll — cursor-channel.md §3) +
+# clipboard sync v1 (GetClipboardSequenceNumber 500 ms poll + CF_UNICODETEXT
+# via GlobalAlloc/Lock — clipboard.rs).
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
 ] }
 
 [lints]

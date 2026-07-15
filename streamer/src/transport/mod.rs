@@ -20,6 +20,7 @@ use common::buffer::ByteBuffer;
 
 use self::metrics::VideoTransportStats;
 
+pub(crate) mod clipboard;
 pub(crate) mod cursor_tracker;
 pub(crate) mod cursor_wire;
 pub(crate) mod metrics;

@@ -421,6 +421,11 @@ ts_consts!(
     // dedicated DataChannel on WebRTC, a prefixed frame on WebSocket —
     // host-cursor authority is transport-agnostic (DCV does it over TCP).
     pub const CURSOR: u8 = 27;
+    // Clipboard sync v1 (text-only, research/05 gap vs Parsec/DCV): host
+    // sequence-poll watcher <-> browser focus-poll, bidirectional, same
+    // transport-agnostic shape as CURSOR (dedicated DataChannel on WebRTC, a
+    // prefixed frame on WebSocket).
+    pub const CLIPBOARD: u8 = 28;
 );
 
 #[derive(Serialize, Deserialize, Debug, TS, Clone, Copy, PartialEq, Eq)]

@@ -53,7 +53,10 @@ const trueDefaultSettings: Settings =
     // U2 P1 — FEC pipeline test mode, default off (zero hot-path cost when false)
     "enableVideoFec": false,
     // U4 P1 — QU lossless overlay test mode, default off (zero hot-path cost when false)
-    "enableVideoQu": false
+    "enableVideoQu": false,
+    // Clipboard sync v1 — default true (Parsec ships this default-on; the
+    // browser's own permission prompt is the actual consent gate).
+    "clipboardSync": true
 }
 
 export default trueDefaultSettings as Settings

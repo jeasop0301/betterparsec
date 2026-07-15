@@ -9,11 +9,12 @@ import { BIG_BUFFER, ByteBuffer } from "./buffer.js"
 import { defaultStreamInputConfig, MouseMode, StreamInput } from "./input.js"
 import { CursorAutoAction, CursorAutoMode } from "./cursor_auto.js"
 import { parseCursorMessage } from "./cursor_wire.js"
+import { decodeClipboardText, encodeClipboardText, CLIPBOARD_MAX_LEN } from "./clipboard_wire.js"
 import { Logger, LogMessageInfo } from "./log.js"
 import { gatherPipeInfo } from "./pipeline/index.js"
 import { BenchmarkContext, StreamStats } from "./stats.js"
 import { StallWatchdog, WatchdogAction } from "./session_ux.js"
-import { Transport, TransportChannel, TransportShutdown } from "./transport/index.js"
+import { DataTransportChannel, Transport, TransportChannel, TransportShutdown } from "./transport/index.js"
 import { WebSocketTransport } from "./transport/web_socket.js"
 import { WebRTCTransport } from "./transport/webrtc.js"
 import { allVideoCodecs, andVideoCodecs, createSupportedVideoFormatsBits, emptyVideoCodecs, getSelectedVideoCodec, hasAnyCodec, VideoCodecSupport } from "./video.js"
@@ -134,6 +135,24 @@ export class Stream implements Component {
     // transport restart yields a fresh channel object, so the stale
     // reference never matches and a new listener attaches.
     private cursorChannelWired: TransportChannel | null = null
+    // Clipboard sync v1 (text-only, research/05 gap vs Parsec/DCV): tracks
+    // the transport channel a receive listener has been attached to, same
+    // channel-identity dedup as cursorChannelWired.
+    private clipboardChannelWired: DataTransportChannel | null = null
+    // Loop guard mirror of the host watcher's should_publish: suppresses
+    // re-sending a value already sent, or bouncing back a value just applied
+    // from the peer.
+    private clipboardLastSent: string | null = null
+    private clipboardLastApplied: string | null = null
+    // Queued inbound text when writeText() could not run (no document focus,
+    // or the write itself failed) — retried on the next window 'focus',
+    // keeping only the newest value.
+    private clipboardPendingWrite: string | null = null
+    // Set once navigator.clipboard.readText() is denied (no permission
+    // prompt on this origin/browser) — stops polling outbound for the rest
+    // of the session instead of re-prompting every focus event.
+    private clipboardOutboundDisabled = false
+    private clipboardFocusListenerAttached = false
 
     private input: StreamInput
     private stats: StreamStats
@@ -592,6 +611,90 @@ export class Stream implements Component {
                 }
             })
         }
+    }
+    // Clipboard sync v1 (text-only, research/05 gap vs Parsec/DCV): wires
+    // the CLIPBOARD channel exactly like setCursorAutoEnabled — channel
+    // identity dedup so re-invoking against a still-live transport does not
+    // double-attach the receive listener, a transport restart yields a
+    // fresh channel object so a new listener attaches.
+    private setClipboardSyncEnabled(enabled: boolean) {
+        if (!enabled) {
+            return
+        }
+
+        const clipboardChannel = this.transport?.getChannel(TransportChannelId.CLIPBOARD)
+        if (!clipboardChannel || clipboardChannel.type !== "data") {
+            this.debugLog("clipboard sync: no clipboard channel on this transport", { type: "ifErrorDescription" })
+            return
+        }
+
+        if (this.clipboardChannelWired !== clipboardChannel) {
+            this.clipboardChannelWired = clipboardChannel
+            clipboardChannel.addReceiveListener((data: ArrayBuffer) => {
+                const text = decodeClipboardText(data)
+                if (text === null) {
+                    return
+                }
+                // Recorded BEFORE the write attempt: applyInboundClipboardText
+                // may defer to the next focus event, but the loop guard must
+                // already be in place so an outbound focus-poll landing in
+                // between does not bounce this text straight back out.
+                this.clipboardLastApplied = text
+                this.applyInboundClipboardText(text)
+            })
+        }
+
+        if (!this.clipboardFocusListenerAttached) {
+            this.clipboardFocusListenerAttached = true
+            window.addEventListener("focus", this.onWindowFocusForClipboard.bind(this))
+        }
+    }
+    // navigator.clipboard.writeText requires document focus; when unfocused
+    // (or the write still fails, e.g. a permission prompt dismissed) the
+    // latest text is queued and retried on the next window 'focus' — only
+    // the newest value survives multiple inbound messages while unfocused.
+    private applyInboundClipboardText(text: string) {
+        if (!document.hasFocus()) {
+            this.clipboardPendingWrite = text
+            return
+        }
+        navigator.clipboard.writeText(text).catch(() => {
+            this.clipboardPendingWrite = text
+        })
+    }
+    private onWindowFocusForClipboard() {
+        if (this.clipboardPendingWrite !== null) {
+            const text = this.clipboardPendingWrite
+            this.clipboardPendingWrite = null
+            this.applyInboundClipboardText(text)
+        }
+
+        if (this.clipboardOutboundDisabled) {
+            return
+        }
+        const channel = this.clipboardChannelWired
+        if (!channel) {
+            return
+        }
+
+        navigator.clipboard.readText().then((text) => {
+            // Loop guard mirror of should_publish: skip a value already sent,
+            // or the value just applied from the peer (its own focus-poll
+            // read would otherwise bounce straight back out).
+            if (text === this.clipboardLastSent || text === this.clipboardLastApplied) {
+                return
+            }
+            const encoded = encodeClipboardText(text)
+            if (encoded === null) {
+                this.debugLog(`clipboard sync: local clipboard text exceeds ${CLIPBOARD_MAX_LEN} bytes — refusing to send`, { type: "ifErrorDescription" })
+                return
+            }
+            this.clipboardLastSent = text
+            channel.send(encoded)
+        }).catch((err) => {
+            this.debugLog(`clipboard sync: readText denied, disabling outbound for this session: ${err}`, { type: "ifErrorDescription" })
+            this.clipboardOutboundDisabled = true
+        })
     }
     // M4 auto-runtime: call when mouseMode changes at runtime (e.g. the
     // sidebar mouse-mode selector) so the cursor-channel wiring engages or
@@ -1086,6 +1189,10 @@ export class Stream implements Component {
         // picking "auto" mid-session (previously a no-op) takes effect
         // immediately rather than only on the next createVideoRenderer() call.
         this.setCursorAutoEnabled(this.settings.mouseMode === "auto")
+        // Clipboard sync v1: same startup-gate pattern as the cursor auto
+        // wiring above — settings.clipboardSync default true (browser
+        // permission prompts provide the actual consent gate).
+        this.setClipboardSyncEnabled(this.settings.clipboardSync)
 
         return pipelineCodecSupport
     }

@@ -57,6 +57,23 @@ Tetrys FEC · 서브프레임 슬라이스 · QU · 네이티브 클라이언트
    `permissions.allow_transport_websockets` 게이트, stream/index.ts 전송
    폴백 체인) — WebRTC 실패 → WS 자동 강등이 실동작하는지·권한 기본값이
    막는지부터 진단. TURN-over-TCP(443) coturn 배포는 별도 잔여.
+   **현장 갱신(2026-07-15, owner)**: TCP(WS) 접속 자체는 성립 — 단
+   **폴백 첫 시도 실패, 리프레시 후 성공** 재현 보고(서버 로그 미포착:
+   재시도 시 리프레시 없이 30초 대기 + F12 콘솔 캡처 필요). **비관
+   교정**: "TCP-릴레이 실패 시 전송 재설계" 톤은 과했다 — DCV는
+   WebSocket/TCP를 프로덕션 경로로 출하 중. 폴백 안정화가 남은 일이지
+   전송 재설계 사유 아님.
+
+### 경쟁사 갭 감사 (2026-07-15 — "불가/저기대/스터글" 항목 vs Parsec·DCV·GFN 실물)
+
+| 항목 | 경쟁사 실물 | 판정·조치 |
+|---|---|---|
+| TCP 전송 실사용성 (M1 "실패 시 재설계") | DCV: WebSocket/TCP 프로덕션 | 비관 교정(위 #3), 폴백 버그만 수리 |
+| 커서 모양 채널 (P2 "나중") | Parsec 출하 (zero-latency 클라 렌더) | P1 라이브 판정 후 즉시 착수. 선행 결정 1건: `display_cursor` 끄기 방식(P2a 키 주입 vs P2b 포크 config) — 클라 렌더 + 구움 커서 중복 방지 |
+| 클립보드 동기화 (research 05 메모 후 방치) | Parsec·DCV 출하, GFN paste 지원 | **v1 완료** (2026-07-15, 텍스트 전용): `CLIPBOARD=28` 채널, 호스트 500ms 시퀀스 폴링 워처(CF_UNICODETEXT, spawn_blocking, 256 KiB 캡), 양방향 루프가드(`should_publish`, 12 tests), WebRTC 전용 채널 + WebSocket 프리픽스 프레임 둘 다 배선, 웹 focus-poll(readText/writeText, 권한 거부 시 세션 내 outbound 비활성) — common 81 + streamer 196 tests, 웹 clipboard_wire 16 tests, clippy/tsc 클린 |
+| 게임패드 럼블 | Parsec 출하 | **갭 아님** — 이미 풀배선 확인(capability 광고 → 호스트 이벤트 → vibrationActuator, input.ts) |
+| 마이크 패스스루 | DCV 출하 | 백로그 등재 — vendor에 Foundation mic 훅 잔존(`send_microphone_opus_data` 미사용 경고들), 중형 |
+| 펜/스타일러스 | DCV 출하 | 백로그 — Moonlight 펜 이벤트 존재, 웹 PointerEvent 매핑 미구현, 중형 |
 
 ### ultra 성능 코어 트랙 (must-do)
 

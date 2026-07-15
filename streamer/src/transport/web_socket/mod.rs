@@ -37,10 +37,13 @@ pub async fn new() -> Result<(WebSocketTransportSender, WebSocketTransportEvents
 
     // TODO: use the video_frame_queue_size with packet rtt info to estimate latency of pictures and request idr if too big
 
+    let (clipboard_apply_tx, clipboard_apply_rx) = channel::<String>(20);
+
     let sender = WebSocketTransportSender {
         event_sender,
         rtt: Arc::new(Mutex::new((Instant::now(), 0))),
         needs_idr: AtomicBool::new(false),
+        clipboard_apply_tx,
     };
 
     // This will start the loop of sending / receiving
@@ -52,6 +55,13 @@ pub async fn new() -> Result<(WebSocketTransportSender, WebSocketTransportEvents
     crate::transport::cursor_tracker::spawn(crate::transport::cursor_tracker::WebSocketCursorSink(
         sender.event_sender.clone(),
     ));
+    // Clipboard sync v1: bidirectional text sync, transport-agnostic — on
+    // this transport both directions ride CLIPBOARD-prefixed ws frames
+    // (clipboard.rs; research/05 gap vs Parsec/DCV).
+    crate::transport::clipboard::spawn(
+        crate::transport::clipboard::WebSocketClipboardSink(sender.event_sender.clone()),
+        clipboard_apply_rx,
+    );
 
     Ok((sender, WebSocketTransportEvents { event_receiver }))
 }
@@ -76,6 +86,9 @@ pub struct WebSocketTransportSender {
     /// Time when it was sent, sequence_number
     rtt: Arc<Mutex<(Instant, u16)>>,
     needs_idr: AtomicBool,
+    /// Forwards decoded inbound CLIPBOARD text (client → host) to the
+    /// clipboard watcher's apply path (transport::clipboard).
+    clipboard_apply_tx: Sender<String>,
 }
 
 async fn send_packet(
@@ -248,7 +261,18 @@ impl TransportSender for WebSocketTransportSender {
                 }
 
                 let channel_id = message[0];
-
+                // Clipboard sync v1: CLIPBOARD frames carry the clipboard
+                // wire format, not an InboundPacket — route them to the
+                // watcher's apply path before InboundPacket::deserialize,
+                // which does not know this channel and would only warn.
+                if channel_id == TransportChannelId::CLIPBOARD {
+                    if let Some(text) = crate::transport::clipboard::decode_text(&message[1..])
+                        && self.clipboard_apply_tx.send(text).await.is_err()
+                    {
+                        warn!("[Clipboard] apply channel closed — dropping inbound text");
+                    }
+                    return Ok(());
+                }
                 let Some(packet) =
                     InboundPacket::deserialize(TransportChannel(channel_id), &message[1..])
                 else {

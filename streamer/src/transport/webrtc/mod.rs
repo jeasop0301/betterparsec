@@ -93,6 +93,9 @@ struct WebRtcInner {
     /// Reliable, ordered DataChannel carrying QU tile messages (bidirectional:
     /// host → client config/tile/invalidate, client → host subscribe/budget).
     video_qu_channel: Arc<RTCDataChannel>,
+    /// Forwards decoded inbound CLIPBOARD text (client → host) to the
+    /// clipboard watcher's apply path (transport::clipboard).
+    clipboard_apply_tx: Sender<String>,
     video: Mutex<WebRtcVideo>,
     target_bitrate_kbps: Arc<AtomicU32>,
     cc_shared: Arc<CcShared>,
@@ -218,6 +221,22 @@ pub async fn new(
     crate::transport::cursor_tracker::spawn(crate::transport::cursor_tracker::WebRtcCursorSink(
         cursor_channel,
     ));
+    // Clipboard channel: reliable, ordered — bidirectional text sync
+    // (clipboard.rs; research/05 gap vs Parsec/DCV).
+    let clipboard_channel = peer
+        .create_data_channel(
+            "clipboard",
+            Some(RTCDataChannelInit {
+                ordered: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    let (clipboard_apply_tx, clipboard_apply_rx) = channel::<String>(20);
+    crate::transport::clipboard::spawn(
+        crate::transport::clipboard::WebRtcClipboardSink(clipboard_channel.clone()),
+        clipboard_apply_rx,
+    );
 
     let runtime = Handle::current();
     let video_metrics = Arc::new(VideoTransportMetrics::new(video_frame_queue_size));
@@ -231,6 +250,7 @@ pub async fn new(
         input_channels: Default::default(),
         video_fec_channel: video_fec_channel.clone(),
         video_qu_channel: video_qu_channel.clone(),
+        clipboard_apply_tx,
         video: Mutex::new(WebRtcVideo::new(
             runtime.clone(),
             Arc::downgrade(&peer),
@@ -260,6 +280,8 @@ pub async fn new(
         this.clone().on_data_channel(video_fec_ack_channel).await;
         // QU tile channel (bidirectional; on_message set up in on_data_channel).
         this.clone().on_data_channel(video_qu_channel).await;
+        // Clipboard channel (bidirectional; on_message set up in on_data_channel).
+        this.clone().on_data_channel(clipboard_channel).await;
 
         struct Options {
             reliable: bool,
@@ -664,6 +686,23 @@ impl WebRtcInner {
                     inner,
                     async move |inner, msg: DataChannelMessage| {
                         inner.video.lock().await.handle_qu_msg(msg.data);
+                    },
+                ));
+            }
+            "clipboard" => {
+                // Bidirectional clipboard channel: decode inbound (client → host)
+                // text and forward it to the watcher's apply path. Outbound
+                // (host → client) publishes are sent directly on
+                // `clipboard_channel` by the clipboard watcher task.
+                channel.on_message(create_event_handler(
+                    inner,
+                    async move |inner, msg: DataChannelMessage| {
+                        let Some(text) = crate::transport::clipboard::decode_text(&msg.data) else {
+                            return;
+                        };
+                        if inner.clipboard_apply_tx.send(text).await.is_err() {
+                            debug!("[Clipboard] apply channel closed — dropping inbound text");
+                        }
                     },
                 ));
             }

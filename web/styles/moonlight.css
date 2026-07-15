@@ -873,6 +873,13 @@ canvas.video-stream {
     display: none;
 }
 
+/* M4 cursor P1 (stream.ts): host-authority auto mode, unlocked — the host
+   bakes its own cursor into the video, so the local browser cursor must be
+   hidden over the stream to avoid a double cursor. */
+.stream-cursor-none {
+    cursor: none;
+}
+
 .local-touch-cursor {
     position: fixed;
     width: 10px;

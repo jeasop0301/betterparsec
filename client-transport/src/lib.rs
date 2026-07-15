@@ -13,6 +13,7 @@
 //! place of `LiWaitForNextVideoFrame`.
 
 pub mod capi;
+pub mod cursor;
 pub mod flow;
 pub mod frame_queue;
 pub mod session;

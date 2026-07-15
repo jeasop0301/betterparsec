@@ -4587,6 +4587,7 @@ dependencies = [
  "tracing-subscriber",
  "transport-core",
  "webrtc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

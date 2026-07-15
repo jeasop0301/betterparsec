@@ -150,6 +150,10 @@ class ViewerApp implements Component {
 
     private inputConfig: StreamInputConfig = defaultStreamInputConfig()
     private previousMouseMode: MouseMode
+    // M4 cursor P1: mirrors the last cursorAutoMode InfoEvent — lets the
+    // relative-mode click re-arm (onMouseButtonDown) also retry a lock the
+    // host wants while mouseMode == "auto".
+    private autoModeWantsLock = false
     private autoEnterFullscreenOnStart: boolean = false
     private pendingAutoFullscreenPrompt: boolean = false
     private fullscreenPromptShown: boolean = false
@@ -308,6 +312,27 @@ class ViewerApp implements Component {
             document.title = `Stream: ${app.title}`
         } else if (data.type == "connectionComplete") {
             this.sidebar.onCapabilitiesChange(data.capabilities)
+        } else if (data.type == "cursorAutoMode") {
+            this.onCursorAutoMode(data.locked)
+        }
+    }
+    // M4 cursor P1: host-authority auto mouse mode (cursor-channel.md §3).
+    // locked → the host wants relative (FPS aim, 0 cursors): (re)acquire
+    // pointer lock. unlocked → the host wants follow (absolute) input and
+    // bakes its own cursor into the video, so the local browser cursor must
+    // stay hidden over the stream to avoid a double cursor.
+    private onCursorAutoMode(locked: boolean) {
+        this.autoModeWantsLock = locked
+        this.div.classList.toggle("stream-cursor-none", !locked)
+
+        if (locked) {
+            // May silently fail without a user gesture — the click re-arm in
+            // onMouseButtonDown retries once one is available.
+            this.requestPointerLock().catch((error) => {
+                console.warn("Auto mode pointer lock request failed", error)
+            })
+        } else {
+            void this.exitPointerLock()
         }
     }
 
@@ -451,8 +476,12 @@ class ViewerApp implements Component {
         // pointer lock, but DO NOT swallow the click — it must still reach the
         // game. Swallowing every click while the lock fails to engage makes
         // the game uninteractable; sending it costs at most one extra in-game
-        // press on the gesture that re-acquires the lock.
-        if (this.inputConfig.mouseMode == "relative" && !document.pointerLockElement) {
+        // press on the gesture that re-acquires the lock. "auto" mode never
+        // rewrites inputConfig.mouseMode (see requestPointerLock), so it needs
+        // its own check against the last cursorAutoMode InfoEvent.
+        const wantsLockNow = this.inputConfig.mouseMode == "relative"
+            || (this.inputConfig.mouseMode == "auto" && this.autoModeWantsLock)
+        if (wantsLockNow && !document.pointerLockElement) {
             this.requestPointerLock().catch((error) => {
                 console.warn("Pointer lock re-arm failed", error)
             })
@@ -708,8 +737,15 @@ class ViewerApp implements Component {
 
         this.previousMouseMode = this.inputConfig.mouseMode
         this.focusInput()
-        this.inputConfig.mouseMode = "relative"
-        this.setInputConfig(this.inputConfig)
+        // "auto" mode must NOT be rewritten to "relative" here: its effective
+        // mode already tracks the host via StreamInput.setAutoLocked (M4
+        // cursor P1) — flipping mouseMode itself would strand it on
+        // "relative" if the lock never actually engages (no gesture yet) and
+        // the host reports visible again before one does.
+        if (this.inputConfig.mouseMode != "auto") {
+            this.inputConfig.mouseMode = "relative"
+            this.setInputConfig(this.inputConfig)
+        }
         setSidebarExtended(false)
 
         this.pointerLockPending = true

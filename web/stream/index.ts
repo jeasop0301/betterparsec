@@ -7,6 +7,8 @@ import { AudioPlayer } from "./audio/index.js"
 import { buildAudioPipeline } from "./audio/pipeline.js"
 import { BIG_BUFFER, ByteBuffer } from "./buffer.js"
 import { defaultStreamInputConfig, StreamInput } from "./input.js"
+import { CursorAutoAction, CursorAutoMode } from "./cursor_auto.js"
+import { parseCursorMessage } from "./cursor_wire.js"
 import { Logger, LogMessageInfo } from "./log.js"
 import { gatherPipeInfo } from "./pipeline/index.js"
 import { BenchmarkContext, StreamStats } from "./stats.js"
@@ -33,7 +35,9 @@ export type InfoEvent = CustomEvent<
     { type: "connectionComplete", capabilities: StreamCapabilities } |
     { type: "videoReady" } |
     { type: "connectionStatus", status: ConnectionStatus } |
-    { type: "addDebugLine", line: string, additional?: LogMessageInfo }
+    { type: "addDebugLine", line: string, additional?: LogMessageInfo } |
+    // M4 cursor P1: host-authority auto mouse mode transitioned (cursor-channel.md §3).
+    { type: "cursorAutoMode", locked: boolean }
 >
 export type InfoEventListener = (event: InfoEvent) => void
 
@@ -116,6 +120,11 @@ export class Stream implements Component {
 
     private videoRenderer: VideoRenderer | null = null
     private audioPlayer: AudioPlayer | null = null
+    // M4 cursor P1: only set when settings.mouseMode == "auto" and the
+    // transport is WebRTC — non-auto sessions never allocate this (#5: no
+    // behavior change otherwise). Recreated in createVideoRenderer() so it
+    // survives transport restarts, matching the FEC/QU wiring pattern.
+    private cursorAutoMode: CursorAutoMode | null = null
 
     private input: StreamInput
     private stats: StreamStats
@@ -490,6 +499,29 @@ export class Stream implements Component {
             this.watchdogBusy = false
         }
         this.runWatchdogActions(this.watchdog.tick(performance.now()))
+
+        // M4 cursor P1: piggyback on the watchdog's 250ms tick instead of a
+        // second interval — commits any pending lock/unlock transition once
+        // its hysteresis window elapses (the host only sends POS on change).
+        if (this.cursorAutoMode) {
+            this.applyCursorAutoAction(this.cursorAutoMode.tick(performance.now()))
+        }
+    }
+    // M4 cursor P1: shared by the initial state seed, cursor channel messages,
+    // and the watchdog-piggybacked tick — always keeps StreamInput and the
+    // dispatched InfoEvent in lockstep.
+    private emitCursorAutoState(locked: boolean) {
+        this.input.setAutoLocked(locked)
+        const event: InfoEvent = new CustomEvent("stream-info", {
+            detail: { type: "cursorAutoMode", locked }
+        })
+        this.eventTarget.dispatchEvent(event)
+    }
+    private applyCursorAutoAction(action: CursorAutoAction | null) {
+        if (!action) {
+            return
+        }
+        this.emitCursorAutoState(action.type === 'lock')
     }
     private runWatchdogActions(actions: WatchdogAction[]) {
         for (const action of actions) {
@@ -967,6 +999,33 @@ export class Stream implements Component {
             } else {
                 this.debugLog('enableVideoQu=true but renderer element not found in divElement; overlay skipped', { type: 'ifErrorDescription' })
             }
+        }
+        // ── M4 cursor P1: host-authority auto mouse mode ────────────────────────
+        // When mouseMode == "auto" and a WebRTC transport is active, drive a
+        // CursorAutoMode instance off the `cursor` DataChannel (visibility
+        // samples) and off the watchdog tick (hysteresis commits). Re-created
+        // per call so a transport restart starts back in the default unlocked
+        // (follow) state instead of carrying stale lock state across sessions.
+        if (this.settings.mouseMode === "auto" && this.transport instanceof WebRTCTransport) {
+            const cursorTransport = this.transport
+            const cursorAutoMode = new CursorAutoMode()
+            this.cursorAutoMode = cursorAutoMode
+
+            // Seed the UI/input with the initial (unlocked/follow) state: the
+            // host only sends POS on change, so nothing else would ever emit
+            // this baseline if the host cursor stays visible the whole session.
+            this.emitCursorAutoState(cursorAutoMode.locked)
+
+            cursorTransport.setOnCursorChannel((cursorCh: RTCDataChannel) => {
+                cursorCh.addEventListener('message', (ev: MessageEvent) => {
+                    const buf: ArrayBuffer = ev.data instanceof ArrayBuffer
+                        ? ev.data : ev.data.buffer
+                    const msg = parseCursorMessage(buf)
+                    if (msg) {
+                        this.applyCursorAutoAction(cursorAutoMode.onVisibility(msg.visible, performance.now()))
+                    }
+                })
+            })
         }
 
         return pipelineCodecSupport

@@ -42,7 +42,12 @@ function trySendChannel(channel: DataTransportChannel | null, buffer: ByteBuffer
 }
 
 export type MouseScrollMode = "highres" | "normal"
-export type MouseMode = "relative" | "follow" | "localCursor" | "pointAndDrag"
+// MouseMode + the "auto" resolver live in the DOM-free mouse_mode module
+// so node tests can import them without this file's window/document
+// dependency chain (notification/resources load-time DOM access).
+export { resolveMouseMode } from "./mouse_mode.js"
+export type { MouseMode } from "./mouse_mode.js"
+import { MouseMode, resolveMouseMode } from "./mouse_mode.js"
 export type TouchMode = "touch" | "mouseRelative" | "localCursor" | "pointAndDrag"
 
 export type StreamInputConfig = {
@@ -79,6 +84,8 @@ export class StreamInput {
 
     private connected = false
     private config: StreamInputConfig
+    // M4 cursor P1: see setAutoLocked/effectiveMouseMode below.
+    private autoLocked = false
     private capabilities: StreamCapabilities = { touch: true }
     // Size of the streamer device
     private streamerSize: [number, number] = [0, 0]
@@ -147,6 +154,15 @@ export class StreamInput {
     }
     getConfig(): StreamInputConfig {
         return this.config
+    }
+    // M4 cursor P1: the host-authority auto mode driver (cursor_auto.ts) tells
+    // us whether the host wants relative (FPS aim) or follow (absolute) input
+    // right now. Ignored unless config.mouseMode == "auto".
+    setAutoLocked(locked: boolean) {
+        this.autoLocked = locked
+    }
+    private effectiveMouseMode(): MouseMode {
+        return resolveMouseMode(this.config.mouseMode, this.autoLocked)
     }
 
     getCapabilities(): StreamCapabilities {
@@ -267,13 +283,14 @@ export class StreamInput {
             return
         }
 
-        if (this.config.mouseMode == "relative" || this.config.mouseMode == "follow") {
+        const mouseMode = this.effectiveMouseMode()
+        if (mouseMode == "relative" || mouseMode == "follow") {
             this.sendMouseButton(true, button)
-        } else if (this.config.mouseMode == "localCursor") {
+        } else if (mouseMode == "localCursor") {
             this.initializeLocalCursor(rect, event.clientX, event.clientY)
             this.sendLocalCursorPosition(true)
             this.sendMouseButton(true, button)
-        } else if (this.config.mouseMode == "pointAndDrag") {
+        } else if (mouseMode == "pointAndDrag") {
             this.sendMousePositionClientCoordinates(event.clientX, event.clientY, rect, true, button)
         }
     }
@@ -283,21 +300,23 @@ export class StreamInput {
             return
         }
 
-        if (this.config.mouseMode == "relative" || this.config.mouseMode == "follow" || this.config.mouseMode == "localCursor") {
+        const mouseMode = this.effectiveMouseMode()
+        if (mouseMode == "relative" || mouseMode == "follow" || mouseMode == "localCursor") {
             this.sendMouseButton(false, button)
-        } else if (this.config.mouseMode == "pointAndDrag") {
+        } else if (mouseMode == "pointAndDrag") {
             this.sendMouseButton(false, button)
         }
     }
     onMouseMove(event: MouseEvent, rect: DOMRect) {
-        if (this.config.mouseMode == "relative") {
+        const mouseMode = this.effectiveMouseMode()
+        if (mouseMode == "relative") {
             this.sendMouseMoveClientCoordinates(event.movementX, event.movementY, rect)
-        } else if (this.config.mouseMode == "follow") {
+        } else if (mouseMode == "follow") {
             this.sendMousePositionClientCoordinates(event.clientX, event.clientY, rect, false)
-        } else if (this.config.mouseMode == "localCursor") {
+        } else if (mouseMode == "localCursor") {
             this.initializeLocalCursor(rect, event.clientX, event.clientY)
             this.moveLocalCursorClientCoordinates(event.movementX, event.movementY, rect, false)
-        } else if (this.config.mouseMode == "pointAndDrag") {
+        } else if (mouseMode == "pointAndDrag") {
             if (event.buttons) {
                 // some button pressed
                 this.sendMouseMoveClientCoordinates(event.movementX, event.movementY, rect)
@@ -499,7 +518,7 @@ export class StreamInput {
     }
     getLocalCursorState(): LocalCursorState {
         if (
-            (this.config.touchMode != "localCursor" && this.config.mouseMode != "localCursor") ||
+            (this.config.touchMode != "localCursor" && this.effectiveMouseMode() != "localCursor") ||
             !this.localCursorPosition ||
             this.streamerSize[0] <= 0 ||
             this.streamerSize[1] <= 0

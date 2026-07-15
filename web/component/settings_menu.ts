@@ -398,7 +398,11 @@ export class StreamSettingsComponent implements Component {
                 { value: "relative", name: streamI.relative },
                 { value: "follow", name: streamI.follow },
                 { value: "localCursor", name: streamI.localCursor },
-                { value: "pointAndDrag", name: streamI.pointAndDrag }
+                { value: "pointAndDrag", name: streamI.pointAndDrag },
+                // M4 cursor P1: host-authority auto mode. No translation key
+                // exists yet — literal string per every-language convention
+                // used elsewhere for untranslated technical labels.
+                { value: "auto", name: "auto (host-controlled)" }
             ],
             {
                 displayName: i.startupMouseMode,

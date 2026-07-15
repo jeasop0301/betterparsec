@@ -379,9 +379,22 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   머신 완성** (2026-07-15, `web/stream/cursor_auto.ts` `CursorAutoMode`
   + 9 tests): visible→unlock / hidden→lock, 히스테리시스 150ms(깜빡임
   내성·클록 재시작), 전이당 액션 1회, 샘플/틱 양쪽에서 커밋. `cursor`
-  채널 스태시(webrtc.ts, video_qu 패턴)까지 완료. 잔여 = 배선(mouseMode
-  "auto" 옵션 + pointer lock 오케스트레이션(ViewerApp) + follow 전환 +
-  video 영역 cursor:none) → [ ] **P2** 모양 채널 zero-latency 커서
+  채널 스태시(webrtc.ts, video_qu 패턴)까지 완료. **웹 배선 + 네이티브
+  플러밍 완성** (2026-07-15, 헤드리스 검증 — task 병렬 2슬라이스):
+  ⓐ 웹: mouseMode "auto"(DOM-free `mouse_mode.ts`의 순수
+  `resolveMouseMode` — auto+locked→relative/auto+unlocked→follow,
+  StreamInput은 effective 모드로만 분기), Stream이 cursor 채널 →
+  `CursorAutoMode` 구동(워치독 250ms 틱에 피기백) →
+  `cursorAutoMode{locked}` InfoEvent, ViewerApp이 pointer lock
+  진입/해제 + 제스처 부재 시 클릭 재장전(`autoModeWantsLock` —
+  기존 relative 재장전이 mouseMode를 "relative"로 변조하던 부작용
+  제거) + unlock 구간 `.stream-cursor-none`(양 테마). 비-auto 세션
+  동작 불변. ⓑ 네이티브: client-transport `cursor.rs`(decode 바이트-핀
+  3면 락스텝 + `CursorShared` atomic readback, x/y u64 패킹) + 세션
+  cursor 채널 스태시 — immersive(Phase B) 기반. 검증: tsc + 웹 32
+  tests(cursor_resolve 3 포함), client-transport 46, clippy·fmt 클린,
+  streamer.exe·static/ 배포 세트 갱신. 잔여 = 라이브: auto 모드로 FPS
+  게임 lock/메뉴 unlock 실동작 → [ ] **P2** 모양 채널 zero-latency 커서
 - [ ] **immersive 모드** — 전체화면 + pointer lock + Keyboard Lock 일괄
   토글 (cursor P1 클라 상태머신에 배선)
 - [ ] 보안 감사(ARCHITECTURE §보안 6항: 서명·짧은토큰·상수시간·replay·안전인코딩·revocation)

@@ -38,6 +38,7 @@ use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 use crate::capi::RxCore;
+use crate::cursor::{CursorShared, decode_pos};
 use crate::flow::{FlowAction, FlowConfig, SignalingFlow, StreamParams};
 use crate::tls::{ServerTrust, client_config};
 use crate::watchdog::{StallWatchdog, WatchdogAction, WatchdogConfig};
@@ -98,6 +99,7 @@ pub struct Session {
     input_tx: mpsc::Sender<(u8, Vec<u8>)>,
     watchdog: Arc<WatchdogStatus>,
     watchdog_paused: Arc<AtomicBool>,
+    cursor: Arc<CursorShared>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -113,11 +115,13 @@ impl Session {
         let (input_tx, input_rx) = mpsc::channel::<(u8, Vec<u8>)>(512);
         let watchdog = Arc::new(WatchdogStatus::default());
         let watchdog_paused = Arc::new(AtomicBool::new(false));
+        let cursor = Arc::new(CursorShared::default());
 
         let state2 = state.clone();
         let params2 = params.clone();
         let watchdog2 = watchdog.clone();
         let watchdog_paused2 = watchdog_paused.clone();
+        let cursor2 = cursor.clone();
         let thread = std::thread::Builder::new()
             .name("ct-session".into())
             .spawn(move || {
@@ -142,6 +146,7 @@ impl Session {
                     input_rx,
                     watchdog2,
                     watchdog_paused2,
+                    cursor2,
                 ));
                 match result {
                     Ok(()) => state2.store(SessionState::Stopped as u8, Ordering::Release),
@@ -160,6 +165,7 @@ impl Session {
             input_tx,
             watchdog,
             watchdog_paused,
+            cursor,
             thread: Some(thread),
         }
     }
@@ -175,6 +181,12 @@ impl Session {
     /// M4 stall-watchdog readback (indicator + terminal reconnect flag).
     pub fn watchdog(&self) -> &Arc<WatchdogStatus> {
         &self.watchdog
+    }
+
+    /// M4 cursor readback (host visibility + last position) — see
+    /// `CursorShared` for the atomic-store rationale.
+    pub fn cursor(&self) -> &Arc<CursorShared> {
+        &self.cursor
     }
 
     /// Hold/resume watchdog escalation around minimized/hidden phases
@@ -302,6 +314,7 @@ async fn run_session(
     mut input_rx: mpsc::Receiver<(u8, Vec<u8>)>,
     watchdog_status: Arc<WatchdogStatus>,
     watchdog_paused: Arc<AtomicBool>,
+    cursor_shared: Arc<CursorShared>,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
     let now_ms = move || started.elapsed().as_millis().min(u64::MAX as u128) as u64;
@@ -533,7 +546,13 @@ async fn run_session(
                         FlowAction::Send(m) => send_ws(&ws_tx, &m).await?,
                         FlowAction::CreatePeer(ice_servers) => {
                             peer = Some(
-                                create_peer(&api, ice_servers, ev_tx.clone(), core.clone())
+                                create_peer(
+                                    &api,
+                                    ice_servers,
+                                    ev_tx.clone(),
+                                    core.clone(),
+                                    cursor_shared.clone(),
+                                )
                                     .await?,
                             );
                         }
@@ -623,6 +642,7 @@ async fn create_peer(
     ice_servers: Vec<RtcIceServer>,
     ev_tx: mpsc::Sender<LocalEvent>,
     core: Arc<RxCore>,
+    cursor_shared: Arc<CursorShared>,
 ) -> anyhow::Result<Arc<RTCPeerConnection>> {
     let rtc_config = RTCConfiguration {
         ice_servers: ice_servers
@@ -688,6 +708,19 @@ async fn create_peer(
                         done()
                     }));
                 }
+            }
+            "cursor" => {
+                // Direct atomic store into `CursorShared`, not routed
+                // through `LocalEvent`: see the struct's doc comment for
+                // why (pure atomics, no ordering dependency on the
+                // session loop).
+                let cursor_shared = cursor_shared.clone();
+                dc.on_message(Box::new(move |msg: DataChannelMessage| {
+                    if let Some(pos) = decode_pos(&msg.data) {
+                        cursor_shared.store(pos);
+                    }
+                    done()
+                }));
             }
             _ => {
                 if let Some(id) = input_channel_id(&label) {

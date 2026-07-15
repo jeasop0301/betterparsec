@@ -378,13 +378,44 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   호스트 로그 대조; Tier B 판정은 f1-ack step 6)
 - **검증:** 호스트에서 `tc netem`으로 대역/지터/손실 주입 → target 그래프 추종 + frame drop 억제. 동일 조건 Parsec과 뭉개짐 A/B.
 
-## M3 — 코덱 / 화질 (feature #3)
-**목표:** 같은 비트레이트에서 더 선명.
+## M3 — 코덱 / 화질 / 효율 (feature #3)
+**목표:** 압도적 네이티브급 화질 + 타 대비 저비트레이트 고효율. 전체 감사:
+`docs/research/quality-efficiency-audit.md` (2026-07-16).
 
-- [ ] AV1 협상·HW 디코드 실동작 검증(`chrome://gpu`), 안 되면 HEVC/H.264 폴백 유지
-- [ ] HEVC 4:4:4 협상 경로 노출(색 텍스트 fringing 제거)
-- [ ] `nvenc_vbv_increase` 등 rate-control 튜닝(모션 스파이크)
-- **검증:** 동일 delivered bitrate에서 AV1 4:2:0 / HEVC 4:2:0 / HEVC 4:4:4 정지·모션·색텍스트 채점.
+**감사 정정 — capability는 대부분 이미 있고, "꺼진 채"다:**
+- **웹 클라 디코드 완비** [x]: H264/HEVC/AV1 × 4:4:4 × 10-bit 전부 WebCodecs
+  감지 지원(video_decoder_pipe.ts). M3 미완의 상당수는 **클라가 아니라
+  호스트 encode 검증 + 기본값 전환.**
+- **인코더 무료 점심 세트(지연 비용 ~0, 꺼져 있음)**: spatial
+  `adaptive_quantization`(false) · `quality_preset` P1(→P4/P5, +500µs@1080p
+  affordable) · `weighted_prediction`(false). Foundation `nvenc_config.h` 실측.
+
+### 효율 지렛대 (측정→활성)
+- [ ] **[헤드리스] 화질-효율 probe** — SSIM/PSNR vs 비트레이트, preset(P1..7) ×
+  spatial AQ × codec(H264/HEVC/AV1) × chroma(4:2:0/4:4:4). nvenc-slice-probe
+  스캐폴딩 재사용, 디코드 경로 = app-native video.rs. "저비트레이트 고화질"의
+  정량 근거.
+- [ ] **[라이브/호스트] 무료 점심 활성**: spatial AQ ON + preset P4 +
+  weighted-pred ON (probe로 sweet spot → Gate B VMAF 검증)
+- [ ] **[라이브/호스트] 코덱 기본 전환**: HEVC e2e 검증 → 기본 h264→hevc,
+  AV1 e2e(AV1 4:2:0 probe 통과) → av1. 같은 화질 −30~50% 비트
+- [ ] **[라이브/호스트] 4:4:4** 협상·검증(색 텍스트 fringing 제거, 클라 준비 완료)
+- [ ] **[라이브/호스트] 10-bit SDR** — 밴딩 제거(그라디언트·어두운 씬 네이티브급),
+  클라 MAIN10/REXT10 준비 완료
+- [ ] `nvenc_vbv_increase`/VBR 등 rate-control 튜닝(모션 스파이크) — CC 상호작용, Gate C
+
+### 신규 capability (진짜 미구현)
+- [ ] **[헤드리스] 클라 샤픈/CAS 셰이더** — 현 프레젠트는 bilinear 스트레치만
+  (present.rs `DXGI_SCALING_STRETCH`). D3D11 픽셀 셰이더 샤픈 → 체감 선명도↑
+  + 저해상도 전송 허용(효율)
+- [ ] **[헤드리스] 대역 구동 동적 해상도 스케일링** — 컨트롤러(대역→해상도
+  사다리, 순수 FecRatioController 패턴) + 클라 업스케일. 혼잡 시 해상도↓가
+  블록킹보다 지각 우위
+- [ ] **[대형] 클라 슈퍼레졸루션(FSR/VSR급)** + 10-bit/HDR 프레젠트 경로
+  (R10G10B10A2 + HDR 스왑체인) — GFN DLSS 지렛대
+- [ ] **AV1 필름그레인 합성** — 그레인 제거 인코드 + 클라 합성(그레인 콘텐츠 효율)
+- **검증:** 동일 delivered bitrate에서 preset·AQ·codec·chroma별 SSIM/PSNR/VMAF
+  채점(probe) → Gate B/E에서 Parsec/GFN 대비 VMAF-NEG +2 또는 −20% 비트 판정.
 
 ## M4 — 하드닝 + 세션 UX (owner 요구로 선택 → 필수 승격, 2026-07-14)
 - [~] **스톨 감지·복구 사다리** (현장 이슈 #1): 클라 프레임 수신 워치독 →

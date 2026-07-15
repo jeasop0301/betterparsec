@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "nvenc-slice-probe"
 path = "src/bin/nvenc_slice_probe.rs"
 required-features = ["video"]
+[[bin]]
+name = "quality-probe"
+path = "src/bin/quality_probe.rs"
+required-features = ["video"]
 
 [dependencies]
 client-transport = { path = "../client-transport" }

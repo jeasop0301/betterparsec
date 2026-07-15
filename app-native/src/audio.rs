@@ -87,6 +87,8 @@ impl OpusDecoder {
             // sizes internally. The track is stereo (RFC 7587 §4.2).
             (*ctx).sample_rate = 48_000;
             ff::av_channel_layout_default(&mut (*ctx).ch_layout, 2);
+            // TODO(surround): decoder is opened stereo; N-channel decode
+            // needs the stream channel count (SDP-negotiated).
             let rc = ff::avcodec_open2(ctx, codec, ptr::null_mut());
             if rc < 0 {
                 return Err(AudioError(format!("avcodec_open2: {}", err_str(rc))));
@@ -132,7 +134,9 @@ impl OpusDecoder {
         Ok(())
     }
 
-    /// Interleave the current `self.frame` as stereo f32.
+    /// Interleave the current `self.frame` as f32, using the frame's own
+    /// `ch_layout.nb_channels` (not a fixed count) so this stays correct
+    /// if the decoder is ever opened for more than 2 channels.
     unsafe fn frame_to_f32(&mut self, out: &mut Vec<f32>) -> Result<(), AudioError> {
         unsafe {
             let f = self.frame;
@@ -144,26 +148,23 @@ impl OpusDecoder {
             use ff::AVSampleFormat as S;
             let fmt = (*f).format;
             if fmt == S::AV_SAMPLE_FMT_FLTP as i32 {
-                // Planar float — libavcodec's native opus output.
-                let l = (*f).data[0].cast::<f32>();
-                let r = if ch > 1 {
-                    (*f).data[1].cast::<f32>()
-                } else {
-                    l
-                };
-                out.reserve(n * 2);
+                // Planar float — libavcodec's native opus output; one
+                // plane per channel, `ch` of them.
+                out.reserve(n * ch);
                 for i in 0..n {
-                    out.push(*l.add(i));
-                    out.push(*r.add(i));
+                    for c in 0..ch {
+                        out.push(*(*f).data[c].cast::<f32>().add(i));
+                    }
                 }
             } else if fmt == S::AV_SAMPLE_FMT_FLT as i32 {
                 // Already interleaved float.
                 let p = (*f).data[0].cast::<f32>();
-                out.reserve(n * 2);
+                out.reserve(n * ch);
                 for i in 0..n {
                     let base = i * ch;
-                    out.push(*p.add(base));
-                    out.push(*p.add(base + usize::from(ch > 1)));
+                    for c in 0..ch {
+                        out.push(*p.add(base + c));
+                    }
                 }
             } else {
                 return Err(AudioError(format!("unsupported sample format {fmt}")));
@@ -319,48 +320,103 @@ pub use sink::{ComGuard, WasapiOut};
 
 // ── Format conversion (48 kHz stereo → device format) ─────────────────────
 
-/// Convert interleaved stereo f32 @ 48 kHz into the device format and
-/// append to `fifo`. Channel map: L/R to the first two channels, other
-/// channels silent; mono downmixes. Rate mismatch uses linear
-/// interpolation (Phase A; the shared engine is 48 kHz virtually always).
+/// Convert interleaved f32 @ `src_rate`/`src_channels` into the device
+/// format and append to `fifo`. Rate mismatch uses linear interpolation
+/// per source channel (Phase A; the shared engine is 48 kHz virtually
+/// always); channelization is applied after resampling — see
+/// [`map_channels`] for the channel map.
 fn convert_into(
     src: &[f32],
+    src_channels: u16,
     src_rate: u32,
     dst_rate: u32,
     dst_channels: u16,
     fifo: &mut VecDeque<f32>,
 ) {
-    let ch = dst_channels as usize;
-    let src_frames = src.len() / 2;
-    if src_frames == 0 || ch == 0 {
+    let sch = src_channels as usize;
+    let dch = dst_channels as usize;
+    if sch == 0 || dch == 0 {
         return;
     }
-    let push = |fifo: &mut VecDeque<f32>, l: f32, r: f32| match ch {
-        1 => fifo.push_back((l + r) * 0.5),
-        _ => {
-            fifo.push_back(l);
-            fifo.push_back(r);
-            for _ in 2..ch {
-                fifo.push_back(0.0);
-            }
-        }
-    };
+    let src_frames = src.len() / sch;
+    if src_frames == 0 {
+        return;
+    }
     if src_rate == dst_rate {
         for f in 0..src_frames {
-            push(fifo, src[f * 2], src[f * 2 + 1]);
+            map_channels(&src[f * sch..f * sch + sch], dch, fifo);
         }
         return;
     }
     let dst_frames = (src_frames as u64 * dst_rate as u64 / src_rate as u64) as usize;
     let step = src_rate as f64 / dst_rate as f64;
+    // Reused per-frame scratch buffer — one allocation for the whole
+    // call, not one per resampled frame.
+    let mut frame = vec![0f32; sch];
     for i in 0..dst_frames {
         let pos = i as f64 * step;
         let i0 = pos as usize;
         let i1 = (i0 + 1).min(src_frames - 1);
         let t = (pos - i0 as f64) as f32;
-        let l = src[i0 * 2] * (1.0 - t) + src[i1 * 2] * t;
-        let r = src[i0 * 2 + 1] * (1.0 - t) + src[i1 * 2 + 1] * t;
-        push(fifo, l, r);
+        for c in 0..sch {
+            frame[c] = src[i0 * sch + c] * (1.0 - t) + src[i1 * sch + c] * t;
+        }
+        map_channels(&frame, dch, fifo);
+    }
+}
+
+/// Channel map from an `src.len()`-channel frame to `dst_channels`:
+/// - equal channel counts: interleaved passthrough.
+/// - mono → N: replicate to channels 0/1 (L/R), rest silent.
+/// - stereo → mono: average L/R (preserves the pre-surround behavior).
+/// - stereo → N (N != 1): L/R to channels 0/1, rest silent.
+/// - 5.1 (L R C LFE Ls Rs, FFmpeg default order) → stereo: ITU-R BS.775
+///   downmix (`L' = L + 0.707*C + 0.707*Ls`, `R' = R + 0.707*C +
+///   0.707*Rs`; LFE dropped), clamped to `[-1, 1]`.
+/// - general fallback: copy `min(src, dst)` channels directly, extra
+///   destination channels silent, extra source channels dropped.
+fn map_channels(src: &[f32], dch: usize, fifo: &mut VecDeque<f32>) {
+    let sch = src.len();
+    if sch == dch {
+        fifo.extend(src.iter().copied());
+        return;
+    }
+    match sch {
+        1 => {
+            // dch != sch here, so dch >= 2 (dch == 0 is rejected by the
+            // caller before any frame is mapped).
+            let v = src[0];
+            fifo.push_back(v);
+            fifo.push_back(v);
+            for _ in 2..dch {
+                fifo.push_back(0.0);
+            }
+        }
+        2 if dch == 1 => {
+            fifo.push_back((src[0] + src[1]) * 0.5);
+        }
+        2 => {
+            fifo.push_back(src[0]);
+            fifo.push_back(src[1]);
+            for _ in 2..dch {
+                fifo.push_back(0.0);
+            }
+        }
+        6 if dch == 2 => {
+            const K: f32 = 0.707;
+            let (l, r, c, _lfe, ls, rs) = (src[0], src[1], src[2], src[3], src[4], src[5]);
+            fifo.push_back((l + K * c + K * ls).clamp(-1.0, 1.0));
+            fifo.push_back((r + K * c + K * rs).clamp(-1.0, 1.0));
+        }
+        _ => {
+            let n = sch.min(dch);
+            for v in &src[..n] {
+                fifo.push_back(*v);
+            }
+            for _ in n..dch {
+                fifo.push_back(0.0);
+            }
+        }
     }
 }
 
@@ -455,7 +511,18 @@ pub fn run(core: &RxCore, shared: &AudioShared, stopped: &AtomicBool) {
                         shared.decode_errors.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(err = %e, "opus decode failed — skipping packet");
                     } else {
-                        convert_into(&pcm, 48_000, out.rate, out.channels, &mut fifo);
+                        // Decoder is opened stereo (see the TODO at the
+                        // decoder-open site); pass its actual channel
+                        // count once N-channel decode lands.
+                        const DECODED_CHANNELS: u16 = 2;
+                        convert_into(
+                            &pcm,
+                            DECODED_CHANNELS,
+                            48_000,
+                            out.rate,
+                            out.channels,
+                            &mut fifo,
+                        );
                         while fifo.len() > fifo_cap {
                             fifo.pop_front();
                         }
@@ -610,22 +677,64 @@ mod tests {
 
     #[test]
     fn convert_passthrough_and_channel_map() {
-        // Same rate, 2ch: identity.
+        // Same rate, 2ch -> 2ch: identity passthrough.
         let mut fifo = VecDeque::new();
-        convert_into(&[0.1, -0.1, 0.2, -0.2], 48_000, 48_000, 2, &mut fifo);
+        convert_into(&[0.1, -0.1, 0.2, -0.2], 2, 48_000, 48_000, 2, &mut fifo);
         assert_eq!(Vec::from(fifo.clone()), vec![0.1, -0.1, 0.2, -0.2]);
-        // Mono downmix.
+        // Stereo -> mono: average L/R (pre-surround behavior preserved).
         fifo.clear();
-        convert_into(&[0.4, 0.2], 48_000, 48_000, 1, &mut fifo);
+        convert_into(&[0.4, 0.2], 2, 48_000, 48_000, 1, &mut fifo);
         assert_eq!(Vec::from(fifo.clone()), vec![0.3]);
-        // 4ch: L R 0 0.
+        // Stereo -> 4ch: L R 0 0.
         fifo.clear();
-        convert_into(&[0.4, 0.2], 48_000, 48_000, 4, &mut fifo);
+        convert_into(&[0.4, 0.2], 2, 48_000, 48_000, 4, &mut fifo);
         assert_eq!(Vec::from(fifo.clone()), vec![0.4, 0.2, 0.0, 0.0]);
-        // Rate halving keeps frame count proportional.
+        // Stereo -> 6ch: L R then silence.
+        fifo.clear();
+        convert_into(&[0.4, 0.2], 2, 48_000, 48_000, 6, &mut fifo);
+        assert_eq!(Vec::from(fifo.clone()), vec![0.4, 0.2, 0.0, 0.0, 0.0, 0.0]);
+        // Mono -> 2ch: replicate to L/R.
+        fifo.clear();
+        convert_into(&[0.4, 0.2], 1, 48_000, 48_000, 2, &mut fifo);
+        assert_eq!(Vec::from(fifo.clone()), vec![0.4, 0.4, 0.2, 0.2]);
+        // Mono -> 4ch: replicate to L/R, rest silent.
+        fifo.clear();
+        convert_into(&[0.5], 1, 48_000, 48_000, 4, &mut fifo);
+        assert_eq!(Vec::from(fifo.clone()), vec![0.5, 0.5, 0.0, 0.0]);
+        // 5.1 (L R C LFE Ls Rs) -> 6ch: identity passthrough.
+        let surround = [0.1_f32, -0.2, 0.3, -0.4, 0.5, -0.6];
+        fifo.clear();
+        convert_into(&surround, 6, 48_000, 48_000, 6, &mut fifo);
+        assert_eq!(Vec::from(fifo.clone()), surround.to_vec());
+        // 5.1 -> stereo: ITU-R BS.775 downmix, LFE dropped.
+        // L=0.1 R=0.2 C=0.3 LFE=0.9(dropped) Ls=0.4 Rs=0.5
+        let surround = [0.1_f32, 0.2, 0.3, 0.9, 0.4, 0.5];
+        fifo.clear();
+        convert_into(&surround, 6, 48_000, 48_000, 2, &mut fifo);
+        let got = Vec::from(fifo.clone());
+        assert_eq!(got.len(), 2);
+        let expect_l = 0.1 + 0.707 * 0.3 + 0.707 * 0.4;
+        let expect_r = 0.2 + 0.707 * 0.3 + 0.707 * 0.5;
+        assert!(
+            (got[0] - expect_l).abs() < 1e-4,
+            "L' = L+0.707C+0.707Ls: got {} expected {expect_l}",
+            got[0]
+        );
+        assert!(
+            (got[1] - expect_r).abs() < 1e-4,
+            "R' = R+0.707C+0.707Rs: got {} expected {expect_r}",
+            got[1]
+        );
+        // 5.1 -> stereo downmix clamps to [-1, 1].
+        let loud = [1.0_f32, 1.0, 1.0, 0.0, 1.0, 1.0];
+        fifo.clear();
+        convert_into(&loud, 6, 48_000, 48_000, 2, &mut fifo);
+        let got = Vec::from(fifo.clone());
+        assert_eq!(got, vec![1.0, 1.0]);
+        // Rate halving keeps frame count proportional (stereo).
         fifo.clear();
         let src: Vec<f32> = (0..96).map(|i| i as f32 / 96.0).collect(); // 48 frames
-        convert_into(&src, 48_000, 24_000, 2, &mut fifo);
+        convert_into(&src, 2, 48_000, 24_000, 2, &mut fifo);
         assert_eq!(fifo.len() / 2, 24);
     }
 

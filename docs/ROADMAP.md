@@ -92,7 +92,7 @@ Tetrys FEC · 서브프레임 슬라이스 · QU · 네이티브 클라이언트
 | **HDR10 end-to-end** | Parsec·Moonlight·GFN 전부 출하 | **미추적 갭(2026-07-16 감사)** — 현 로드맵엔 "게이트 통과 후 주장"으로만 존재, 빌드 트랙 부재. 호스트 HDR 인코드(NVENC 10-bit, Foundation은 HEVC 10-bit YUV444 encode 확인됨) + PQ/HLG 메타데이터 전달 + 브라우저/네이티브 HDR 디코드·프레젠트. **화질 최강 주장의 필수 조건.** 대형(호스트+와이어+클라). Gate E 계열 |
 | **멀티모니터** | Parsec·DCV·Moonlight 전부 출하 | **미추적 갭(2026-07-16 감사)** — 로드맵 전체 언급 0. 모니터 선택(단일 전환) + 스팬/개별 스트림. Sunshine은 output 선택 config 존재 → 클라 모니터 피커 + 와이어가 헤드리스 착수 가능, 호스트 다중 캡처는 포크/config. 데스크톱 실사용의 핵심. 중~대형 |
 | **프라이버시 모드** | Parsec·DCV 출하(호스트 화면 블랭크 + 로컬 입력 차단) | **미추적 갭(2026-07-16 감사)** — **owner 시나리오 직결**(집/사무실에 다른 사람 있을 때 물리 모니터·키보드 차단). 호스트측(Sunshine/포크): 스트림 중 물리 디스플레이 블랭크 + 로컬 HID 차단 토글. 중형, 호스트 포크 |
-| **서라운드 오디오 5.1/7.1** | Moonlight·Sunshine 출하 | **미추적 갭(2026-07-16 감사)** — 현재 opus 스테레오 전용. 클라 멀티채널 opus 디코드 + 채널맵 + WASAPI 멀티채널 렌더(app-native 오디오 변환 테스트 패턴으로 헤드리스 검증 가능). 호스트는 Sunshine 서라운드 config. 중형, 클라측 헤드리스 착수 가능 |
+| **서라운드 오디오 5.1/7.1** | Moonlight·Sunshine 출하 | [~] **채널맵 기계 완성** (2026-07-16 새벽, 헤드리스 — task 병렬): `app-native/src/audio.rs` — `frame_to_f32`가 실 `ch_layout.nb_channels` 인터리브(하드코딩 2 제거), `convert_into(+src_channels)` + 신규 `map_channels`(passthrough / mono→N / stereo→N / **5.1→stereo ITU-R BS.775 다운믹스** L'=L+0.707C+0.707Ls·클램프 / N→M 폴백), 리샘플은 채널당 일반화. 잔여: [ ] **디코더 N채널 개방**(현 stereo 하드코딩, SDP 협상 채널수 필요 — TODO 표시) + Sunshine 서라운드 config + WASAPI 멀티채널 렌더 라이브. convert 테스트 확장(5.1→stereo 손계산 검증). 채널맵은 이제 정확, 잠재 non-stereo 오처리 버그도 수리 |
 | **이미지/파일 클립보드 + 파일 전송** | Parsec·DCV 이미지 클립보드, Parsec 파일 드래그드롭 | **미추적 갭(2026-07-16 감사)** — 현 클립보드 텍스트 전용. 이미지 = CLIPBOARD 채널에 PNG kind 추가(호스트 CF_DIB→PNG 워처 + 웹 Clipboard API image), 헤드리스 와이어/코덱 검증 가능. 파일 전송은 별도 reliable 채널. 중형 |
 
 ### ultra 성능 코어 트랙 (must-do)
@@ -391,10 +391,17 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   affordable) · `weighted_prediction`(false). Foundation `nvenc_config.h` 실측.
 
 ### 효율 지렛대 (측정→활성)
-- [ ] **[헤드리스] 화질-효율 probe** — SSIM/PSNR vs 비트레이트, preset(P1..7) ×
-  spatial AQ × codec(H264/HEVC/AV1) × chroma(4:2:0/4:4:4). nvenc-slice-probe
-  스캐폴딩 재사용, 디코드 경로 = app-native video.rs. "저비트레이트 고화질"의
-  정량 근거.
+- [x] **화질-효율 probe 완성** (2026-07-16 새벽, 헤드리스 검증 — task 병렬):
+  `app-native/src/bin/quality_probe.rs` (`cargo run --release -p app-native
+  --features video --bin quality-probe`) — 스트레스 합성 프레임(이동 그라디언트
+  + Nyquist 체커보드 + PRNG 노이즈) 120장을 h264_nvenc preset{p1,p4,p6} ×
+  spatial_aq{off,on} 고정 8Mbps CBR로 인코드 → 소프트웨어 디코드 → 원본 대비
+  PSNR/SSIM(순수, 6 tests). **실측**: SSIM p1→p4→p6 = 0.8987→0.9137→0.9192,
+  PSNR 27.34→27.87→28.18 — **preset가 화질/비트 대부분 캐리**, p4+aq vs p1 =
+  같은 8Mbps에서 **+0.60dB PSNR / +0.0166 SSIM**(무료 점심 실측 이득).
+  spatial_aq는 고주파 노이즈 콘텐츠에선 미미(평탄/텍스트에서 빛남 — 실 데스크톱
+  콘텐츠 라이브 재측 필요). `spatial_aq` AVOption명 확인됨. codec/chroma 축은
+  라이브(호스트 인코드) 확장.
 - [ ] **[라이브/호스트] 무료 점심 활성**: spatial AQ ON + preset P4 +
   weighted-pred ON (probe로 sweet spot → Gate B VMAF 검증)
 - [ ] **[라이브/호스트] 코덱 기본 전환**: HEVC e2e 검증 → 기본 h264→hevc,
@@ -418,9 +425,13 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
 - [ ] **[헤드리스] 클라 샤픈/CAS 셰이더** — 현 프레젠트는 bilinear 스트레치만
   (present.rs `DXGI_SCALING_STRETCH`). D3D11 픽셀 셰이더 샤픈 → 체감 선명도↑
   + 저해상도 전송 허용(효율)
-- [ ] **[헤드리스] 대역 구동 동적 해상도 스케일링** — 컨트롤러(대역→해상도
-  사다리, 순수 FecRatioController 패턴) + 클라 업스케일. 혼잡 시 해상도↓가
-  블록킹보다 지각 우위
+- [~] **대역 구동 동적 해상도 스케일링** — [x] **컨트롤러 기계 완성**
+  (2026-07-16 새벽, 헤드리스 — task 병렬): `transport-core/src/resolution.rs`
+  `DynResolutionController` — 대역 추정 → 해상도 사다리(2160/1440/1080/900/720/
+  540/480, 룽별 min_kbps) 매핑, drop-fast/recover-slow 히스테리시스(현 룽 부족 시
+  즉시 1룽↓, raise_streak 클린 후 1룽↑), 클램프, `sanitised()`(길이불일치·빈입력
+  폴백), 12 tests. 상수는 Gate-B/C 튜닝. 잔여: [ ] 스트리머 배선(해상도 변경 요청)
+  + 클라 업스케일(샤픈 셰이더와 결합)
 - [ ] **[대형] 클라 슈퍼레졸루션(FSR/VSR급)** + 10-bit/HDR 프레젠트 경로
   (R10G10B10A2 + HDR 스왑체인) — GFN DLSS 지렛대
 - [ ] **AV1 필름그레인 합성** — 그레인 제거 인코드 + 클라 합성(그레인 콘텐츠 효율)

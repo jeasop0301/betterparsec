@@ -156,6 +156,12 @@ impl DecodeState {
             return;
         };
         if self.wait_for_key && !unit.is_key {
+            // Mid-GOP join (reconnect onto a resumed Sunshine session):
+            // deltas keep flowing and nothing else ever asks for a key, so
+            // without this latch the session shows white forever (field
+            // report 2026-07-15). request_idr collapses into the next
+            // session tick's needs-IDR ack — safe to latch per skipped unit.
+            core.request_idr();
             return;
         }
         self.wait_for_key = false;
@@ -508,6 +514,12 @@ impl eframe::App for App {
                     if ui.button("Connect").clicked() {
                         self.form.host_id = self.host_id_text.trim().parse().unwrap_or(0);
                         self.form.app_id = self.app_id_text.trim().parse().unwrap_or(0);
+                        // Fresh connection = fresh chance for the raw
+                        // surface (the latch is per-connection, not per-app).
+                        #[cfg(all(windows, feature = "video"))]
+                        {
+                            self.surface_failed = false;
+                        }
                         self.running = Some(Running::start(self.form.clone(), ctx.clone()));
                     }
                     ui.add_space(4.0);
@@ -647,6 +659,12 @@ impl eframe::App for App {
                                 }
                                 match self.surface.as_mut() {
                                     Some(s) if s.failed() => {
+                                        // Present thread latched fallback
+                                        // (raw_present_failed is set, so the
+                                        // egui texture path takes over).
+                                        tracing::warn!(
+                                            "stream surface failed — egui fallback for this connection"
+                                        );
                                         self.surface = None;
                                         self.surface_failed = true;
                                     }
@@ -670,6 +688,16 @@ impl eframe::App for App {
                                             (fit.width() * ppp).round() as i32,
                                             (fit.height() * ppp).round() as i32,
                                         );
+                                        // Single-cursor, parent half: while
+                                        // the chrome window has focus winit
+                                        // re-applies its cursor every frame,
+                                        // overriding the child's
+                                        // WM_SETCURSOR hide — report None to
+                                        // egui while the pointer is over the
+                                        // stream child (field issue #2).
+                                        if s.cursor_over() {
+                                            ctx.set_cursor_icon(egui::CursorIcon::None);
+                                        }
                                     }
                                     None => {}
                                 }
@@ -739,6 +767,7 @@ impl eframe::App for App {
                         #[cfg(all(windows, feature = "video"))]
                         {
                             self.surface = None; // joins the present thread
+                            self.surface_failed = false; // per-connection latch
                         }
                         run.stop();
                         #[cfg(feature = "video")]

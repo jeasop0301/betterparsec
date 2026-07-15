@@ -17,7 +17,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
@@ -35,9 +35,10 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::WaitForSingleObjectEx;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_STYLE, GWLP_USERDATA, GetWindowLongPtrW,
-    HTTRANSPARENT, MoveWindow, RegisterClassW, SetWindowLongPtrW, WINDOW_EX_STYLE, WM_ERASEBKGND,
-    WM_NCHITTEST, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_STYLE, GWLP_USERDATA, GetCursorPos,
+    GetWindowLongPtrW, GetWindowRect, HTTRANSPARENT, MoveWindow, RegisterClassW, SetWindowLongPtrW,
+    WINDOW_EX_STYLE, WM_ERASEBKGND, WM_NCHITTEST, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
+    WS_CLIPSIBLINGS, WS_VISIBLE,
 };
 use windows::core::{Interface, PCWSTR, w};
 
@@ -402,6 +403,22 @@ impl StreamSurface {
         unsafe {
             let _ = MoveWindow(self.hwnd, rect.0, rect.1, rect.2, rect.3, true);
         }
+    }
+
+    /// Whether the global cursor is inside the stream child window. The
+    /// shell reports `CursorIcon::None` to egui while true: winit
+    /// re-applies its own cursor every frame while the chrome window has
+    /// focus, which fights the child's WM_SETCURSOR hide — double cursor
+    /// until the first click moves focus (field report 2026-07-15).
+    pub fn cursor_over(&self) -> bool {
+        let mut pt = POINT::default();
+        let mut rect = RECT::default();
+        unsafe {
+            if GetCursorPos(&mut pt).is_err() || GetWindowRect(self.hwnd, &mut rect).is_err() {
+                return false;
+            }
+        }
+        pt.x >= rect.left && pt.x < rect.right && pt.y >= rect.top && pt.y < rect.bottom
     }
 
     /// The raw path is gone (init failed); the UI should fall back to the

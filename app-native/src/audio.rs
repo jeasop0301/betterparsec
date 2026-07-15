@@ -15,7 +15,7 @@
 use std::collections::VecDeque;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use client_transport::capi::RxCore;
 use ffmpeg_sys_next as ff;
@@ -374,60 +374,76 @@ fn debug_delay_samples(rate: u32, channels: u16, delay_ms: u64) -> usize {
 // ── Audio thread ───────────────────────────────────────────────────────────
 
 /// Audio thread body: drain the session's opus queue, decode, fill the
-/// default render endpoint. Returns when `stopped` is set. Any WASAPI
-/// init failure latches [`AUDIO_FAILED`] and receives-and-drops instead
-/// (keeps the sample queue from backing up).
+/// default render endpoint. Returns when `stopped` is set. A dead render
+/// device (init failure or mid-session invalidation — e.g. the default
+/// endpoint switching when a Parsec virtual device attaches) drops the
+/// sink and retries every [`SINK_RETRY`]; packets are received-and-dropped
+/// meanwhile (keeps the sample queue from backing up).
 #[cfg(windows)]
 pub fn run(core: &RxCore, shared: &AudioShared, stopped: &AtomicBool) {
     let _com = ComGuard::init();
-    let out = match WasapiOut::new() {
-        Ok(o) => {
-            tracing::info!(rate = o.rate, ch = o.channels, "WASAPI shared render up");
-            shared.state.store(AUDIO_RUNNING, Ordering::Release);
-            Some(o)
-        }
-        Err(e) => {
-            tracing::error!(err = %e, "WASAPI init failed — audio off");
-            shared.state.store(AUDIO_FAILED, Ordering::Release);
-            None
+    // BP_AUDIO_DEBUG_DELAY_MS (opt-in, clamped to 2 s): constant playout
+    // delay for the same-PC audio verdict — the streamed copy becomes an
+    // audible echo behind the host's direct output, so "is remote audio
+    // really playing?" needs ears, not meter squinting. Implemented as
+    // silence prepended before the first fill (re-armed on sink rebuild);
+    // the FIFO cap grows by the same amount so drop-oldest cannot erode
+    // the offset over time.
+    let delay_ms: u64 = std::env::var("BP_AUDIO_DEBUG_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    // Device-format FIFO between decode and fill; ~250 ms cap (+ debug
+    // delay), drop oldest (latency beats continuity for realtime audio).
+    let mut fifo: VecDeque<f32> = VecDeque::new();
+    let mut pcm: Vec<f32> = Vec::new();
+    let mut fifo_cap = 0usize;
+
+    /// Field report 2026-07-15: AUDCLNT_E_DEVICE_INVALIDATED mid-session.
+    const SINK_RETRY: Duration = Duration::from_secs(2);
+    let mut next_sink_attempt = Instant::now();
+
+    // (Re)build the render sink: fresh FIFO, cap, debug-delay preroll.
+    let build_sink = |fifo: &mut VecDeque<f32>, fifo_cap: &mut usize| -> Option<WasapiOut> {
+        match WasapiOut::new() {
+            Ok(o) => {
+                tracing::info!(rate = o.rate, ch = o.channels, "WASAPI shared render up");
+                fifo.clear();
+                *fifo_cap = o.rate as usize / 4 * o.channels as usize;
+                if delay_ms > 0 {
+                    let silence = debug_delay_samples(o.rate, o.channels, delay_ms);
+                    fifo.extend(std::iter::repeat_n(0.0f32, silence));
+                    *fifo_cap += silence;
+                    tracing::info!(delay_ms, samples = silence, "audio debug delay armed");
+                }
+                Some(o)
+            }
+            Err(e) => {
+                tracing::error!(err = %e, "WASAPI init failed — retrying every {SINK_RETRY:?}");
+                None
+            }
         }
     };
+
+    let mut out = build_sink(&mut fifo, &mut fifo_cap);
+    shared.state.store(
+        if out.is_some() {
+            AUDIO_RUNNING
+        } else {
+            AUDIO_FAILED
+        },
+        Ordering::Release,
+    );
     let mut dec = match OpusDecoder::new() {
         Ok(d) => Some(d),
         Err(e) => {
+            // Decoder init cannot recover by retry — audio stays off.
             tracing::error!(err = %e, "opus decoder init failed — audio off");
             shared.state.store(AUDIO_FAILED, Ordering::Release);
             None
         }
     };
-
-    // Device-format FIFO between decode and fill; ~250 ms cap, drop
-    // oldest (latency beats continuity for realtime audio).
-    let mut fifo: VecDeque<f32> = VecDeque::new();
-    let mut pcm: Vec<f32> = Vec::new();
-    let mut fifo_cap = out
-        .as_ref()
-        .map(|o| o.rate as usize / 4 * o.channels as usize)
-        .unwrap_or(0);
-
-    // BP_AUDIO_DEBUG_DELAY_MS (opt-in, clamped to 2 s): constant playout
-    // delay for the same-PC audio verdict — the streamed copy becomes an
-    // audible echo behind the host's direct output, so "is remote audio
-    // really playing?" needs ears, not meter squinting. Implemented as
-    // silence prepended once before the first fill; the FIFO cap grows by
-    // the same amount so drop-oldest cannot erode the offset over time.
-    let delay_ms: u64 = std::env::var("BP_AUDIO_DEBUG_DELAY_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    if delay_ms > 0
-        && let Some(o) = out.as_ref()
-    {
-        let silence = debug_delay_samples(o.rate, o.channels, delay_ms);
-        fifo.extend(std::iter::repeat_n(0.0f32, silence));
-        fifo_cap += silence;
-        tracing::info!(delay_ms, samples = silence, "audio debug delay armed");
-    }
 
     loop {
         match core.wait_audio(Duration::from_millis(20)) {
@@ -454,13 +470,25 @@ pub fn run(core: &RxCore, shared: &AudioShared, stopped: &AtomicBool) {
                 std::thread::sleep(Duration::from_millis(2));
             }
         }
-        if let Some(out) = out.as_ref()
-            && let Err(e) = out.fill(&mut fifo)
+        if let Some(o) = out.as_ref()
+            && let Err(e) = o.fill(&mut fifo)
         {
-            tracing::error!(err = %e, "WASAPI fill failed — audio off");
+            // Device invalidated (default endpoint changed, unplugged…):
+            // drop the sink — no per-iteration error spam — and rebuild on
+            // the retry cadence below.
+            tracing::error!(err = %e, "WASAPI fill failed — dropping sink, will rebuild");
             shared.state.store(AUDIO_FAILED, Ordering::Release);
-            dec = None;
+            out = None;
             fifo.clear();
+            next_sink_attempt = Instant::now() + SINK_RETRY;
+        }
+        if out.is_none() && dec.is_some() && Instant::now() >= next_sink_attempt {
+            out = build_sink(&mut fifo, &mut fifo_cap);
+            if out.is_some() {
+                shared.state.store(AUDIO_RUNNING, Ordering::Release);
+            } else {
+                next_sink_attempt = Instant::now() + SINK_RETRY;
+            }
         }
     }
 }

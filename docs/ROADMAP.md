@@ -179,9 +179,22 @@ U5/M6 스파이크, f1-ack 소스 확인+0x5509 호스트 패치.
    `cargo build -p app-native`는 기본 피처가 비어 있어 `--features
    video` 누락 시 디코더 없는 exe가 나온다(세션·입력·오디오 채널은
    정상 연결, 화면만 부재 — 2026-07-15 오전 재현·소요). 정식 커맨드 =
-   `cargo build --release -p app-native --features video`. 잔여 라이브
-   = ①오디오 청취 판정(delay 켜고) + 커서 단일화 확인, ②host 롤 —
-   임베디드 서버로 paired 접속
+   `cargo build --release -p app-native --features video`. **라이브 ②차
+   (2026-07-15 오후, Parsec 원격 경유 — 판정 오염 주의) 현장 이슈 3건
+   진단·수정 (헤드리스 검증)**: ⑴ 재접속 화이트스크린 = `wait_for_key`
+   스킵 경로가 IDR을 요청하지 않아 mid-GOP 조인(Sunshine resume) 시
+   무한 대기 — 스킵 시 `request_idr` 래치로 수정(+로그 근거: 워치독
+   무발화 = 프레임은 도착, "surface up" 부재 = 퍼블리시 없음).
+   ⑵ 오디오 = AUDCLNT_E_DEVICE_INVALIDATED(Parsec 가상 장치의 기본
+   엔드포인트 전환)에서 죽은 sink에 fill 스팸 + 복구 없음 → sink 폐기 +
+   2s 주기 재생성 + 딜레이 프리롤 재장전으로 수정(딜레이 자체는 매 실행
+   armed 확인 — 미청취는 장치 사망 때문). ⑶ 커서 = 클릭 후 단일(owner
+   확인) — 원인: 부모(winit)가 포커스 보유 중 매 프레임 커서를 재적용해
+   child의 WM_SETCURSOR 숨김과 경합 → 포인터가 스트림 child 위면 egui에
+   `CursorIcon::None` 보고(`StreamSurface::cursor_over`)로 부모 권위도
+   차단. + `surface_failed` 래치를 접속 단위로 리셋(Connect·워치독
+   재접속), 래치 시 warn 로그. 잔여 라이브 = ①로컬(비-Parsec) 오디오
+   청취 + 호버 단일커서 확인, ②host 롤 — 임베디드 서버로 paired 접속
    (`BP_SUNSHINE_STAGE` 관리형 Sunshine은 이 머신에 Foundation
    스테이지 부재 확인(2026-07-15) — MSYS2 UCRT64 재빌드 세션에서) →
    다음 헤드리스 대형 항목: M4 `session-ux`(스톨 워치독 웹 배선 완료

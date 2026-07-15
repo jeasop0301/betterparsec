@@ -12,7 +12,7 @@
 //! The mirror C header lives at `client-transport/include/client_transport.h`
 //! and must stay in sync with this file.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,6 +36,9 @@ pub struct RxCore {
     /// error (e.g. missing reference after frame-queue eviction); drained
     /// through [`RxCore::poll_needs_idr`] like the receiver-side flags.
     decode_needs_idr: AtomicBool,
+    /// Monotonic count of frames delivered to the frame queue (M4 stall
+    /// watchdog frame signal; never reset).
+    frames_delivered: AtomicU64,
     /// Opus packets from the audio RTP track (session `on_track` pushes;
     /// the audio render thread pops). Independent of the video pipeline.
     audio: SampleQueue,
@@ -48,6 +51,7 @@ impl RxCore {
             queue: FrameQueue::new(DEFAULT_FRAME_CAP),
             pending_ack: Mutex::new(None),
             decode_needs_idr: AtomicBool::new(false),
+            frames_delivered: AtomicU64::new(0),
             audio: SampleQueue::new(DEFAULT_AUDIO_CAP),
         }
     }
@@ -58,6 +62,7 @@ impl RxCore {
             match ev {
                 RxEvent::Frame(unit) => {
                     self.queue.push(unit);
+                    self.frames_delivered.fetch_add(1, Ordering::Relaxed);
                 }
                 RxEvent::Ack(a) => {
                     *lock_ignore_poison(&self.pending_ack) = Some(a);
@@ -74,6 +79,11 @@ impl RxCore {
 
     pub fn poll_ack(&self) -> Option<u32> {
         lock_ignore_poison(&self.pending_ack).take()
+    }
+
+    /// Monotonic delivered-frame count (M4 stall watchdog frame signal).
+    pub fn frames_delivered(&self) -> u64 {
+        self.frames_delivered.load(Ordering::Relaxed)
     }
 
     /// Latch a needs-IDR request from the decode side. Collapses with the
@@ -531,6 +541,26 @@ mod tests {
         core.request_idr(); // collapses — cumulative like the other flags
         assert!(core.poll_needs_idr());
         assert!(!core.poll_needs_idr());
+    }
+
+    /// The watchdog frame signal counts queue pushes, monotonic, never
+    /// reset — even when the frame is popped (or dropped) afterwards.
+    #[test]
+    fn frames_delivered_counts_queue_pushes() {
+        let core = RxCore::new(0);
+        assert_eq!(core.frames_delivered(), 0);
+        let mut seq = 0;
+        for frame_id in 0..3u32 {
+            for msg in
+                source_msgs_for_frame(frame_id, frame_id == 0, frame_id, &[1, 2, 3], &mut seq)
+            {
+                core.on_message(&msg, 0);
+            }
+        }
+        assert_eq!(core.frames_delivered(), 3);
+        // Popping does not reset the signal.
+        let _ = core.wait_frame(Duration::from_millis(5));
+        assert_eq!(core.frames_delivered(), 3);
     }
 
     fn pop_frame(rx: &Rx, timeout_ms: u64) -> Option<(CtDecodeUnit, Vec<u8>, *mut CtFrame)> {

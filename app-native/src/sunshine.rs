@@ -130,7 +130,12 @@ impl SunshineProcess {
         // successful bind proves nobody owns the moonlight port yet.
         match std::net::TcpListener::bind(("0.0.0.0", cfg.port)) {
             Ok(l) => drop(l),
-            Err(e) => return Err(format!("moonlight port {} is already in use: {e}", cfg.port)),
+            Err(e) => {
+                return Err(format!(
+                    "moonlight port {} is already in use: {e}",
+                    cfg.port
+                ));
+            }
         }
 
         let stamp = format!(

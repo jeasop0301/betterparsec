@@ -49,7 +49,10 @@ fn stage_dlls(bin: &Path, dest_dir: &Path) {
     };
     for entry in entries.flatten() {
         let src = entry.path();
-        if src.extension().is_none_or(|e| !e.eq_ignore_ascii_case("dll")) {
+        if src
+            .extension()
+            .is_none_or(|e| !e.eq_ignore_ascii_case("dll"))
+        {
             continue;
         }
         let dest = dest_dir.join(entry.file_name());

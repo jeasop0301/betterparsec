@@ -169,8 +169,10 @@ mod tests {
 
         use std::io::{Read, Write};
         let mut sock = std::net::TcpStream::connect(addr).expect("connect");
-        sock.write_all(b"GET /api/config.js HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .expect("send");
+        sock.write_all(
+            b"GET /api/config.js HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .expect("send");
         let mut response = Vec::new();
         sock.read_to_end(&mut response).expect("read");
         assert!(response.starts_with(b"HTTP/1.1 "), "host answered HTTP");

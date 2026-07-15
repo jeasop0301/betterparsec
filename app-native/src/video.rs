@@ -182,10 +182,7 @@ impl Decoder {
                 ff::av_frame_unref(self.sw_frame);
                 let rc = ff::av_hwframe_transfer_data(self.sw_frame, self.frame, 0);
                 if rc < 0 {
-                    return Err(DecodeError(format!(
-                        "hwframe transfer: {}",
-                        err_str(rc)
-                    )));
+                    return Err(DecodeError(format!("hwframe transfer: {}", err_str(rc))));
                 }
                 src = self.sw_frame;
             }
@@ -197,12 +194,19 @@ impl Decoder {
             // Explicit allowlist instead of transmuting the raw int back
             // into the bindgen enum.
             use ff::AVPixelFormat as P;
-            let src_fmt = [P::AV_PIX_FMT_NV12, P::AV_PIX_FMT_YUV420P, P::AV_PIX_FMT_YUVJ420P]
-                .into_iter()
-                .find(|f| *f as i32 == (*src).format)
-                .ok_or_else(|| {
-                    DecodeError(format!("unsupported decoded pixel format {}", (*src).format))
-                })?;
+            let src_fmt = [
+                P::AV_PIX_FMT_NV12,
+                P::AV_PIX_FMT_YUV420P,
+                P::AV_PIX_FMT_YUVJ420P,
+            ]
+            .into_iter()
+            .find(|f| *f as i32 == (*src).format)
+            .ok_or_else(|| {
+                DecodeError(format!(
+                    "unsupported decoded pixel format {}",
+                    (*src).format
+                ))
+            })?;
 
             self.sws = ff::sws_getCachedContext(
                 self.sws,
@@ -222,8 +226,12 @@ impl Decoder {
             }
 
             let mut rgba = vec![0u8; w as usize * h as usize * 4];
-            let dst_data: [*mut u8; 4] =
-                [rgba.as_mut_ptr(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut()];
+            let dst_data: [*mut u8; 4] = [
+                rgba.as_mut_ptr(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ];
             let dst_stride: [i32; 4] = [w * 4, 0, 0, 0];
             let rc = ff::sws_scale(
                 self.sws,
@@ -268,7 +276,11 @@ mod tests {
     /// `video` feature links against). None → skip fixture generation.
     fn ffmpeg_cli() -> Option<PathBuf> {
         let dir = std::env::var_os("FFMPEG_DIR")?;
-        let exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+        let exe = if cfg!(windows) {
+            "ffmpeg.exe"
+        } else {
+            "ffmpeg"
+        };
         let p = PathBuf::from(dir).join("bin").join(exe);
         p.is_file().then_some(p)
     }
@@ -360,7 +372,11 @@ mod tests {
         let bs = std::fs::read(&fixture).expect("read fixture");
 
         let aus = split_access_units(&bs);
-        assert!(aus.len() >= 25, "expected ~30 access units, got {}", aus.len());
+        assert!(
+            aus.len() >= 25,
+            "expected ~30 access units, got {}",
+            aus.len()
+        );
 
         let mut dec = Decoder::new().expect("decoder init");
         let mut frames = 0usize;

@@ -266,14 +266,8 @@ impl Renderer {
                 self.upload = tex;
             }
             let upload = self.upload.as_ref().expect("just created");
-            self.ctx.UpdateSubresource(
-                upload,
-                0,
-                None,
-                frame.rgba.as_ptr().cast(),
-                w * 4,
-                0,
-            );
+            self.ctx
+                .UpdateSubresource(upload, 0, None, frame.rgba.as_ptr().cast(), w * 4, 0);
             let back: ID3D11Texture2D = self.swapchain.GetBuffer(0)?;
             self.ctx.CopyResource(&back, upload);
         }
@@ -438,10 +432,7 @@ fn render_loop(hwnd: HWND, shared: &Arc<VideoShared>) {
     let mut renderer: Option<Renderer> = None;
     loop {
         let frame = {
-            let mut guard = shared
-                .frame
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut guard = shared.frame.lock().unwrap_or_else(PoisonError::into_inner);
             loop {
                 if shared.present_stop.load(Ordering::Acquire) {
                     return;
@@ -471,10 +462,7 @@ fn render_loop(hwnd: HWND, shared: &Arc<VideoShared>) {
                     tracing::error!(err = %e, "raw present init failed — egui fallback");
                     shared.raw_present_failed.store(true, Ordering::Release);
                     // Put the frame back for the fallback consumer.
-                    *shared
-                        .frame
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner) = Some(frame);
+                    *shared.frame.lock().unwrap_or_else(PoisonError::into_inner) = Some(frame);
                     return;
                 }
             }

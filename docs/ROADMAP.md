@@ -332,8 +332,18 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   1), clippy·fmt 클린. **Rust 미러 완성** (2026-07-15,
   `client-transport/src/watchdog.rs` — TS와 락스텝: 동일 사다리·기본값·
   틱당 1단, TS 스위트 포팅 15 tests, API만 `Option<WatchdogAction>`).
-  잔여 = 네이티브 세션 배선(app-native 프레임 신호·시그널링 ws 액션) +
-  라이브 스톨 주입 스모크(clumsy full-block) + Gate B/C 임계 튜닝.
+  **네이티브 배선 완성** (2026-07-15, 헤드리스 검증): 워치독을 세션
+  루프에 내장(`client-transport/src/session.rs` 50ms 틱 — 셸 스왑에도
+  생존, ct-probe 포함) — 프레임 신호 = `RxCore::frames_delivered`
+  단조 카운터(+1 test), IDR/ICE restart = 시그널링 ws
+  `RequestIdr`/`RestartIce`, reconnect = `WatchdogStatus` 플래그 +
+  세션 Failed 종료 → 셸(app-native)이 자동 재생성. 셸 쪽 배선 =
+  인디케이터 readback(구 임시 라벨 대체) + minimized pause. 검증:
+  client-transport 40 + app-native 24 tests, clippy·fmt 클린. **주의**:
+  신규 ws 메시지라 web-server/streamer도 같은 커밋 이후 빌드 필요
+  (구버전 서버는 deserialize 실패로 릴레이 종료 — 배포 세트 일치 확인,
+  2026-07-15 로컬 세트 재빌드·재기동 완료). 잔여 = 라이브 스톨 주입
+  스모크(clumsy full-block, 웹+네이티브) + Gate B/C 임계 튜닝.
 - [ ] **커서 P1** — `cursor` DataChannel + 호스트 권위 자동 lock/unlock
   (cursor-channel.md §3 P1, 설계 완료) → [ ] **P2** 모양 채널
   zero-latency 커서

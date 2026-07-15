@@ -11,20 +11,20 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod host;
-mod sunshine;
 #[cfg(all(windows, feature = "video"))]
 mod audio;
+mod host;
 #[cfg(all(windows, feature = "video"))]
 mod input;
 #[cfg(all(windows, feature = "video"))]
 mod present;
+mod sunshine;
 #[cfg(feature = "video")]
 mod video;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(feature = "video")]
 use std::sync::Condvar;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -429,8 +429,7 @@ impl App {
                         .collect::<Vec<_>>()
                         .join(", "),
                     match h.config_source {
-                        host::ConfigSource::File =>
-                            format!("config: {}", h.config_path.display()),
+                        host::ConfigSource::File => format!("config: {}", h.config_path.display()),
                         host::ConfigSource::BuiltinDefault => "default config".into(),
                     },
                     sunshine,
@@ -516,6 +515,14 @@ impl eframe::App for App {
                 }
                 Some(run) => {
                     let state = run.session.state();
+                    // Hold watchdog escalation while minimized (parity
+                    // with the web wiring's document-hidden pause).
+                    run.session
+                        .set_watchdog_paused(ctx.input(|i| i.viewport().minimized.unwrap_or(false)));
+                    // Terminal watchdog rung: the session ended itself
+                    // after the full ladder — rebuild below (web parity).
+                    let watchdog_reconnect = state == SessionState::Failed
+                        && run.session.watchdog().reconnect_requested();
                     let frames = run.stats.frames.load(Ordering::Relaxed);
                     let keys = run.stats.key_frames.load(Ordering::Relaxed);
                     let bytes = run.stats.payload_bytes.load(Ordering::Relaxed);
@@ -543,12 +550,13 @@ impl eframe::App for App {
                     ui.label(format!("frames: {frames}  (key: {keys})"));
                     ui.label(format!("fps (2s window): {:.1}", run.fps.fps()));
                     ui.label(format!("payload: {:.2} MB", bytes as f64 / 1e6));
-                    // Poor-man's stall indicator until the session-ux
-                    // watchdog lands (field issue #1).
-                    if frames > 0 && stalled_for > 1.0 && state == SessionState::Streaming {
+                    // Stall indicator: readback of the session-embedded
+                    // watchdog ladder (M4 field issue #1, client-transport
+                    // watchdog.rs); seconds from the shell-side pump stats.
+                    if run.session.watchdog().stalled() {
                         ui.colored_label(
                             egui::Color32::YELLOW,
-                            format!("no frames for {stalled_for:.1}s"),
+                            format!("stream stalled — recovering ({stalled_for:.1}s)"),
                         );
                     }
                     if state == SessionState::Failed {
@@ -725,6 +733,21 @@ impl eframe::App for App {
                             self.video_tex = None;
                             self.video_gen = 0;
                         }
+                    }
+
+                    if watchdog_reconnect && let Some(run) = self.running.take() {
+                        #[cfg(all(windows, feature = "video"))]
+                        {
+                            self.surface = None; // joins the present thread
+                        }
+                        run.stop();
+                        #[cfg(feature = "video")]
+                        {
+                            self.video_tex = None;
+                            self.video_gen = 0;
+                        }
+                        tracing::info!("stall watchdog reconnect: rebuilding the session");
+                        self.running = Some(Running::start(self.form.clone(), ctx.clone()));
                     }
                 }
             }

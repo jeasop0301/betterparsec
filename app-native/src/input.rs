@@ -111,7 +111,14 @@ fn translate(
             } else {
                 MouseButton::X2
             };
-            button(if msg == WM_XBUTTONDOWN { Press } else { Release }, b)
+            button(
+                if msg == WM_XBUTTONDOWN {
+                    Press
+                } else {
+                    Release
+                },
+                b,
+            )
         }
         // Positive wheel delta = away from the user = scroll up, matching
         // the wire's moonlight scroll convention.
@@ -161,7 +168,13 @@ fn current_modifiers() -> KeyModifiers {
 /// Window-message hook called from the stream surface wndproc (UI
 /// thread). `Some(_)` = handled (message consumed — also suppresses the
 /// Alt/F10 system-menu default for SYSKEY messages).
-pub fn handle(ctx: &InputCtx, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+pub fn handle(
+    ctx: &InputCtx,
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Option<LRESULT> {
     // Single-cursor: the host cursor lives in the video (module doc).
     if msg == WM_SETCURSOR {
         if !setcursor_hides(lparam.0) {
@@ -222,7 +235,13 @@ mod tests {
 
     #[test]
     fn mouse_position_scales_to_stream_reference() {
-        match translate(WM_MOUSEMOVE, 0, lparam_xy(100, 50), VP, KeyModifiers::empty()) {
+        match translate(
+            WM_MOUSEMOVE,
+            0,
+            lparam_xy(100, 50),
+            VP,
+            KeyModifiers::empty(),
+        ) {
             Some(InboundPacket::MousePosition {
                 x,
                 y,
@@ -239,7 +258,13 @@ mod tests {
     #[test]
     fn mouse_position_clamps_captured_drag_coords() {
         // Captured drags go negative / past the client edge.
-        match translate(WM_MOUSEMOVE, 0, lparam_xy(-40, 500), VP, KeyModifiers::empty()) {
+        match translate(
+            WM_MOUSEMOVE,
+            0,
+            lparam_xy(-40, 500),
+            VP,
+            KeyModifiers::empty(),
+        ) {
             Some(InboundPacket::MousePosition { x, y, .. }) => {
                 assert_eq!(x, 0);
                 assert_eq!(y as i32, 1080_i32 * 99 / 100); // last client row
@@ -278,13 +303,25 @@ mod tests {
 
     #[test]
     fn wheel_delta_passes_signed() {
-        match translate(WM_MOUSEWHEEL, wparam_wheel(-120), 0, VP, KeyModifiers::empty()) {
+        match translate(
+            WM_MOUSEWHEEL,
+            wparam_wheel(-120),
+            0,
+            VP,
+            KeyModifiers::empty(),
+        ) {
             Some(InboundPacket::HighResScroll { delta_x, delta_y }) => {
                 assert_eq!((delta_x, delta_y), (0, -120));
             }
             other => panic!("wrong packet: {other:?}"),
         }
-        match translate(WM_MOUSEHWHEEL, wparam_wheel(120), 0, VP, KeyModifiers::empty()) {
+        match translate(
+            WM_MOUSEHWHEEL,
+            wparam_wheel(120),
+            0,
+            VP,
+            KeyModifiers::empty(),
+        ) {
             Some(InboundPacket::HighResScroll { delta_x, delta_y }) => {
                 assert_eq!((delta_x, delta_y), (120, 0));
             }
@@ -318,7 +355,16 @@ mod tests {
 
     #[test]
     fn unrelated_messages_are_ignored() {
-        assert!(translate(0x0083 /* WM_NCCALCSIZE */, 0, 0, VP, KeyModifiers::empty()).is_none());
+        assert!(
+            translate(
+                0x0083, /* WM_NCCALCSIZE */
+                0,
+                0,
+                VP,
+                KeyModifiers::empty()
+            )
+            .is_none()
+        );
     }
 
     #[test]

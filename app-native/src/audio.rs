@@ -146,7 +146,11 @@ impl OpusDecoder {
             if fmt == S::AV_SAMPLE_FMT_FLTP as i32 {
                 // Planar float — libavcodec's native opus output.
                 let l = (*f).data[0].cast::<f32>();
-                let r = if ch > 1 { (*f).data[1].cast::<f32>() } else { l };
+                let r = if ch > 1 {
+                    (*f).data[1].cast::<f32>()
+                } else {
+                    l
+                };
                 out.reserve(n * 2);
                 for i in 0..n {
                     out.push(*l.add(i));
@@ -248,10 +252,9 @@ mod sink {
                     let f32_fmt = match f.wFormatTag {
                         TAG_IEEE_FLOAT => f.wBitsPerSample == 32,
                         TAG_EXTENSIBLE => {
-                            let sub = std::ptr::addr_of!(
-                                (*fmt.cast::<WAVEFORMATEXTENSIBLE>()).SubFormat
-                            )
-                            .read_unaligned();
+                            let sub =
+                                std::ptr::addr_of!((*fmt.cast::<WAVEFORMATEXTENSIBLE>()).SubFormat)
+                                    .read_unaligned();
                             sub == SUBTYPE_IEEE_FLOAT && f.wBitsPerSample == 32
                         }
                         _ => false,
@@ -264,14 +267,7 @@ mod sink {
                 }
 
                 // 200 ms buffer (100 ns units), timer-driven polling fill.
-                let rc = client.Initialize(
-                    AUDCLNT_SHAREMODE_SHARED,
-                    0,
-                    2_000_000,
-                    0,
-                    fmt,
-                    None,
-                );
+                let rc = client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 2_000_000, 0, fmt, None);
                 CoTaskMemFree(Some(fmt.cast()));
                 rc?;
                 let buffer_frames = client.GetBufferSize()?;
@@ -501,8 +497,7 @@ mod tests {
     #[test]
     fn opus_roundtrip_produces_stereo_pcm() {
         unsafe {
-            let mut codec =
-                ff::avcodec_find_encoder_by_name(c"libopus".as_ptr());
+            let mut codec = ff::avcodec_find_encoder_by_name(c"libopus".as_ptr());
             let mut experimental = false;
             if codec.is_null() {
                 codec = ff::avcodec_find_encoder(ff::AVCodecID::AV_CODEC_ID_OPUS);
@@ -570,7 +565,10 @@ mod tests {
             assert!(!pcm.is_empty(), "decoded samples");
             assert_eq!(pcm.len() % 2, 0, "interleaved stereo");
             let energy: f32 = pcm.iter().map(|s| s * s).sum::<f32>() / pcm.len() as f32;
-            assert!(energy > 1e-4, "sine energy survives the roundtrip: {energy}");
+            assert!(
+                energy > 1e-4,
+                "sine energy survives the roundtrip: {energy}"
+            );
 
             // Cleanup.
             let mut frame = frame;

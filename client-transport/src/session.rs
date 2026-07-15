@@ -8,7 +8,7 @@
 use std::future::ready;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -40,6 +40,7 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use crate::capi::RxCore;
 use crate::flow::{FlowAction, FlowConfig, SignalingFlow, StreamParams};
 use crate::tls::{ServerTrust, client_config};
+use crate::watchdog::{StallWatchdog, WatchdogAction, WatchdogConfig};
 
 /// H.264 baseline bit for `FlowConfig::supported_codecs`
 /// (mirrors StreamSupportedVideoCodecs::H264).
@@ -68,11 +69,35 @@ pub enum SessionState {
     Stopped = 4,
 }
 
+/// M4 stall-watchdog readback shared with the shell: indicator state +
+/// terminal reconnect request (the shell tears the session down and
+/// rebuilds — mirrors the web wiring's reconnect rung).
+#[derive(Debug, Default)]
+pub struct WatchdogStatus {
+    stalled: AtomicBool,
+    reconnect: AtomicBool,
+}
+
+impl WatchdogStatus {
+    /// Stall indicator is up (UI readback).
+    pub fn stalled(&self) -> bool {
+        self.stalled.load(Ordering::Acquire)
+    }
+
+    /// The ladder exhausted into the terminal reconnect rung; the session
+    /// thread has ended (state `Failed`) and the shell should rebuild.
+    pub fn reconnect_requested(&self) -> bool {
+        self.reconnect.load(Ordering::Acquire)
+    }
+}
+
 pub struct Session {
     state: Arc<AtomicU8>,
     params: Arc<std::sync::Mutex<Option<StreamParams>>>,
     stop_tx: mpsc::Sender<()>,
     input_tx: mpsc::Sender<(u8, Vec<u8>)>,
+    watchdog: Arc<WatchdogStatus>,
+    watchdog_paused: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -86,9 +111,13 @@ impl Session {
         // Input backlog ~= a few frames of events; overflow drops (stale
         // input is worse than lost input).
         let (input_tx, input_rx) = mpsc::channel::<(u8, Vec<u8>)>(512);
+        let watchdog = Arc::new(WatchdogStatus::default());
+        let watchdog_paused = Arc::new(AtomicBool::new(false));
 
         let state2 = state.clone();
         let params2 = params.clone();
+        let watchdog2 = watchdog.clone();
+        let watchdog_paused2 = watchdog_paused.clone();
         let thread = std::thread::Builder::new()
             .name("ct-session".into())
             .spawn(move || {
@@ -111,6 +140,8 @@ impl Session {
                     params2,
                     stop_rx,
                     input_rx,
+                    watchdog2,
+                    watchdog_paused2,
                 ));
                 match result {
                     Ok(()) => state2.store(SessionState::Stopped as u8, Ordering::Release),
@@ -127,6 +158,8 @@ impl Session {
             params,
             stop_tx,
             input_tx,
+            watchdog,
+            watchdog_paused,
             thread: Some(thread),
         }
     }
@@ -137,6 +170,18 @@ impl Session {
         InputSender {
             tx: self.input_tx.clone(),
         }
+    }
+
+    /// M4 stall-watchdog readback (indicator + terminal reconnect flag).
+    pub fn watchdog(&self) -> &Arc<WatchdogStatus> {
+        &self.watchdog
+    }
+
+    /// Hold/resume watchdog escalation around minimized/hidden phases
+    /// (a hidden window legitimately stops mattering; it must not
+    /// escalate). Idempotent; picked up on the next session tick.
+    pub fn set_watchdog_paused(&self, paused: bool) {
+        self.watchdog_paused.store(paused, Ordering::Release);
     }
 
     pub fn state(&self) -> SessionState {
@@ -247,6 +292,7 @@ fn set_state(state: &AtomicU8, s: SessionState) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     config: SessionConfig,
     core: Arc<RxCore>,
@@ -254,6 +300,8 @@ async fn run_session(
     params_out: Arc<std::sync::Mutex<Option<StreamParams>>>,
     mut stop_rx: mpsc::Receiver<()>,
     mut input_rx: mpsc::Receiver<(u8, Vec<u8>)>,
+    watchdog_status: Arc<WatchdogStatus>,
+    watchdog_paused: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
     let now_ms = move || started.elapsed().as_millis().min(u64::MAX as u128) as u64;
@@ -338,6 +386,16 @@ async fn run_session(
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // M4 stall watchdog (Rust mirror of the web ladder, watchdog.rs):
+    // armed at ConnectionComplete, fed from the delivered-frame counter on
+    // this 50 ms tick. RequestIdr/RestartIce go over the signaling socket
+    // (alive even when the media path is dead); Reconnect is terminal —
+    // it flags WatchdogStatus and ends the session as Failed so the shell
+    // rebuilds.
+    let mut dog = StallWatchdog::new(WatchdogConfig::default());
+    let mut dog_frames: u64 = 0;
+    let mut dog_paused = false;
+
     loop {
         tokio::select! {
             _ = stop_rx.recv() => {
@@ -353,6 +411,46 @@ async fn run_session(
                     if core.poll_needs_idr() {
                         let _ = ch.send(&bytes::Bytes::from_static(&[0x00])).await;
                     }
+                }
+
+                // Watchdog drive: pause edge → frame signal → one rung.
+                let paused = watchdog_paused.load(Ordering::Acquire);
+                if paused != dog_paused {
+                    dog_paused = paused;
+                    if paused {
+                        dog.pause();
+                    } else {
+                        dog.resume(now_ms());
+                    }
+                }
+                let frames = core.frames_delivered();
+                if frames != dog_frames {
+                    dog_frames = frames;
+                    if let Some(WatchdogAction::Recovered { stalled_ms }) =
+                        dog.frame_received(now_ms())
+                    {
+                        watchdog_status.stalled.store(false, Ordering::Release);
+                        info!(stalled_ms, "stall watchdog: recovered");
+                    }
+                }
+                match dog.tick(now_ms()) {
+                    Some(WatchdogAction::Stall) => {
+                        watchdog_status.stalled.store(true, Ordering::Release);
+                        warn!("stall watchdog: no frames delivered — indicator up");
+                    }
+                    Some(WatchdogAction::RequestIdr { attempt }) => {
+                        info!(attempt, "stall watchdog: requesting IDR via signaling");
+                        send_ws(&ws_tx, &StreamClientMessage::RequestIdr).await?;
+                    }
+                    Some(WatchdogAction::RestartIce) => {
+                        info!("stall watchdog: requesting ICE restart");
+                        send_ws(&ws_tx, &StreamClientMessage::RestartIce).await?;
+                    }
+                    Some(WatchdogAction::Reconnect) => {
+                        watchdog_status.reconnect.store(true, Ordering::Release);
+                        bail!("stall watchdog: ladder exhausted — reconnect");
+                    }
+                    Some(WatchdogAction::Recovered { .. }) | None => {}
                 }
             }
             pkt = input_rx.recv() => {
@@ -465,6 +563,10 @@ async fn run_session(
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                                 Some(params);
                             set_state(&state, SessionState::Streaming);
+                            // Arm the watchdog: media is expected from here
+                            // on; a stream that never delivers escalates.
+                            dog.start(now_ms());
+                            dog_frames = core.frames_delivered();
                         }
                         FlowAction::Terminated { error_code } => {
                             info!(error_code, "ConnectionTerminated");

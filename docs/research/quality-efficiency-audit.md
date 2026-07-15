@@ -191,3 +191,39 @@ nvenc-slice-probe가 "슬라이스 지연 세금 없음"을 숫자로 증명했�
 라이브 측정) ② 네이티브 A/V 경로 Phase B(오디오 exclusive + 제로카피
 present) ③ Gate C 실측 판정**이다. 신규 대형 개발은 클라 슈퍼레졸루션 하나.
 나머지는 켜기·측정·Phase B 배선 — capability는 이미 대부분 손에 있다.
+
+---
+
+## I. 수신·디코드·렌더 경로 검증 (2026-07-16 — "끝까지" 4차/최종)
+
+버그 사냥이 아니라 **음성적 검증**(clean인지 확인). 결과: **비디오 경로는
+양 클라 모두 이미 저지연으로 정확히 설정**돼 있다.
+
+**네이티브 (video.rs / frame_queue.rs):**
+- `AV_CODEC_FLAG_LOW_DELAY` **설정** ✓ (디코더 reorder 버퍼 없음)
+- `thread_count = 1` ✓ (프레임 스레딩 N프레임 지연 회피)
+- FrameQueue cap 16이나 **overflow 시 flush+IDR**(백로그 드레인 안 함) =
+  steady-state ~0 지연 ✓
+- 완성 프레임 즉시 전달(video_rx pending은 재조립용, 인위적 대기 없음) ✓
+
+**웹 (transport/webrtc.ts):**
+- `receiver.jitterBufferTarget = 0` + `playoutDelayHint = 0` **설정** ✓
+- 기본 파이프라인 = **FEC 데이터 경로**(DepacketizeVideoPipe→VideoDecoderPipe)
+  → 브라우저 RTP 지터버퍼 **우회** ✓
+- `canvasVsync:false`(기본) = rAF 배칭 없이 submit 시 즉시 draw ✓
+
+**유일한 잔여 지연 홀 = 오디오 (양 클라 공통 약점):**
+- 네이티브: WASAPI shared 200ms 버퍼 + 250ms FIFO (§G #1) → 수백 ms
+- 웹: opus RTP 트랙 → 브라우저 **NetEQ**(jitterBufferTarget=0 설정했으나 지터에
+  적응 성장, 필드 리포트) → 수십 ms
+- **비디오는 단일 ms대인데 오디오만 뒤처진다** → 오디오가 "fastest"의 단일
+  최우선 잔여 과제. 네이티브 exclusive event-driven이 결정타.
+
+**최종 결론 (4회 심층 감사 종합):** "기술적 최강"의 골격 — 지연 코어(CC/FEC),
+수신·디코드·렌더 저지연 배선(검증됨), 색 정확도(수리됨) — 는 **이미 서 있다.**
+남은 것은 정확히 셋으로 수렴한다:
+1. **호스트 인코드 활성** (무료 점심 + HEVC/AV1 + 4:4:4/10-bit) — 켜기+측정, capability 보유
+2. **네이티브 A/V Phase B** (오디오 exclusive ~10ms + 제로카피 present)
+3. **Gate C 외부 실측** — 왕좌 판정
+신규 대형 개발은 클라 슈퍼레졸루션 하나뿐. **더 팔 숨은 버그는 없다** —
+이제부턴 활성·측정·Phase B 배선의 실행 단계다.

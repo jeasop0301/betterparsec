@@ -72,6 +72,8 @@ use crate::{
 };
 
 mod audio;
+mod cursor_tracker;
+pub(crate) mod cursor_wire;
 mod fec_sender;
 // Wire/framing moved to the shared transport-core crate (M6 W1); re-exported
 // here so `crate::transport::webrtc::fec_wire::*` call sites stay unchanged.
@@ -204,6 +206,18 @@ pub async fn new(
             }),
         )
         .await?;
+    // Cursor visibility channel: reliable, ordered — host-authority POS
+    // messages for the client's auto mouse-mode (cursor-channel.md §3 P1).
+    let cursor_channel = peer
+        .create_data_channel(
+            "cursor",
+            Some(RTCDataChannelInit {
+                ordered: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    cursor_tracker::spawn(cursor_channel);
 
     let runtime = Handle::current();
     let video_metrics = Arc::new(VideoTransportMetrics::new(video_frame_queue_size));

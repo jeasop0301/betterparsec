@@ -364,9 +364,16 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   (구버전 서버는 deserialize 실패로 릴레이 종료 — 배포 세트 일치 확인,
   2026-07-15 로컬 세트 재빌드·재기동 완료). 잔여 = 라이브 스톨 주입
   스모크(clumsy full-block, 웹+네이티브) + Gate B/C 임계 튜닝.
-- [ ] **커서 P1** — `cursor` DataChannel + 호스트 권위 자동 lock/unlock
-  (cursor-channel.md §3 P1, 설계 완료) → [ ] **P2** 모양 채널
-  zero-latency 커서
+- [~] **커서 P1** — `cursor` DataChannel + 호스트 권위 자동 lock/unlock
+  (cursor-channel.md §3 P1). **호스트 절반 완성** (2026-07-15, 헤드리스
+  검증): `cursor` reliable·ordered 채널 + 60Hz Win32 트래커
+  (`GetCursorInfo` 폴링, CURSOR_SUPPRESSED=hidden, 변화 시만 송신,
+  ptScreenPos+GetSystemMetrics 단일 좌표공간 — 정규화 사상엔 일관성만
+  필요) + POS 와이어(14B LE) 양측 바이트-핀(`cursor_wire.rs` ↔
+  `web/stream/cursor_wire.ts`, streamer 182 + 웹 5 tests). 잔여 =
+  클라 auto 모드(순수 상태머신: visible→unlock+follow+cursor:none /
+  hidden→pointer lock, 히스테리시스 150ms) + 배선 → [ ] **P2** 모양
+  채널 zero-latency 커서
 - [ ] **immersive 모드** — 전체화면 + pointer lock + Keyboard Lock 일괄
   토글 (cursor P1 클라 상태머신에 배선)
 - [ ] 보안 감사(ARCHITECTURE §보안 6항: 서명·짧은토큰·상수시간·replay·안전인코딩·revocation)

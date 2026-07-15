@@ -193,8 +193,13 @@ U5/M6 스파이크, f1-ack 소스 확인+0x5509 호스트 패치.
    child의 WM_SETCURSOR 숨김과 경합 → 포인터가 스트림 child 위면 egui에
    `CursorIcon::None` 보고(`StreamSurface::cursor_over`)로 부모 권위도
    차단. + `surface_failed` 래치를 접속 단위로 리셋(Connect·워치독
-   재접속), 래치 시 warn 로그. 잔여 라이브 = ①로컬(비-Parsec) 오디오
-   청취 + 호버 단일커서 확인, ②host 롤 — 임베디드 서버로 paired 접속
+   재접속), 래치 시 warn 로그. **라이브 ③차 (2026-07-15, owner)**:
+   ⑴⑵ 검증 통과 — **오디오 청취 PASS**(500ms 에코 확인; "무한증식"
+   관찰 = same-PC 루프백 피드백: 스트림 사본 재생→Sunshine 재캡처→
+   재인코드 캐스케이드, 딜레이가 가시화한 예상 물리·딜레이 off면 소멸)
+   + **재접속 반복 정상 = 화이트스크린 픽스 확정**. 잔여 라이브 =
+   ①호버 단일커서 확인(cursor_over 픽스 미판정), ②host 롤 — 임베디드
+   서버로 paired 접속
    (`BP_SUNSHINE_STAGE` 관리형 Sunshine은 이 머신에 Foundation
    스테이지 부재 확인(2026-07-15) — MSYS2 UCRT64 재빌드 세션에서) →
    다음 헤드리스 대형 항목: M4 `session-ux`(스톨 워치독 웹 배선 완료

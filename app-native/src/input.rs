@@ -69,6 +69,18 @@ fn setcursor_hides(lparam: isize) -> bool {
     (lparam as usize & 0xFFFF) as u32 == HTCLIENT
 }
 
+/// Rate-limited cursor diagnostics (field issue #2 follow-up): the first
+/// few WM_SETCURSOR hits log immediately (proves the handler runs at
+/// all), then every 256th (proves it keeps running without flooding).
+fn cursor_debug_log(what: &str) {
+    use std::sync::atomic::AtomicU32;
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 4 || n % 256 == 0 {
+        tracing::debug!(n, "[cursor] {what}");
+    }
+}
+
 /// Pure Win32-message → wire-packet translation (unit-tested headless).
 /// `None` = not an input message / not translatable yet (no stream dims).
 fn translate(
@@ -178,10 +190,21 @@ pub fn handle(
     // Single-cursor: the host cursor lives in the video (module doc).
     if msg == WM_SETCURSOR {
         if !setcursor_hides(lparam.0) {
+            cursor_debug_log("WM_SETCURSOR non-client — keeping system cursor");
             return None; // DefWindowProc → normal system cursor
         }
         unsafe { SetCursor(None) };
+        cursor_debug_log("WM_SETCURSOR client — SetCursor(NULL)");
         return Some(LRESULT(1)); // TRUE: cursor handled, no arrow reset
+    }
+    // Reinforcement (field report 2026-07-15: arrow still follows on
+    // hover): re-assert the hidden cursor on every mouse move so anything
+    // that reset the thread cursor between moves (parent chrome, other
+    // in-process code) is overridden at the next movement — exactly the
+    // moments a "following" arrow is visible. WM_MOUSEMOVE still falls
+    // through to translate() below.
+    if msg == WM_MOUSEMOVE {
+        unsafe { SetCursor(None) };
     }
 
     // Focus and drag-capture side effects first.

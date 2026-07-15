@@ -103,6 +103,12 @@ impl FrameQueue {
         std::mem::take(&mut self.lock().overflowed)
     }
 
+    /// Non-blocking pop of the front frame, if one is queued. Never blocks;
+    /// used to drain stale backlog so only the newest picture is presented.
+    pub fn try_pop(&self) -> Option<DecodeUnit> {
+        self.lock().frames.pop_front()
+    }
+
     pub fn len(&self) -> usize {
         self.lock().frames.len()
     }

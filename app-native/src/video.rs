@@ -224,6 +224,41 @@ impl Decoder {
         }
     }
 
+    /// Decode one access unit but discard the output picture. Advances the
+    /// decoder state — keeping the P-frame reference chain intact — without
+    /// the expensive HW download + swscale that [`Decoder::decode`] does.
+    /// Used to skip stale frames when the present side has fallen behind so
+    /// only the newest picture is ever converted and shown (bounds
+    /// presentation latency under load).
+    pub fn decode_drop(&mut self, data: &[u8]) -> Result<(), DecodeError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            let rc = ff::av_new_packet(self.pkt, data.len() as i32);
+            if rc < 0 {
+                return Err(DecodeError(format!("av_new_packet: {}", err_str(rc))));
+            }
+            ptr::copy_nonoverlapping(data.as_ptr(), (*self.pkt).data, data.len());
+            let rc = ff::avcodec_send_packet(self.ctx, self.pkt);
+            ff::av_packet_unref(self.pkt);
+            if rc < 0 && rc != ff::AVERROR(libc::EAGAIN) {
+                return Err(DecodeError(format!("send_packet: {}", err_str(rc))));
+            }
+            loop {
+                let rc = ff::avcodec_receive_frame(self.ctx, self.frame);
+                if rc == ff::AVERROR(libc::EAGAIN) || rc == ff::AVERROR_EOF {
+                    break;
+                }
+                if rc < 0 {
+                    return Err(DecodeError(format!("receive_frame: {}", err_str(rc))));
+                }
+                ff::av_frame_unref(self.frame);
+            }
+            Ok(())
+        }
+    }
+
     /// Download (when on a D3D11 surface) and convert the current
     /// `self.frame` to RGBA.
     unsafe fn frame_to_rgba(&mut self) -> Result<RgbaFrame, DecodeError> {

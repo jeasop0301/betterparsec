@@ -523,7 +523,29 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                         } else {
                             KeyAction::Down
                         },
-                        modifiers: current_modifiers(),
+                        modifiers: {
+                            // Build modifiers from the reliable hook signals:
+                            // GetKeyState (used by current_modifiers) can miss
+                            // keys in a low-level hook's thread, dropping the
+                            // Alt off a forwarded Alt+Tab so the host never sees
+                            // the combo (field report: Alt+Tab does nothing).
+                            let mut m = KeyModifiers::empty();
+                            if shift_down {
+                                m |= KeyModifiers::SHIFT;
+                            }
+                            if ctrl_down {
+                                m |= KeyModifiers::CTRL;
+                            }
+                            if kb.flags.contains(LLKHF_ALTDOWN) {
+                                m |= KeyModifiers::ALT;
+                            }
+                            if unsafe { GetAsyncKeyState(VK_LWIN.0 as i32) } < 0
+                                || unsafe { GetAsyncKeyState(VK_RWIN.0 as i32) } < 0
+                            {
+                                m |= KeyModifiers::META;
+                            }
+                            m
+                        },
                         key: vk as u16,
                         flags: KeyFlags::empty(),
                     });

@@ -50,7 +50,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
-            .with_title("BetterParsec — build 07-16a"),
+            .with_title("BetterParsec — build 07-16b (low-latency)"),
         ..Default::default()
     };
     eframe::run_native(
@@ -198,6 +198,26 @@ impl DecodeState {
             }
         }
     }
+
+    /// Advance the decoder over a stale unit without presenting it (skip
+    /// backlog): same IDR gating as [`Self::on_unit`], but the picture is
+    /// decoded and dropped instead of converted + published.
+    fn drop_unit(&mut self, core: &RxCore, shared: &VideoShared, unit: &DecodeUnit) {
+        let Some(dec) = self.decoder.as_mut() else {
+            return;
+        };
+        if self.wait_for_key && !unit.is_key {
+            core.request_idr();
+            return;
+        }
+        self.wait_for_key = false;
+        if let Err(e) = dec.decode_drop(&unit.data) {
+            shared.decode_errors.fetch_add(1, Ordering::Relaxed);
+            self.wait_for_key = true;
+            core.request_idr();
+            tracing::warn!(err = %e, frame_id = unit.frame_id, "decode(drop) failed — requesting IDR");
+        }
+    }
 }
 
 struct Running {
@@ -269,20 +289,51 @@ impl Running {
                         match core.wait_frame(Duration::from_millis(250)) {
                             Some(unit) => {
                                 let now = Instant::now();
-                                stats.frames.fetch_add(1, Ordering::Relaxed);
-                                if unit.is_key {
-                                    stats.key_frames.fetch_add(1, Ordering::Relaxed);
-                                }
-                                stats
-                                    .payload_bytes
-                                    .fetch_add(unit.data.len() as u64, Ordering::Relaxed);
-                                stats.last_frame_ms.store(
-                                    now.duration_since(started).as_millis() as u64,
-                                    Ordering::Relaxed,
-                                );
-                                fps.push(now);
                                 #[cfg(feature = "video")]
-                                decode.on_unit(&core, &video, &egui_ctx, &unit);
+                                {
+                                    let account = |u: &DecodeUnit| {
+                                        stats.frames.fetch_add(1, Ordering::Relaxed);
+                                        if u.is_key {
+                                            stats.key_frames.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        stats
+                                            .payload_bytes
+                                            .fetch_add(u.data.len() as u64, Ordering::Relaxed);
+                                    };
+                                    account(&unit);
+                                    // Skip stale backlog: decode older queued
+                                    // units to keep the reference chain current
+                                    // but only convert + present the newest, so
+                                    // presentation latency never accumulates when
+                                    // download/convert briefly falls behind 60 fps.
+                                    let mut newest = unit;
+                                    while let Some(next) = core.try_frame() {
+                                        account(&next);
+                                        decode.drop_unit(&core, &video, &newest);
+                                        newest = next;
+                                    }
+                                    stats.last_frame_ms.store(
+                                        now.duration_since(started).as_millis() as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                    fps.push(now);
+                                    decode.on_unit(&core, &video, &egui_ctx, &newest);
+                                }
+                                #[cfg(not(feature = "video"))]
+                                {
+                                    stats.frames.fetch_add(1, Ordering::Relaxed);
+                                    if unit.is_key {
+                                        stats.key_frames.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    stats
+                                        .payload_bytes
+                                        .fetch_add(unit.data.len() as u64, Ordering::Relaxed);
+                                    stats.last_frame_ms.store(
+                                        now.duration_since(started).as_millis() as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                    fps.push(now);
+                                }
                             }
                             None => {
                                 if stats.stopped.load(Ordering::Acquire) {

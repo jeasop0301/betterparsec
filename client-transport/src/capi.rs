@@ -103,6 +103,12 @@ impl RxCore {
         self.queue.wait_pop(timeout)
     }
 
+    /// Non-blocking pop of the next reassembled frame, if one is already
+    /// queued (drains stale backlog; the newest is what gets presented).
+    pub fn try_frame(&self) -> Option<DecodeUnit> {
+        self.queue.try_pop()
+    }
+
     /// Push one opus packet from the audio RTP track (transport thread).
     pub fn push_audio(&self, pkt: Vec<u8>) {
         self.audio.push(pkt);

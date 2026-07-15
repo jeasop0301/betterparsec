@@ -329,8 +329,11 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   webrtc `send_offer(ice_restart=true)` 재-offer, 클라 answer 경로 기존) +
   reconnect = 기존 fresh-ws 재접속 경로 재사용(`restartSessionWithFreshWs`
   추출). 검증: tsc + 웹 70 tests, streamer 180 + common 81(신규 wire-pin
-  1), clippy·fmt 클린. 잔여 = Rust 미러(네이티브 세션) + 라이브 스톨 주입
-  스모크(clumsy full-block) + Gate B/C 임계 튜닝.
+  1), clippy·fmt 클린. **Rust 미러 완성** (2026-07-15,
+  `client-transport/src/watchdog.rs` — TS와 락스텝: 동일 사다리·기본값·
+  틱당 1단, TS 스위트 포팅 15 tests, API만 `Option<WatchdogAction>`).
+  잔여 = 네이티브 세션 배선(app-native 프레임 신호·시그널링 ws 액션) +
+  라이브 스톨 주입 스모크(clumsy full-block) + Gate B/C 임계 튜닝.
 - [ ] **커서 P1** — `cursor` DataChannel + 호스트 권위 자동 lock/unlock
   (cursor-channel.md §3 P1, 설계 완료) → [ ] **P2** 모양 채널
   zero-latency 커서

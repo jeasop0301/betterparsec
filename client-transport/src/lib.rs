@@ -17,3 +17,4 @@ pub mod flow;
 pub mod frame_queue;
 pub mod session;
 pub mod tls;
+pub mod watchdog;

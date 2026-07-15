@@ -62,7 +62,11 @@ Tetrys FEC · 서브프레임 슬라이스 · QU · 네이티브 클라이언트
    재시도 시 리프레시 없이 30초 대기 + F12 콘솔 캡처 필요). **비관
    교정**: "TCP-릴레이 실패 시 전송 재설계" 톤은 과했다 — DCV는
    WebSocket/TCP를 프로덕션 경로로 출하 중. 폴백 안정화가 남은 일이지
-   전송 재설계 사유 아님.
+   전송 재설계 사유 아님. **라이브 재확인(2026-07-15 저녁, 인천 WAN)**:
+   TCP 폴백 "느리지만 됨" — 실사용성 성립. 같은 세션 계측 관찰:
+   host processing latency 보통 ≤3ms(우수), streamer→browser RTT는
+   출렁이며 피크 60ms대(인천↔호스트 WAN — bufferbloat/무선 구간 의심,
+   Gate B 상관 계측 대상. CC가 이 출렁임을 먹고 사는 신호다).
 
 ### 경쟁사 갭 감사 (2026-07-15 — "불가/저기대/스터글" 항목 vs Parsec·DCV·GFN 실물)
 
@@ -70,7 +74,7 @@ Tetrys FEC · 서브프레임 슬라이스 · QU · 네이티브 클라이언트
 |---|---|---|
 | TCP 전송 실사용성 (M1 "실패 시 재설계") | DCV: WebSocket/TCP 프로덕션 | 비관 교정(위 #3), 폴백 버그만 수리 |
 | 커서 모양 채널 (P2 "나중") | Parsec 출하 (zero-latency 클라 렌더) | P1 라이브 판정 후 즉시 착수. 선행 결정 1건: `display_cursor` 끄기 방식(P2a 키 주입 vs P2b 포크 config) — 클라 렌더 + 구움 커서 중복 방지 |
-| 클립보드 동기화 (research 05 메모 후 방치) | Parsec·DCV 출하, GFN paste 지원 | **v1 완료** (2026-07-15, 텍스트 전용): `CLIPBOARD=28` 채널, 호스트 500ms 시퀀스 폴링 워처(CF_UNICODETEXT, spawn_blocking, 256 KiB 캡), 양방향 루프가드(`should_publish`, 12 tests), WebRTC 전용 채널 + WebSocket 프리픽스 프레임 둘 다 배선, 웹 focus-poll(readText/writeText, 권한 거부 시 세션 내 outbound 비활성) — common 81 + streamer 196 tests, 웹 clipboard_wire 16 tests, clippy/tsc 클린 |
+| 클립보드 동기화 (research 05 메모 후 방치) | Parsec·DCV 출하, GFN paste 지원 | **v1 완료 + 라이브 PASS** (2026-07-15, 텍스트 전용; owner 인천 WAN 검증 "성공"): `CLIPBOARD=28` 채널, 호스트 500ms 시퀀스 폴링 워처(CF_UNICODETEXT, spawn_blocking, 256 KiB 캡), 양방향 루프가드(`should_publish`, 12 tests), WebRTC 전용 채널 + WebSocket 프리픽스 프레임 둘 다 배선, 웹 focus-poll(readText/writeText, 권한 거부 시 세션 내 outbound 비활성) — common 81 + streamer 196 tests, 웹 clipboard_wire 16 tests, clippy/tsc 클린 |
 | 게임패드 럼블 | Parsec 출하 | **갭 아님** — 이미 풀배선 확인(capability 광고 → 호스트 이벤트 → vibrationActuator, input.ts) |
 | 마이크 패스스루 | DCV 출하 | 백로그 등재 — vendor에 Foundation mic 훅 잔존(`send_microphone_opus_data` 미사용 경고들), 중형 |
 | 펜/스타일러스 | DCV 출하 | 백로그 — Moonlight 펜 이벤트 존재, 웹 PointerEvent 매핑 미구현, 중형 |
@@ -422,16 +426,22 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   `transport/cursor_tracker.rs`, ws 프레임 바이트-핀 +1 test). 클라는
   `getChannel(CURSOR)` 단일 경로로 양 전송 소비 → **UDP 차단(TCP 폴백)
   망에서도 auto 커서 동작**. 검증: common 81 + streamer 183 + 웹 143,
-  clippy·fmt·tsc 클린, streamer.exe·static/ 재배포. 잔여 = 라이브: auto
-  모드 FPS lock/메뉴 unlock (UDP망 + TCP망 각 1회) → [ ] **P2** 모양
-  채널 zero-latency 커서
+  clippy·fmt·tsc 클린, streamer.exe·static/ 재배포. **라이브 판정 PASS**
+  (2026-07-15 저녁, owner — 인천 원격 WAN + 물리 모니터): auto 커서
+  정상 동작, FPS 360° lock 회전 확인. 현장 이슈 1건: **ESC가 pointer
+  lock을 강제 해제**(브라우저 보안 스펙 — immersive의 Keyboard Lock만
+  예외)해서 게임 중 거슬림 → 완화 배선: 클릭뿐 아니라 **아무 키
+  입력에서도 lock 재획득**(keydown = transient activation, ESC 자체는
+  제외 — WASD 누르는 순간 즉시 복귀). 게이밍 정답 경로는 immersive.
+  → [ ] **P2** 모양 채널 zero-latency 커서 (display_cursor 결정 선행)
 - [~] **immersive 모드** — 전체화면 + pointer lock + Keyboard Lock 일괄
   토글. **웹 완성** (2026-07-15, 헤드리스 검증): 사이드바 Immersive
   버튼 — 진입 = fullscreen 확인 후 keyboard.lock(가드) +
   `wantsPointerLock`(relative 또는 auto+wantsLock, DOM-free 헬퍼 +3
   tests) 시 pointer lock; 이탈 = 버튼/fullscreen 상실/lock 상실 3경로가
-  동일 teardown으로 수렴(키보드 unlock 누수 없음). 잔여 = 라이브 확인 +
-  네이티브 셸 immersive(RawInput, Phase B)
+  동일 teardown으로 수렴(키보드 unlock 누수 없음). **라이브 판정 PASS**
+  (2026-07-15, owner: "굉장히 잘 작동"). 잔여 = 네이티브 셸
+  immersive(RawInput, Phase B)
 - [ ] 보안 감사(ARCHITECTURE §보안 6항: 서명·짧은토큰·상수시간·replay·안전인코딩·revocation)
 - [ ] 입력(Gamepad/Keyboard Lock) secure-context 동작, 오디오, 재접속 안정성
 - [ ] upstream 병합 전략 정리

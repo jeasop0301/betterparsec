@@ -418,6 +418,23 @@ class ViewerApp implements Component {
     onKeyDown(event: KeyboardEvent) {
         this.onUserInteraction()
 
+        // Pointer-lock re-arm on ANY key, not just clicks (field report
+        // 2026-07-15: Escape force-exits pointer lock — a browser security
+        // rule only immersive's Keyboard Lock can override — and needing a
+        // click to resume aim is jarring mid-game). Keydown carries the
+        // transient user activation pointer lock needs, so pressing WASD
+        // right after an Escape re-locks instantly. Escape itself is
+        // excluded: re-locking on the very key that just exited would trap
+        // the user (and the browser refuses it anyway right after an
+        // ESC-exit).
+        if (event.code !== "Escape"
+            && wantsPointerLock(this.inputConfig.mouseMode, this.autoModeWantsLock)
+            && !document.pointerLockElement) {
+            this.requestPointerLock().catch((error) => {
+                console.warn("Pointer lock key re-arm failed", error)
+            })
+        }
+
         console.debug(event)
         if (event.shiftKey && event.ctrlKey && event.code == "KeyV") {
             // We are likely pasting -> don't send keys

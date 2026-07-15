@@ -237,8 +237,13 @@ U5/M6 스파이크, f1-ack 소스 확인+0x5509 호스트 패치.
    (`betterparsec::input=debug`) — 물리 모니터 세션(인천, 네이티브 배포
    또는 웹 개선 후)에서 5초 판정. 잔여 라이브 = ①호버 단일커서(물리
    모니터), ②host 롤 — 임베디드 서버로 paired 접속
-   (`BP_SUNSHINE_STAGE` 관리형 Sunshine은 이 머신에 Foundation
-   스테이지 부재 확인(2026-07-15) — MSYS2 UCRT64 재빌드 세션에서) →
+   (`BP_SUNSHINE_STAGE` 관리형 Sunshine — **스테이지 재구축 완료**
+   2026-07-15 밤: 21:19 중단 빌드(세션 사망 동반) ninja 재개,
+   `-DDRIVER_DEPS_REQUIRED=OFF`(설치러 페이로드, 스테이지 계약 무관),
+   정적 링크 확인(ldd 전부 시스템 DLL), exe+assets 스테이지 =
+   `C:\Users\kje12\Projects\foundation-sunshine\stage`, `--version` 부팅
+   스모크 `2026.0715.221257.c12c2a91.杂鱼`, SHA-256
+   `a3318c2d…86223a4` — 남은 건 라이브 접속뿐) →
    다음 헤드리스 대형 항목: M4 `session-ux`(스톨 워치독 웹 배선 완료
    2026-07-15 — 잔여: 커서 P1, immersive) · U3는 와이어 계약 핀 완료
    (slice-qu-constraints.md §6) — depacketizer 패치는 포크(슬라이스 정렬
@@ -452,9 +457,14 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   라운드트립 test) + 웹 클라 렌더(shape 캐시 32개, chunked base64,
   ≤128px CSS `cursor:url() hotspot` — inline style이 cursor:none 클래스
   위에 자연 우선) — **`clientCursor` 설정 기본 off**: display_cursor가
-  영상에 커서를 굽는 동안 이중 방지. 활성화 = 포크 config(P2b, MSYS2
-  세션)로 구움 끄기 후 기본 on 전환 + 라이브 판정. streamer 200 + 웹
-  160 + client-transport 47 tests.
+  영상에 커서를 굽는 동안 이중 방지. **P2a/P2b 선행 결정 해소**
+  (2026-07-15 밤, 포크 소스 확인): Foundation upstream에 이미
+  `capture_cursor` config(+런타임 토글 Ctrl+Alt+Shift+N, config.cpp:1341
+  — `display_cursor` 전역 직결)가 존재 — **포크 패치 불필요**. 활성화 =
+  호스트 conf `capture_cursor=false` + `clientCursor` 기본 on + 라이브
+  판정. 단 네이티브 클라는 아직 구움 커서 의존(자체 shape 렌더 부재)
+  → 기본 전환은 네이티브 shape 렌더 후, 그 전엔 웹 세션 한정 실험.
+  streamer 200 + 웹 160 + client-transport 47 tests.
 - [~] **immersive 모드** — 전체화면 + pointer lock + Keyboard Lock 일괄
   토글. **웹 완성** (2026-07-15, 헤드리스 검증): 사이드바 Immersive
   버튼 — 진입 = fullscreen 확인 후 keyboard.lock(가드) +

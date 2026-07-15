@@ -18,11 +18,18 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
+use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
+};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Device,
-    ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BUFFER_DESC,
+    D3D11_COMPARISON_NEVER, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_MAP_WRITE_DISCARD, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT, D3D11CreateDevice, ID3D11Buffer,
+    ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader, ID3D11RenderTargetView,
+    ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
@@ -40,7 +47,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WINDOW_EX_STYLE, WM_ERASEBKGND, WM_NCHITTEST, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
     WS_CLIPSIBLINGS, WS_VISIBLE,
 };
-use windows::core::{Interface, PCWSTR, w};
+use windows::core::{Interface, PCSTR, PCWSTR, s, w};
 
 use crate::VideoShared;
 use crate::video::RgbaFrame;
@@ -128,6 +135,99 @@ fn create_stream_child(parent: HWND) -> Result<HWND, PresentError> {
 
 // ── Renderer (render-thread owned) ─────────────────────────────────────────
 
+/// Inline HLSL for the opt-in client-side sharpen pass: a full-screen
+/// triangle (no vertex/index buffers, driven by `SV_VertexID`) followed
+/// by a light CAS-style/unsharp kernel — center + 4 axial neighbors,
+/// pushed away from their average by `strength`. Single pass, no
+/// external dependencies; compiled at runtime via `D3DCompile`.
+const SHARPEN_HLSL: &str = r#"
+cbuffer SharpenCB : register(b0) {
+    float2 invResolution;
+    float strength;
+    float _pad;
+};
+
+Texture2D srcTex : register(t0);
+SamplerState samp : register(s0);
+
+struct VSOut {
+    float4 pos : SV_POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+VSOut VSMain(uint id : SV_VertexID) {
+    VSOut o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.uv = uv;
+    o.pos = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+    return o;
+}
+
+float4 PSMain(VSOut i) : SV_TARGET {
+    float4 center = srcTex.Sample(samp, i.uv);
+    float4 up = srcTex.Sample(samp, i.uv - float2(0.0, invResolution.y));
+    float4 down = srcTex.Sample(samp, i.uv + float2(0.0, invResolution.y));
+    float4 left = srcTex.Sample(samp, i.uv - float2(invResolution.x, 0.0));
+    float4 right = srcTex.Sample(samp, i.uv + float2(invResolution.x, 0.0));
+    float4 sharp = center + strength * (center * 4.0 - up - down - left - right) * 0.25;
+    return saturate(sharp);
+}
+"#;
+
+/// Matches the `SharpenCB` HLSL cbuffer layout (16-byte aligned).
+#[repr(C)]
+struct SharpenCbData {
+    inv_resolution: [f32; 2],
+    strength: f32,
+    _pad: f32,
+}
+
+/// `BP_SHARPEN`: integer percent 0..100 → strength 0.0..1.0. Absent or
+/// unparsable → 0.0 (off, keeps the default bit-exact copy path).
+fn sharpen_from_env() -> f32 {
+    std::env::var("BP_SHARPEN")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .map(|v| v.clamp(0, 100) as f32 / 100.0)
+        .unwrap_or(0.0)
+}
+
+/// Compile an HLSL source string via `D3DCompile`, returning shader
+/// bytecode ready for `CreateVertexShader`/`CreatePixelShader`.
+fn compile_hlsl(src: &str, entry: PCSTR, target: PCSTR) -> Result<Vec<u8>, PresentError> {
+    unsafe {
+        let mut blob: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        let result = D3DCompile(
+            src.as_ptr().cast(),
+            src.len(),
+            None,
+            None,
+            None,
+            entry,
+            target,
+            0,
+            0,
+            &mut blob,
+            Some(&mut errors),
+        );
+        if let Err(e) = result {
+            let detail = errors
+                .map(|b| {
+                    let ptr = b.GetBufferPointer().cast::<u8>();
+                    let len = b.GetBufferSize();
+                    String::from_utf8_lossy(std::slice::from_raw_parts(ptr, len)).into_owned()
+                })
+                .unwrap_or_default();
+            return Err(PresentError(format!("D3DCompile: {e}: {detail}")));
+        }
+        let blob = blob.ok_or_else(|| PresentError("D3DCompile produced no blob".into()))?;
+        let ptr = blob.GetBufferPointer().cast::<u8>();
+        let len = blob.GetBufferSize();
+        Ok(std::slice::from_raw_parts(ptr, len).to_vec())
+    }
+}
+
 /// D3D11 device + FLIP_DISCARD swapchain bound to the stream child HWND.
 /// Split from the thread loop so tests can drive draw/present/readback
 /// synchronously.
@@ -139,6 +239,21 @@ struct Renderer {
     /// DEFAULT-usage upload target for the decoded RGBA rows, matching
     /// the swapchain buffer dimensions.
     upload: Option<ID3D11Texture2D>,
+    /// Shader resource view onto [`Self::upload`]; recreated whenever the
+    /// upload texture is (re)created (resolution change), never reused
+    /// across textures.
+    upload_srv: Option<ID3D11ShaderResourceView>,
+    /// Opt-in client-side sharpen strength in `[0.0, 1.0]`; `0.0` (the
+    /// default) keeps the exact bit-copy present path. Set from
+    /// `BP_SHARPEN` (integer percent, 0..100) or forced by tests.
+    sharpen: f32,
+    /// Full-screen-triangle sharpen pass resources, compiled and created
+    /// lazily on first use (device-level, independent of resolution).
+    sharpen_vs: Option<ID3D11VertexShader>,
+    sharpen_ps: Option<ID3D11PixelShader>,
+    sharpen_sampler: Option<ID3D11SamplerState>,
+    /// `SharpenCB` constant buffer (inverse resolution + strength).
+    sharpen_cbuf: Option<ID3D11Buffer>,
     width: u32,
     height: u32,
 }
@@ -205,6 +320,12 @@ impl Renderer {
                 swapchain,
                 waitable,
                 upload: None,
+                upload_srv: None,
+                sharpen: sharpen_from_env(),
+                sharpen_vs: None,
+                sharpen_ps: None,
+                sharpen_sampler: None,
+                sharpen_cbuf: None,
                 width,
                 height,
             })
@@ -216,6 +337,7 @@ impl Renderer {
             return Ok(());
         }
         self.upload = None; // release before ResizeBuffers
+        self.upload_srv = None; // tied to the (now-stale) upload texture
         unsafe {
             self.swapchain
                 .ResizeBuffers(
@@ -265,14 +387,155 @@ impl Renderer {
                     .CreateTexture2D(&desc, None, Some(&mut tex))
                     .map_err(|e| PresentError(format!("CreateTexture2D: {e}")))?;
                 self.upload = tex;
+                // The old SRV (if any) pointed at the texture we just
+                // replaced — never reuse it across textures.
+                self.upload_srv = None;
             }
-            let upload = self.upload.as_ref().expect("just created");
+            // Cloned (COM AddRef, not a copy): the borrow ends here so the
+            // sharpen path below can take `&mut self` for lazy resource
+            // creation while still using the same underlying texture.
+            let upload = self.upload.clone().expect("just created");
             self.ctx
-                .UpdateSubresource(upload, 0, None, frame.rgba.as_ptr().cast(), w * 4, 0);
+                .UpdateSubresource(&upload, 0, None, frame.rgba.as_ptr().cast(), w * 4, 0);
             let back: ID3D11Texture2D = self.swapchain.GetBuffer(0)?;
-            self.ctx.CopyResource(&back, upload);
+            if self.sharpen > 0.0 {
+                self.draw_sharpen(&back, &upload, w, h)?;
+            } else {
+                self.ctx.CopyResource(&back, &upload);
+            }
         }
         Ok(())
+    }
+
+    /// Lazily compile/create the sharpen pass's device-level resources
+    /// (shaders, sampler, constant buffer). Independent of resolution —
+    /// created once per `Renderer` and reused across frames/resizes.
+    fn ensure_sharpen_resources(&mut self) -> Result<(), PresentError> {
+        if self.sharpen_vs.is_some() {
+            return Ok(());
+        }
+        unsafe {
+            let vs_bytecode = compile_hlsl(SHARPEN_HLSL, s!("VSMain"), s!("vs_5_0"))?;
+            let ps_bytecode = compile_hlsl(SHARPEN_HLSL, s!("PSMain"), s!("ps_5_0"))?;
+
+            let mut vs = None;
+            self.device
+                .CreateVertexShader(&vs_bytecode, None, Some(&mut vs))
+                .map_err(|e| PresentError(format!("CreateVertexShader: {e}")))?;
+            let mut ps = None;
+            self.device
+                .CreatePixelShader(&ps_bytecode, None, Some(&mut ps))
+                .map_err(|e| PresentError(format!("CreatePixelShader: {e}")))?;
+
+            let sampler_desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                ComparisonFunc: D3D11_COMPARISON_NEVER,
+                MaxLOD: f32::MAX,
+                ..Default::default()
+            };
+            let mut sampler = None;
+            self.device
+                .CreateSamplerState(&sampler_desc, Some(&mut sampler))
+                .map_err(|e| PresentError(format!("CreateSamplerState: {e}")))?;
+
+            let cbuf_desc = D3D11_BUFFER_DESC {
+                ByteWidth: size_of::<SharpenCbData>() as u32,
+                Usage: D3D11_USAGE_DYNAMIC,
+                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                ..Default::default()
+            };
+            let mut cbuf = None;
+            self.device
+                .CreateBuffer(&cbuf_desc, None, Some(&mut cbuf))
+                .map_err(|e| PresentError(format!("CreateBuffer (SharpenCB): {e}")))?;
+
+            self.sharpen_vs = vs;
+            self.sharpen_ps = ps;
+            self.sharpen_sampler = sampler;
+            self.sharpen_cbuf = cbuf;
+        }
+        Ok(())
+    }
+
+    /// Opt-in sharpen path: draws a full-screen triangle sampling
+    /// `upload` through the unsharp kernel straight onto `back`, in
+    /// place of the plain `CopyResource`. The default (`sharpen == 0.0`)
+    /// path in [`Self::draw`] never calls this — the bit-exact copy is
+    /// unchanged.
+    fn draw_sharpen(
+        &mut self,
+        back: &ID3D11Texture2D,
+        upload: &ID3D11Texture2D,
+        w: u32,
+        h: u32,
+    ) -> Result<(), PresentError> {
+        self.ensure_sharpen_resources()?;
+        unsafe {
+            if self.upload_srv.is_none() {
+                let mut srv = None;
+                self.device
+                    .CreateShaderResourceView(upload, None, Some(&mut srv))
+                    .map_err(|e| PresentError(format!("CreateShaderResourceView: {e}")))?;
+                self.upload_srv = srv;
+            }
+            let srv = self.upload_srv.clone().expect("just created");
+
+            let mut rtv: Option<ID3D11RenderTargetView> = None;
+            self.device
+                .CreateRenderTargetView(back, None, Some(&mut rtv))
+                .map_err(|e| PresentError(format!("CreateRenderTargetView: {e}")))?;
+            let rtv = rtv.ok_or_else(|| PresentError("no render target view".into()))?;
+
+            let cbuf = self.sharpen_cbuf.clone().expect("ensured above");
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.ctx
+                .Map(&cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
+                .map_err(|e| PresentError(format!("Map cbuffer: {e}")))?;
+            let data = SharpenCbData {
+                inv_resolution: [1.0 / w as f32, 1.0 / h as f32],
+                strength: self.sharpen,
+                _pad: 0.0,
+            };
+            std::ptr::copy_nonoverlapping(&data, mapped.pData.cast(), 1);
+            self.ctx.Unmap(&cbuf, 0);
+
+            let viewport = D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: w as f32,
+                Height: h as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            self.ctx.RSSetViewports(Some(&[viewport]));
+            self.ctx
+                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            self.ctx.VSSetShader(self.sharpen_vs.as_ref(), None);
+            self.ctx.PSSetShader(self.sharpen_ps.as_ref(), None);
+            self.ctx.PSSetShaderResources(0, Some(&[Some(srv)]));
+            self.ctx
+                .PSSetSamplers(0, Some(std::slice::from_ref(&self.sharpen_sampler)));
+            self.ctx.PSSetConstantBuffers(0, Some(&[Some(cbuf)]));
+            self.ctx.OMSetRenderTargets(Some(&[Some(rtv)]), None);
+            self.ctx.Draw(3, 0);
+
+            // Unbind the SRV/RTV: the next frame's UpdateSubresource on
+            // the same upload texture (and the next FLIP_DISCARD
+            // buffer's implicit reuse) must never race a still-bound
+            // view — debug-layer hazard otherwise.
+            self.ctx.PSSetShaderResources(0, Some(&[None]));
+            self.ctx.OMSetRenderTargets(None, None);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_sharpen_for_test(&mut self, strength: f32) {
+        self.sharpen = strength;
     }
 
     fn present(&mut self) -> Result<(), PresentError> {
@@ -289,7 +552,7 @@ impl Renderer {
     #[cfg(test)]
     fn read_backbuffer(&mut self) -> Result<Vec<u8>, PresentError> {
         use windows::Win32::Graphics::Direct3D11::{
-            D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_USAGE_STAGING,
+            D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_USAGE_STAGING,
         };
         unsafe {
             let back: ID3D11Texture2D = self.swapchain.GetBuffer(0)?;
@@ -684,6 +947,99 @@ mod tests {
         assert_eq!(r.read_backbuffer().expect("readback f2"), f2.rgba);
         r.present().expect("present f2");
         assert_eq!((r.width, r.height), (128, 72));
+
+        drop(r);
+        unsafe {
+            let _ = DestroyWindow(parent); // destroys the child too
+        }
+    }
+
+    /// A hard vertical edge, one flat shade per half — headroom on both
+    /// sides (not 0/255) so the sharpen halo is visible rather than
+    /// floor/ceiling-clamped away.
+    fn edge_frame(width: usize, height: usize) -> RgbaFrame {
+        let mut rgba = vec![0u8; width * height * 4];
+        for y in 0..height {
+            for x in 0..width {
+                let i = (y * width + x) * 4;
+                let v: u8 = if x < width / 2 { 64 } else { 192 };
+                rgba[i] = v;
+                rgba[i + 1] = v;
+                rgba[i + 2] = v;
+                rgba[i + 3] = 255;
+            }
+        }
+        RgbaFrame {
+            width,
+            height,
+            rgba,
+        }
+    }
+
+    /// Sharpen-on draw must leave flat interior regions unchanged (within
+    /// rounding) and must steepen the hard edge — darker just before it,
+    /// brighter just after — versus the plain-copy result the default
+    /// (sharpen-off) path would have produced.
+    #[test]
+    fn sharpen_pass_sharpens_edge_and_preserves_flat_regions() {
+        let parent = hidden_parent();
+        let child = create_stream_child(parent).expect("child window");
+        unsafe {
+            let _ = MoveWindow(child, 0, 0, 320, 240, false);
+        }
+
+        let (width, height) = (64usize, 32usize);
+        let frame = edge_frame(width, height);
+        let mut r = match Renderer::new(child, width as u32, height as u32) {
+            Ok(r) => r,
+            Err(e) => {
+                // No hardware D3D11 device (bare CI VM): nothing to test.
+                eprintln!("skipping: {e}");
+                unsafe {
+                    let _ = DestroyWindow(parent);
+                }
+                return;
+            }
+        };
+        r.set_sharpen_for_test(1.0);
+        r.draw(&frame).expect("draw edge frame");
+        let out = r.read_backbuffer().expect("readback");
+        r.present().expect("present");
+
+        let row = width * 4;
+        let px = |buf: &[u8], x: usize, y: usize, c: usize| buf[y * row + x * 4 + c] as i32;
+
+        // Flat interior, both sides of the edge: unchanged within an
+        // 8-bit rounding tolerance.
+        for &x in &[4usize, 8, 24, 40, 56, 60] {
+            for y in 0..height {
+                for c in 0..3 {
+                    let want = px(&frame.rgba, x, y, c);
+                    let got = px(&out, x, y, c);
+                    assert!(
+                        (want - got).abs() <= 2,
+                        "flat region changed at x={x} y={y} c={c}: {want} -> {got}"
+                    );
+                }
+            }
+        }
+
+        // Edge-adjacent columns: the unsharp kernel pushes each side away
+        // from the local average, away from the plain-copy value.
+        let (edge_left, edge_right, mid_row) = (width / 2 - 1, width / 2, height / 2);
+        let before_in = px(&frame.rgba, edge_left, mid_row, 0);
+        let before_out = px(&out, edge_left, mid_row, 0);
+        let after_in = px(&frame.rgba, edge_right, mid_row, 0);
+        let after_out = px(&out, edge_right, mid_row, 0);
+
+        assert!(
+            before_out < before_in - 5,
+            "expected undershoot just before the edge: in={before_in} out={before_out}"
+        );
+        assert!(
+            after_out > after_in + 5,
+            "expected overshoot just after the edge: in={after_in} out={after_out}"
+        );
 
         drop(r);
         unsafe {

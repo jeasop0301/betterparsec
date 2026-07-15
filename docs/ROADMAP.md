@@ -422,9 +422,16 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
 - [ ] **present CPU 왕복 제거(제로카피 NV12 텍스처)** — 지연·효율, present.rs Phase B
 
 ### 신규 capability (진짜 미구현)
-- [ ] **[헤드리스] 클라 샤픈/CAS 셰이더** — 현 프레젠트는 bilinear 스트레치만
-  (present.rs `DXGI_SCALING_STRETCH`). D3D11 픽셀 셰이더 샤픈 → 체감 선명도↑
-  + 저해상도 전송 허용(효율)
+- [~] **클라 샤픈/CAS 셰이더** — [x] **기계 완성** (2026-07-16 새벽, 헤드리스
+  검증 — task): `app-native/src/present.rs` opt-in 샤픈 패스 — `BP_SHARPEN`(0..100)
+  또는 테스트 훅으로 활성, **기본 off는 기존 `CopyResource` 경로 그대로**(bit-exact
+  `swapchain_roundtrip_and_resize` 보존). 런타임 D3DCompile(vs_5_0/ps_5_0, 인라인
+  HLSL): full-screen 트라이앵글 VS + CAS/unsharp PS(center+4축 이웃, `sharp =
+  center + strength*(center*4 - 상하좌우)*0.25`, saturate). SRV는 upload 텍스처
+  수명에 결속(리사이즈 시 재생성), FLIP_DISCARD라 RTV는 프레임마다 신규 + draw 후
+  언바인드(bind hazard 회피). 실 D3D11 하드웨어 검증 — 신규 test(하드 엣지
+  오버슛/언더슛 readback 확인, 평탄부 불변). app-native 53 tests. 잔여: [ ] 저해상도
+  전송 + 업스케일 결합(동적 해상도 컨트롤러와) + 강도 라이브 튜닝
 - [~] **대역 구동 동적 해상도 스케일링** — [x] **컨트롤러 기계 완성**
   (2026-07-16 새벽, 헤드리스 — task 병렬): `transport-core/src/resolution.rs`
   `DynResolutionController` — 대역 추정 → 해상도 사다리(2160/1440/1080/900/720/

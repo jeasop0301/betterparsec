@@ -35,3 +35,7 @@ server
 
 # Local-only helper scripts (machine-specific paths, not for the repo)
 *.local.ps1
+
+# Stray tool dumps (cargo metadata etc.)
+/meta.json
+/meta.err

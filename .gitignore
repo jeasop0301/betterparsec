@@ -28,3 +28,7 @@ server
 /benchmark-results
 
 /.idea
+
+# Loose runtime binaries at the repo root (run-in-place artifacts)
+/*.exe
+/*.dll

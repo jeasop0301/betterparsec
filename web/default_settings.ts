@@ -56,7 +56,11 @@ const trueDefaultSettings: Settings =
     "enableVideoQu": false,
     // Clipboard sync v1 — default true (Parsec ships this default-on; the
     // browser's own permission prompt is the actual consent gate).
-    "clipboardSync": true
+    "clipboardSync": true,
+    // M4 cursor P2 (cursor-channel.md §P2) — default false: Sunshine still
+    // bakes the cursor into the video until the display_cursor fork config
+    // lands, so this is off by default (identical behavior to before P2).
+    "clientCursor": false
 }
 
 export default trueDefaultSettings as Settings

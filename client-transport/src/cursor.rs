@@ -128,6 +128,24 @@ mod tests {
         );
     }
 
+    /// POS v2 (cursor P2) appends a u32 shape_id this client does not
+    /// consume yet — decode must tolerate the longer buffer by reading
+    /// the first 14 bytes (additive wire evolution pin).
+    #[test]
+    fn pos_v2_trailing_shape_id_is_tolerated() {
+        let mut bytes = vec![
+            0x00, 0x01, // kind, visible
+            0xE8, 0x03, 0x00, 0x00, // x = 1000
+            0xFE, 0xFF, 0xFF, 0xFF, // y = -2
+            0x00, 0x0A, // vw = 2560
+            0xA0, 0x05, // vh = 1440
+        ];
+        bytes.extend_from_slice(&7u32.to_le_bytes()); // shape_id = 7
+        let p = decode_pos(&bytes).expect("v2 decodes via the first 14 bytes");
+        assert_eq!(p.x, 1000);
+        assert_eq!(p.vh, 1440);
+    }
+
     #[test]
     fn hidden_pin() {
         let bytes: [u8; CURSOR_POS_LEN] = [

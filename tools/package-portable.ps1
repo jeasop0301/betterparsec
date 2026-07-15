@@ -30,4 +30,12 @@ foreach ($f in $files) {
 ) | Set-Content -Path (Join-Path $staging 'run-incheon.bat')
 
 Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $zip -Force
+# Self-serve: the release web-server serves static/ at the site root, so
+# the zip is downloadable at https://<server>:8080/betterparsec-portable.zip
+# (re-run this script after every `Copy-Item dist static` redeploy — the
+# redeploy wipes static/).
+$staticDir = Join-Path $root 'static'
+if (Test-Path $staticDir) {
+    Copy-Item $zip $staticDir -Force
+}
 Write-Output ("zip: {0} ({1:N1} MB)" -f $zip, ((Get-Item $zip).Length / 1MB))

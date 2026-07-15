@@ -319,17 +319,23 @@ class ViewerApp implements Component {
         } else if (data.type == "connectionComplete") {
             this.sidebar.onCapabilitiesChange(data.capabilities)
         } else if (data.type == "cursorAutoMode") {
-            this.onCursorAutoMode(data.locked)
+            this.onCursorAutoMode(data.locked, data.cursorCss)
         }
     }
     // M4 cursor P1: host-authority auto mouse mode (cursor-channel.md §3).
     // locked → the host wants relative (FPS aim, 0 cursors): (re)acquire
     // pointer lock. unlocked → the host wants follow (absolute) input and
     // bakes its own cursor into the video, so the local browser cursor must
-    // stay hidden over the stream to avoid a double cursor.
-    private onCursorAutoMode(locked: boolean) {
+    // stay hidden over the stream to avoid a double cursor — UNLESS
+    // cursorCss is set (M4 cursor P2, settings.clientCursor): then the
+    // client renders the cursor itself via CSS instead, overriding the
+    // `stream-cursor-none` class (higher specificity — see moonlight.css/
+    // standard.css `.stream-cursor-none`). Cleared back to the class when
+    // cursorCss is null (unknown/oversized shape, or clientCursor off).
+    private onCursorAutoMode(locked: boolean, cursorCss: string | null) {
         this.autoModeWantsLock = locked
         this.div.classList.toggle("stream-cursor-none", !locked)
+        this.div.style.cursor = cursorCss ?? ""
 
         if (locked) {
             // May silently fail without a user gesture — the click re-arm in

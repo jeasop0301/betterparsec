@@ -45,6 +45,12 @@ export type Settings = {
     // true — browser clipboard permission prompts provide the actual
     // consent gate (Parsec ships this default-on too).
     clipboardSync: boolean
+    // M4 cursor P2 (cursor-channel.md §P2): render the host cursor shape
+    // client-side via CSS instead of relying on the video-baked cursor.
+    // Default false — Sunshine still bakes the cursor into the video until
+    // the display_cursor fork config lands, so with this off behavior is
+    // identical to before P2.
+    clientCursor: boolean
 }
 
 export type StreamCodec = "h264" | "auto" | "h265" | "av1"
@@ -202,6 +208,7 @@ export class StreamSettingsComponent implements Component {
 
     private useSelectElementPolyfill: InputComponent
     private clipboardSync: InputComponent
+    private clientCursor: InputComponent
 
     constructor(permissions: StreamPermissions, settings: Settings) {
         // Sometimes the normal settings object doesn't have some values, because they change between versions.
@@ -554,6 +561,13 @@ export class StreamSettingsComponent implements Component {
         })
         this.clipboardSync.addChangeListener(this.onSettingsChange.bind(this))
         this.clipboardSync.mount(this.divElement)
+        // M4 cursor P2 (cursor-channel.md §P2) — experimental, no
+        // translation key yet, same literal-label convention as clipboardSync.
+        this.clientCursor = new InputComponent("clientCursor", "checkbox", "Client-rendered cursor (experimental)", {
+            checked: settings?.clientCursor ?? defaultSettings_.clientCursor
+        })
+        this.clientCursor.addChangeListener(this.onSettingsChange.bind(this))
+        this.clientCursor.mount(this.divElement)
 
         this.onSettingsChange()
     }
@@ -622,6 +636,7 @@ export class StreamSettingsComponent implements Component {
 
         settings.useSelectElementPolyfill = this.useSelectElementPolyfill.isChecked()
         settings.clipboardSync = this.clipboardSync.isChecked()
+        settings.clientCursor = this.clientCursor.isChecked()
 
         makeSettingsValid(this.permissions, settings)
 

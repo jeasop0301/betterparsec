@@ -8,7 +8,7 @@ import { buildAudioPipeline } from "./audio/pipeline.js"
 import { BIG_BUFFER, ByteBuffer } from "./buffer.js"
 import { defaultStreamInputConfig, MouseMode, StreamInput } from "./input.js"
 import { CursorAutoAction, CursorAutoMode } from "./cursor_auto.js"
-import { parseCursorMessage } from "./cursor_wire.js"
+import { parseCursorMessage, bytesToBase64 } from "./cursor_wire.js"
 import { decodeClipboardText, encodeClipboardText, CLIPBOARD_MAX_LEN } from "./clipboard_wire.js"
 import { Logger, LogMessageInfo } from "./log.js"
 import { gatherPipeInfo } from "./pipeline/index.js"
@@ -38,7 +38,11 @@ export type InfoEvent = CustomEvent<
     { type: "connectionStatus", status: ConnectionStatus } |
     { type: "addDebugLine", line: string, additional?: LogMessageInfo } |
     // M4 cursor P1: host-authority auto mouse mode transitioned (cursor-channel.md §3).
-    { type: "cursorAutoMode", locked: boolean }
+    // M4 cursor P2: cursorCss is the CSS `cursor` value ViewerApp should apply
+    // instead of the `stream-cursor-none` class when settings.clientCursor is
+    // on and the active shape is cached and <=128px; null otherwise (existing
+    // cursor:none behavior, cursor-channel.md §P2).
+    { type: "cursorAutoMode", locked: boolean, cursorCss: string | null }
 >
 export type InfoEventListener = (event: InfoEvent) => void
 
@@ -95,6 +99,15 @@ function isFirefox(): boolean {
     return navigator.userAgent.includes("Firefox/")
 }
 
+// M4 cursor P2 (cursor-channel.md §P2): cap on the number of cached cursor
+// shapes (data: URLs), evicting the oldest on overflow. Bounds memory for a
+// long session against a host that cycles through many distinct cursors.
+const CURSOR_SHAPE_CACHE_MAX = 32
+// M4 cursor P2: client-rendered cursor CSS only applies below this size —
+// larger shapes fall back to the existing cursor:none (video-baked cursor)
+// behavior; an overlay-div fallback for oversized shapes is an explicit v1
+// non-goal (docs/design/cursor-channel.md §P2).
+const CURSOR_SHAPE_MAX_CSS_DIMENSION = 128
 const WEBRTC_CONNECT_TIMEOUT_MS = 15000
 const FALLBACK_RECONNECT_DELAY_MS = 500
 // M4 stall watchdog tick period. The ladder escalates at most one rung per
@@ -127,6 +140,15 @@ export class Stream implements Component {
     // createVideoRenderer() so it survives transport restarts, matching the
     // FEC/QU wiring pattern.
     private cursorAutoMode: CursorAutoMode | null = null
+    // M4 cursor P2 (cursor-channel.md §P2): shapes received over the cursor
+    // channel, keyed by shape_id — insertion order doubles as recency for
+    // the CURSOR_SHAPE_CACHE_MAX eviction (oldest-first) below. Populated
+    // regardless of settings.clientCursor so enabling it mid-session (not
+    // currently wired at runtime, but kept consistent with cursorAutoMode's
+    // own re-creation pattern) would not start from an empty cache.
+    private cursorShapeCache = new Map<number, { url: string, hotX: number, hotY: number, w: number, h: number }>()
+    // The shape_id carried by the most recent POS message (0 = unknown/none).
+    private activeCursorShapeId = 0
     // M4 auto-runtime (mid-session mouseMode switch): tracks the transport
     // channel a receive listener has been attached to. A second listener on
     // the SAME channel would double-fire cursorAutoMode.onVisibility — this
@@ -541,9 +563,44 @@ export class Stream implements Component {
     private emitCursorAutoState(locked: boolean) {
         this.input.setAutoLocked(locked)
         const event: InfoEvent = new CustomEvent("stream-info", {
-            detail: { type: "cursorAutoMode", locked }
+            detail: { type: "cursorAutoMode", locked, cursorCss: this.computeCursorCss(locked) }
         })
         this.eventTarget.dispatchEvent(event)
+    }
+    // M4 cursor P2 (cursor-channel.md §P2): the CSS `cursor` value ViewerApp
+    // should show instead of `stream-cursor-none` — only when unlocked (the
+    // host is in the "bakes its own cursor" follow state), the experimental
+    // setting is on, the active shape_id is cached, and it's small enough
+    // for a real CSS cursor (Chrome et al. cap around this size; bigger
+    // shapes fall back to cursor:none — overlay-div fallback for those is
+    // an explicit v1 non-goal).
+    private computeCursorCss(locked: boolean): string | null {
+        if (locked || !this.settings.clientCursor) {
+            return null
+        }
+        const shape = this.cursorShapeCache.get(this.activeCursorShapeId)
+        if (!shape || shape.w > CURSOR_SHAPE_MAX_CSS_DIMENSION || shape.h > CURSOR_SHAPE_MAX_CSS_DIMENSION) {
+            return null
+        }
+        return `url(${shape.url}) ${shape.hotX} ${shape.hotY}, default`
+    }
+    // M4 cursor P2: stores a SHAPE message as a data: URL, evicting the
+    // oldest cache entry (insertion order) once CURSOR_SHAPE_CACHE_MAX is
+    // reached — bounds memory against a host cycling through many cursors.
+    private cacheCursorShape(shapeId: number, w: number, h: number, hotX: number, hotY: number, png: Uint8Array) {
+        if (!this.cursorShapeCache.has(shapeId) && this.cursorShapeCache.size >= CURSOR_SHAPE_CACHE_MAX) {
+            const oldestKey = this.cursorShapeCache.keys().next().value
+            if (oldestKey !== undefined) {
+                this.cursorShapeCache.delete(oldestKey)
+            }
+        }
+        this.cursorShapeCache.set(shapeId, {
+            url: `data:image/png;base64,${bytesToBase64(png)}`,
+            hotX,
+            hotY,
+            w,
+            h,
+        })
     }
     private applyCursorAutoAction(action: CursorAutoAction | null) {
         if (!action) {
@@ -606,8 +663,30 @@ export class Stream implements Component {
                     return
                 }
                 const msg = parseCursorMessage(data)
-                if (msg) {
-                    this.applyCursorAutoAction(activeCursorAutoMode.onVisibility(msg.visible, performance.now()))
+                if (!msg) {
+                    return
+                }
+                if (msg.kind === 'shape') {
+                    this.cacheCursorShape(msg.shapeId, msg.w, msg.h, msg.hotX, msg.hotY, msg.png)
+                    // Only re-render if this shape is the one currently
+                    // shown (it may have arrived before or after the POS
+                    // that references it — either order must converge).
+                    if (msg.shapeId === this.activeCursorShapeId) {
+                        this.emitCursorAutoState(activeCursorAutoMode.locked)
+                    }
+                    return
+                }
+                // msg.kind === 'pos'
+                const shapeChanged = msg.shapeId !== this.activeCursorShapeId
+                this.activeCursorShapeId = msg.shapeId
+                const action = activeCursorAutoMode.onVisibility(msg.visible, performance.now())
+                if (action) {
+                    this.applyCursorAutoAction(action)
+                } else if (shapeChanged) {
+                    // Lock state didn't flip, but the rendered shape did
+                    // (e.g. the host cursor changed while already unlocked)
+                    // — refresh the CSS without touching lock state.
+                    this.emitCursorAutoState(activeCursorAutoMode.locked)
                 }
             })
         }

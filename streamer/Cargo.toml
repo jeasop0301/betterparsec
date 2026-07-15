@@ -29,13 +29,17 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 [target.'cfg(windows)'.dependencies]
 # Cursor P1 tracker (GetCursorInfo 60 Hz poll — cursor-channel.md §3) +
 # clipboard sync v1 (GetClipboardSequenceNumber 500 ms poll + CF_UNICODETEXT
-# via GlobalAlloc/Lock — clipboard.rs).
+# via GlobalAlloc/Lock — clipboard.rs) + P2 cursor shape extraction
+# (GetIconInfoExW/GetDIBits — cursor-channel.md §P2, cursor_tracker.rs).
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
+    "Win32_Graphics_Gdi",
 ] }
+# P2 cursor shape PNG encoding (cursor_tracker.rs extract_shape).
+png = "0.18.1"
 
 [lints]
 workspace = true

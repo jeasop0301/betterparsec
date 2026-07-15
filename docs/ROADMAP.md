@@ -433,7 +433,17 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   예외)해서 게임 중 거슬림 → 완화 배선: 클릭뿐 아니라 **아무 키
   입력에서도 lock 재획득**(keydown = transient activation, ESC 자체는
   제외 — WASD 누르는 순간 즉시 복귀). 게이밍 정답 경로는 immersive.
-  → [ ] **P2** 모양 채널 zero-latency 커서 (display_cursor 결정 선행)
+  → [~] **P2 모양 채널 기계 완성** (2026-07-15, 헤드리스 — task 슬라이스):
+  POS v2(+u32 shape_id, 네이티브 관용성 핀 +1 test) + SHAPE 와이어(kind=1,
+  PNG 256 KiB 캡, 양측 바이트-핀) + 스트리머 모양 추출(hCursor 변화 감지,
+  GetIconInfoExW+GetDIBits — 레거시 제로알파는 AND 마스크로 복원, 모노크롬
+  XOR은 PNG 알파 근사, oversize는 영구-미스, 실물 IDC_ARROW 추출
+  라운드트립 test) + 웹 클라 렌더(shape 캐시 32개, chunked base64,
+  ≤128px CSS `cursor:url() hotspot` — inline style이 cursor:none 클래스
+  위에 자연 우선) — **`clientCursor` 설정 기본 off**: display_cursor가
+  영상에 커서를 굽는 동안 이중 방지. 활성화 = 포크 config(P2b, MSYS2
+  세션)로 구움 끄기 후 기본 on 전환 + 라이브 판정. streamer 200 + 웹
+  160 + client-transport 47 tests.
 - [~] **immersive 모드** — 전체화면 + pointer lock + Keyboard Lock 일괄
   토글. **웹 완성** (2026-07-15, 헤드리스 검증): 사이드바 Immersive
   버튼 — 진입 = fullscreen 확인 후 keyboard.lock(가드) +

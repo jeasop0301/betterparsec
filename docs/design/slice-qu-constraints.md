@@ -204,6 +204,51 @@ RTP queue layer.
 | Timing fields for latency attribution (`receiveTimeUs`, `rtpTimestamp`) | Small: wrapper field pass-through | patches/moonlight-common-rust.patch |
 | Dirty-rect / QU metadata | Large: no protocol carrier exists — needs a new extension (or the QU DataChannel path from fec-framing.md, which bypasses this protocol entirely) | Sunshine fork + protocol extension |
 
+## 6. Per-slice DU wire contract (2026-07-15 Sunshine-source verification)
+
+The premise of 5.1 — "FEC-block boundary = slice boundary" — was verified
+against upstream Sunshine `src/stream.cpp` (master, fetched 2026-07-15;
+local copy `server/sunshine_stream_upstream.cpp`): **it does not hold for
+our host.**
+
+### 6.1 What Sunshine actually does
+
+- `stream.cpp:1552-1599`: FEC blocks split a frame **by size only** —
+  `max_data_per_fec_block` derives from the shard limit, the frame payload is
+  divided into equal `aligned_size` chunks, and boundaries land mid-NAL.
+  Slice boundaries play no role.
+- `MAX_FEC_BLOCKS = 4` (`stream.cpp:1553`): the protocol carries block
+  index/count in 2 bits each (`multiFecBlocks = (blockIndex << 4) |
+  ((count-1) << 6)`, mirrored by `RtpVideoQueue.c:584/709`). **Per-slice
+  blocks therefore cap slice mode at 4 slices per frame.**
+- `multiFecFlags` is constant `0x10` on the wire (`stream.cpp:1634`) and the
+  client never parses it (`RtpVideoQueue.c:369` — literal `TODO`). Free bits
+  are available for a backward-compatible extension signal.
+
+Consequence: a client-side depacketizer patch keyed on FEC-block boundaries
+would deliver size-split fragments cut mid-NAL — useless as decode units.
+**The Sunshine fork must move first** (or land together): per-slice DU is a
+two-sided change with a wire contract, not an independent client patch.
+
+### 6.2 Proposed contract (pin before either side is written)
+
+| Side | Change |
+|---|---|
+| Host (fork) | When NVENC slice mode is active with N in 2..4 slices and per-slice send is enabled: split the frame payload at VCL-NAL (slice) boundaries into N FEC blocks instead of `aligned_size` chunks; keep per-block blocksize alignment/zero-pad exactly as today (H.264/HEVC tolerate trailing zeros; AV1 is excluded — no slices). Set `multiFecFlags \|= 0x20` ("blocks are slice-aligned"). N>4 or missing boundaries: fall back to stock size-split without 0x20. |
+| Client (moonlight-common-c patch) | Parse `multiFecFlags & 0x20`. When set: `RtpVideoQueue` submits each completed FEC block to the depacketizer immediately (today blocks accumulate until the last — `RtpVideoQueue.c:783-800`), and the depacketizer reassembles a DU per block end (new flush point; `FLAG_EOF` still only marks the true frame end). DU gains `sliceIndex`/`sliceCount` metadata (ripples into the Rust wrapper). Flag absent: byte-identical stock behavior. |
+| Loss semantics | Unchanged: blocks are already order-enforced (`RtpVideoQueue.c:586` rejects behind-current blocks); a lost block still drops the whole frame through the existing RFI/IDR machinery. Slice DUs only accelerate the happy path. |
+| Streamer consumption | Separate opt-in (per-slice send decomposition of `send_single_frame`, section 2's four invariants). Until then the streamer may simply reassemble slice DUs back into frames — correctness-neutral. |
+
+### 6.3 Revised U3 ordering
+
+1. Pin this contract (done — this section).
+2. Sunshine fork: slice-aligned FEC blocks + `0x20` flag (MSYS2 UCRT64 build
+   session; same worktree as the ACK patches).
+3. moonlight-common-c depacketizer patch against the flag (client side,
+   testable against fork traffic on loopback).
+4. Streamer per-slice send path (section 2 invariants) — Gate C measurement
+   decides whether the overlap win pays for the added encoder slice overhead.
+
 ## Open questions (remaining)
 
 - How should QU tiles be composited on the browser client (separate `VideoFrame`

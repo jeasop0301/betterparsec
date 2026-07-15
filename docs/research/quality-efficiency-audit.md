@@ -106,3 +106,33 @@ nvenc-slice-probe가 "슬라이스 지연 세금 없음"을 숫자로 증명했�
 채였다. 무료 점심(spatial AQ + preset + HEVC/AV1 + 4:4:4/10-bit)만 켜도
 "타 대비 저비트레이트 고화질"의 상당 부분이 열린다 — capability가 아니라
 기본값·측정·활성 문제. 진짜 신규 개발은 클라 슈퍼레졸루션 하나.
+---
+
+## F. 심층 파이프라인 추적 (2026-07-16 — "끝까지" 2차 감사)
+
+실제 디코드→프레젠트 경로를 바이트 단위로 추적한 결과:
+
+1. **[수리 완료] 네이티브 색 행렬/레인지 버그** — `app-native/src/video.rs`
+   `frame_to_rgba`가 `sws_getCachedContext`를 **색공간/레인지 지정 없이**
+   생성 → swscale 기본 = **BT.601 limited**. HD(1080p)는 BT.709이므로
+   **709 콘텐츠를 601 행렬로 변환 = 색 실제 틀어짐**(피부톤·채도 이동). 이
+   RGBA가 present까지 그대로 감(별도 YUV 셰이더 없음, R8G8B8A8 업로드).
+   웹은 브라우저 WebCodecs가 VUI를 읽어 정상 → **네이티브 전용 버그**.
+   **수정**: 프레임 `colorspace`/`color_range`로 `sws_setColorspaceDetails`
+   적용(709/601/2020 + full/limited), 미지정 시 해상도 폴백(≥720p→709).
+   순수 결정함수 `sws_cs_for`/`is_full_range` +2 tests, app-native 52 tests.
+2. **[미해결] 8-bit 프레젠트 천장** — present.rs 스왑체인 R8G8B8A8_UNORM.
+   10-bit 디코드해도 present에서 8-bit 절단 → 밴딩 잔존. 네이티브 10-bit엔
+   R10G10B10A2 + HDR 스왑체인 필요(M3 신규 capability).
+3. **[미해결] present용 CPU 왕복(Phase A)** — 디코드→`hwframe_transfer`(GPU→CPU)
+   →swscale→D3D11 텍스처 업로드(CPU→GPU). 프레임당 GPU↔CPU 왕복 = 지연 +
+   추가 변환. 제로카피 NV12 텍스처 직결은 "Phase B" 유보(present.rs 모듈 doc).
+4. **[유의] 스케일링 품질** — 현재 SWS_FAST_BILINEAR지만 1:1(색 변환만)이라
+   무해. **동적 해상도 스케일링 착수 시** FAST_BILINEAR→고품질(bicubic/lanczos)
+   교체 필요, 아니면 업스케일이 뭉갬.
+5. **[유의] 웹 색 신호 의존** — 웹은 브라우저 VUI 처리에 의존 → **Sunshine VUI
+   신호 정확성** 라이브 확인 필요(특히 4:4:4/10-bit/HDR).
+
+**2차 감사 결론:** 첫 감사(인코더 튜닝)에 더해 **클라 디코드 경로에 실제 색
+버그**가 있었다(수리 완료). "네이티브급 화질"은 인코더 무료 점심 + 이 색
+정확도 + 10-bit 프레젠트가 함께 가야 완성된다.

@@ -64,6 +64,57 @@ unsafe extern "C" fn pick_pixfmt(
     }
 }
 
+// ── Color space / range (native-grade color accuracy) ──────────────────────
+//
+// swscale's default YUV→RGB uses BT.601 limited-range coefficients unless
+// told otherwise, so an HD (BT.709) stream decoded through the default
+// path comes out with a visibly wrong matrix (skin tones / saturated
+// colors shift). WebCodecs on the browser client reads the bitstream VUI
+// automatically; this native path must apply it explicitly from the
+// decoded frame's `colorspace` / `color_range`.
+
+// swscale.h SWS_CS_* coefficient-table selectors (stable ABI values).
+const SWS_CS_ITU709_: i32 = 1;
+const SWS_CS_ITU601_: i32 = 5; // == SMPTE170M / BT470BG
+const SWS_CS_BT2020_: i32 = 9;
+const SWS_CS_RGB_: i32 = 5; // dst table for RGB output (unused coeffs)
+
+// AVColorSpace enum values (stable).
+const AVCOL_SPC_BT709_: i32 = 1;
+const AVCOL_SPC_BT470BG_: i32 = 5;
+const AVCOL_SPC_SMPTE170M_: i32 = 6;
+const AVCOL_SPC_BT2020_NCL_: i32 = 9;
+const AVCOL_SPC_BT2020_CL_: i32 = 10;
+// AVColorRange.
+const AVCOL_RANGE_JPEG_: i32 = 2; // full range
+
+/// Pick the swscale coefficient table for a decoded frame's `colorspace`.
+/// Unspecified/unknown falls back by resolution — the universal heuristic:
+/// ≥720p is BT.709, below is BT.601.
+fn sws_cs_for(av_colorspace: i32, height: i32) -> i32 {
+    match av_colorspace {
+        AVCOL_SPC_BT709_ => SWS_CS_ITU709_,
+        AVCOL_SPC_BT2020_NCL_ | AVCOL_SPC_BT2020_CL_ => SWS_CS_BT2020_,
+        AVCOL_SPC_SMPTE170M_ | AVCOL_SPC_BT470BG_ => SWS_CS_ITU601_,
+        _ => {
+            if height >= 720 {
+                SWS_CS_ITU709_
+            } else {
+                SWS_CS_ITU601_
+            }
+        }
+    }
+}
+
+/// Whether the YUV input is full-range: explicit JPEG range, or a `YUVJ*`
+/// pixel format (implicit full range). Otherwise limited (MPEG/TV) range.
+fn is_full_range(av_color_range: i32, pix_fmt: i32) -> bool {
+    if av_color_range == AVCOL_RANGE_JPEG_ {
+        return true;
+    }
+    pix_fmt == ff::AVPixelFormat::AV_PIX_FMT_YUVJ420P as i32
+}
+
 pub struct Decoder {
     ctx: *mut ff::AVCodecContext,
     frame: *mut ff::AVFrame,
@@ -223,6 +274,27 @@ impl Decoder {
             );
             if self.sws.is_null() {
                 return Err(DecodeError("sws_getCachedContext failed".into()));
+            }
+
+            // Apply the stream's real matrix + range (native-grade color).
+            // Default swscale coefficients are BT.601 limited; HD is BT.709.
+            let cs = sws_cs_for((*src).colorspace as i32, h);
+            let src_full = is_full_range((*src).color_range as i32, (*src).format);
+            let inv_table = ff::sws_getCoefficients(cs);
+            let rgb_table = ff::sws_getCoefficients(SWS_CS_RGB_);
+            if !inv_table.is_null() && !rgb_table.is_null() {
+                // brightness 0, contrast/saturation unity (1<<16); dst RGB
+                // is full-range.
+                ff::sws_setColorspaceDetails(
+                    self.sws,
+                    inv_table,
+                    i32::from(src_full),
+                    rgb_table,
+                    1,
+                    0,
+                    1 << 16,
+                    1 << 16,
+                );
             }
 
             let mut rgba = vec![0u8; w as usize * h as usize * 4];
@@ -397,5 +469,34 @@ mod tests {
             f.rgba.chunks_exact(4).any(|px| px != first),
             "decoded frame is a flat fill"
         );
+    }
+
+    #[test]
+    fn colorspace_selection_matches_stream_signalling() {
+        // Explicit signalling is honoured regardless of resolution.
+        assert_eq!(sws_cs_for(AVCOL_SPC_BT709_, 480), SWS_CS_ITU709_);
+        assert_eq!(sws_cs_for(AVCOL_SPC_SMPTE170M_, 1080), SWS_CS_ITU601_);
+        assert_eq!(sws_cs_for(AVCOL_SPC_BT470BG_, 1080), SWS_CS_ITU601_);
+        assert_eq!(sws_cs_for(AVCOL_SPC_BT2020_NCL_, 2160), SWS_CS_BT2020_);
+        assert_eq!(sws_cs_for(AVCOL_SPC_BT2020_CL_, 2160), SWS_CS_BT2020_);
+        // Unspecified (2) falls back by resolution: HD→709, SD→601. This
+        // is the case that was previously always wrong (601 default).
+        assert_eq!(sws_cs_for(2, 1080), SWS_CS_ITU709_);
+        assert_eq!(sws_cs_for(2, 720), SWS_CS_ITU709_);
+        assert_eq!(sws_cs_for(2, 576), SWS_CS_ITU601_);
+        assert_eq!(sws_cs_for(2, 480), SWS_CS_ITU601_);
+    }
+
+    #[test]
+    fn range_selection_flags_full_range_sources() {
+        let nv12 = ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+        let yuvj = ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_YUVJ420P as i32;
+        // Explicit JPEG range → full, regardless of pixfmt.
+        assert!(is_full_range(AVCOL_RANGE_JPEG_, nv12));
+        // YUVJ pixel format → implicit full even when range unspecified.
+        assert!(is_full_range(0, yuvj));
+        // Plain NV12 with unspecified/MPEG range → limited.
+        assert!(!is_full_range(0, nv12));
+        assert!(!is_full_range(1, nv12));
     }
 }

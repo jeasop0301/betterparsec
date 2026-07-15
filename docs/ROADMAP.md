@@ -404,6 +404,16 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   클라 MAIN10/REXT10 준비 완료
 - [ ] `nvenc_vbv_increase`/VBR 등 rate-control 튜닝(모션 스파이크) — CC 상호작용, Gate C
 
+### 심층 발견·수리 (2026-07-16 파이프라인 추적)
+- [x] **네이티브 색 정확도 버그 수리** (헤드리스 검증) — `app-native/src/video.rs`
+  `frame_to_rgba`가 swscale 색공간/레인지 미지정 → BT.601 기본으로 HD(709)
+  스트림 색 틀어짐(피부톤·채도 이동), present까지 도달(웹은 브라우저 VUI로
+  정상 = 네이티브 전용). 프레임 `colorspace`/`color_range` → `sws_setColorspaceDetails`
+  (709/601/2020 + full/limited, 미지정 시 ≥720p→709 폴백). 순수 `sws_cs_for`/
+  `is_full_range` +2 tests, app-native 52 tests. quality-efficiency-audit.md §F.
+- [ ] **8-bit present 천장** — R8G8B8A8 스왑체인, 10-bit 디코드 절단. R10G10B10A2 필요
+- [ ] **present CPU 왕복 제거(제로카피 NV12 텍스처)** — 지연·효율, present.rs Phase B
+
 ### 신규 capability (진짜 미구현)
 - [ ] **[헤드리스] 클라 샤픈/CAS 셰이더** — 현 프레젠트는 bilinear 스트레치만
   (present.rs `DXGI_SCALING_STRETCH`). D3D11 픽셀 셰이더 샤픈 → 체감 선명도↑

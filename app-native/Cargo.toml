@@ -33,6 +33,8 @@ ffmpeg-sys-next = { version = "7.1", optional = true, default-features = false, 
     "swscale",
 ] }
 libc = { version = "0.2", optional = true }
+# M4 cursor P2 native render: SHAPE PNG decode → HCURSOR (cursor_icon.rs).
+png = { version = "0.17", optional = true }
 
 # A0 slice 3: raw D3D11 FLIP_DISCARD present surface (design D5). The
 # stream child HWND + swapchain live outside egui; raw-window-handle
@@ -65,6 +67,7 @@ video = [
     "dep:libc",
     "dep:windows",
     "dep:moonlight-common",
+    "dep:png",
 ]
 
 [dev-dependencies]

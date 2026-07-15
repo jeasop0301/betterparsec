@@ -13,6 +13,8 @@
 
 #[cfg(all(windows, feature = "video"))]
 mod audio;
+#[cfg(all(windows, feature = "video"))]
+mod cursor_icon;
 mod host;
 #[cfg(all(windows, feature = "video"))]
 mod input;
@@ -380,6 +382,12 @@ struct App {
     /// Raw surface init/present failed this connection — egui fallback.
     #[cfg(all(windows, feature = "video"))]
     surface_failed: bool,
+    /// M4 cursor P2 (opt-in `BP_CLIENT_CURSOR=1`): client-rendered host
+    /// cursor state (HCURSOR ring + wndproc-shared slot, cursor_icon.rs).
+    #[cfg(all(windows, feature = "video"))]
+    client_cursor: bool,
+    #[cfg(all(windows, feature = "video"))]
+    cursor_state: cursor_icon::ClientCursor,
 }
 
 impl App {
@@ -400,6 +408,10 @@ impl App {
             surface: None,
             #[cfg(all(windows, feature = "video"))]
             surface_failed: false,
+            #[cfg(all(windows, feature = "video"))]
+            client_cursor: std::env::var("BP_CLIENT_CURSOR").is_ok_and(|v| v == "1"),
+            #[cfg(all(windows, feature = "video"))]
+            cursor_state: cursor_icon::ClientCursor::default(),
         }
     }
 
@@ -519,6 +531,7 @@ impl eframe::App for App {
                         #[cfg(all(windows, feature = "video"))]
                         {
                             self.surface_failed = false;
+                            self.cursor_state.reset(); // per-connection shapes
                         }
                         self.running = Some(Running::start(self.form.clone(), ctx.clone()));
                     }
@@ -637,6 +650,7 @@ impl eframe::App for App {
                                                 s.enable_input(input::InputCtx {
                                                     sender: run.session.input_sender(),
                                                     video: run.video.clone(),
+                                                    cursor: self.cursor_state.active_slot(),
                                                 });
                                                 self.surface = Some(s);
                                             }
@@ -698,6 +712,12 @@ impl eframe::App for App {
                                         if s.cursor_over() {
                                             ctx.set_cursor_icon(egui::CursorIcon::None);
                                         }
+                                        // M4 cursor P2 pump: newest host
+                                        // shape → HCURSOR for the child's
+                                        // WM_SETCURSOR (cursor_icon.rs).
+                                        if self.client_cursor {
+                                            self.cursor_state.pump(run.session.cursor());
+                                        }
                                     }
                                     None => {}
                                 }
@@ -754,6 +774,7 @@ impl eframe::App for App {
                         #[cfg(all(windows, feature = "video"))]
                         {
                             self.surface = None; // joins the present thread
+                            self.cursor_state.reset();
                         }
                         run.stop();
                         #[cfg(feature = "video")]
@@ -768,6 +789,7 @@ impl eframe::App for App {
                         {
                             self.surface = None; // joins the present thread
                             self.surface_failed = false; // per-connection latch
+                            self.cursor_state.reset();
                         }
                         run.stop();
                         #[cfg(feature = "video")]

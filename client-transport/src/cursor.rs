@@ -1,23 +1,43 @@
 //! `cursor` DataChannel wire decode + session→shell readback — M4 cursor
-//! P1 (docs/design/cursor-channel.md §3).
+//! P1/P2 (docs/design/cursor-channel.md §3, §P2).
 //!
-//! POS message, little-endian, 14 bytes:
-//! `u8 kind=0 | u8 visible(0/1) | i32 x | i32 y | u16 vw | u16 vh`
+//! POS message, little-endian, 14 bytes (v1) or 18 bytes (v2, P2 —
+//! `shape_id` appended; v1 frames decode with `shape_id = 0`):
+//! `u8 kind=0 | u8 visible(0/1) | i32 x | i32 y | u16 vw | u16 vh [| u32 shape_id]`
 //!
 //! `x`,`y` are cursor screen coordinates and `vw`,`vh` the captured
-//! monitor's size in the same coordinate space.
+//! monitor's size in the same coordinate space. `shape_id` is 0 for
+//! "unknown/none" and otherwise refers to the last SHAPE message with
+//! that id.
 //!
-//! Mirror: `streamer/src/transport/webrtc/cursor_wire.rs` (encode) and
+//! SHAPE message, little-endian, 17-byte header + PNG payload:
+//! `u8 kind=1 | u32 shape_id | u16 w | u16 h | u16 hot_x | u16 hot_y | u32 png_len | png bytes`
+//! The host sends SHAPE only when the cursor shape (hCursor) changes and
+//! assigns a **fresh id per change** (`cursor_tracker`), so the latest
+//! shape is always complete state — a single-slot store suffices here.
+//!
+//! Mirror: `streamer/src/transport/cursor_wire.rs` (encode) and
 //! `web/stream/cursor_wire.ts` (parse) — keep the byte-pinned tests in
 //! lockstep across all three (qu_wire pattern). This crate only decodes
-//! (the client never encodes POS; the host is the sole cursor authority).
+//! (the client never encodes; the host is the sole cursor authority).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 pub const CURSOR_KIND_POS: u8 = 0;
+pub const CURSOR_KIND_SHAPE: u8 = 1;
+/// Minimum (v1) POS frame length; v2 appends a u32 `shape_id`.
 pub const CURSOR_POS_LEN: usize = 14;
+pub const CURSOR_POS_V2_LEN: usize = 18;
+/// Fixed portion of a SHAPE frame, before the variable-length PNG payload.
+pub const CURSOR_SHAPE_HEADER_LEN: usize = 17;
+/// Refuse to accept a PNG payload bigger than this — bounds a single
+/// cursor shape frame regardless of source cursor size (encode-side twin
+/// lives in `streamer/src/transport/cursor_wire.rs`).
+pub const CURSOR_SHAPE_MAX_PNG_LEN: usize = 262_144;
 
-/// One cursor state sample (host authority: visibility + position).
+/// One cursor state sample (host authority: visibility + position + the
+/// shape currently in effect; `shape_id == 0` = unknown/none).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CursorPos {
     pub visible: bool,
@@ -25,6 +45,7 @@ pub struct CursorPos {
     pub y: i32,
     pub vw: u16,
     pub vh: u16,
+    pub shape_id: u32,
 }
 
 /// Decode one `cursor` DataChannel message. Returns `None` for buffers
@@ -38,12 +59,57 @@ pub fn decode_pos(bytes: &[u8]) -> Option<CursorPos> {
     if bytes.len() < CURSOR_POS_LEN {
         return None;
     }
+    let shape_id = if bytes.len() >= CURSOR_POS_V2_LEN {
+        u32::from_le_bytes(bytes[14..18].try_into().expect("4-byte slice"))
+    } else {
+        0
+    };
     Some(CursorPos {
         visible: bytes[1] != 0,
         x: i32::from_le_bytes(bytes[2..6].try_into().expect("4-byte slice")),
         y: i32::from_le_bytes(bytes[6..10].try_into().expect("4-byte slice")),
         vw: u16::from_le_bytes(bytes[10..12].try_into().expect("2-byte slice")),
         vh: u16::from_le_bytes(bytes[12..14].try_into().expect("2-byte slice")),
+        shape_id,
+    })
+}
+
+/// One decoded SHAPE message: the host cursor image (RGBA PNG) plus its
+/// hotspot. `w`/`h` are the host-declared pixel dimensions (informational
+/// — the PNG itself is authoritative for decoders).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorShape {
+    pub shape_id: u32,
+    pub w: u16,
+    pub h: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    pub png: Vec<u8>,
+}
+
+/// Decode one SHAPE frame. `None` on a truncated header, a declared
+/// `png_len` over [`CURSOR_SHAPE_MAX_PNG_LEN`], a body shorter than the
+/// declared length, or an unrecognised kind. Trailing bytes beyond
+/// `png_len` are tolerated (exactly `png_len` bytes are taken) — matches
+/// `web/stream/cursor_wire.ts` `parseCursorMessage`.
+pub fn decode_shape(bytes: &[u8]) -> Option<CursorShape> {
+    if bytes.len() < CURSOR_SHAPE_HEADER_LEN || bytes[0] != CURSOR_KIND_SHAPE {
+        return None;
+    }
+    let png_len = u32::from_le_bytes(bytes[13..17].try_into().expect("4-byte slice")) as usize;
+    if png_len > CURSOR_SHAPE_MAX_PNG_LEN {
+        return None;
+    }
+    if bytes.len() < CURSOR_SHAPE_HEADER_LEN + png_len {
+        return None;
+    }
+    Some(CursorShape {
+        shape_id: u32::from_le_bytes(bytes[1..5].try_into().expect("4-byte slice")),
+        w: u16::from_le_bytes(bytes[5..7].try_into().expect("2-byte slice")),
+        h: u16::from_le_bytes(bytes[7..9].try_into().expect("2-byte slice")),
+        hot_x: u16::from_le_bytes(bytes[9..11].try_into().expect("2-byte slice")),
+        hot_y: u16::from_le_bytes(bytes[11..13].try_into().expect("2-byte slice")),
+        png: bytes[CURSOR_SHAPE_HEADER_LEN..CURSOR_SHAPE_HEADER_LEN + png_len].to_vec(),
     })
 }
 
@@ -61,10 +127,17 @@ pub fn decode_pos(bytes: &[u8]) -> Option<CursorPos> {
 /// `pos` packs `x` and `y` (both `i32`) into one `u64`: high 32 bits = `x`,
 /// low 32 bits = `y`, each reinterpreted through its unsigned bit pattern
 /// (`i32 as u32`) so negative coordinates round-trip exactly.
+///
+/// `shape` (P2) is the latest decoded SHAPE message behind a `Mutex` —
+/// unlike POS this is off the hot path (the host sends SHAPE only when
+/// the cursor shape changes), so a lock is fine and the payload (`Vec`)
+/// rules out plain atomics anyway.
 #[derive(Debug)]
 pub struct CursorShared {
     visible: AtomicBool,
     pos: AtomicU64,
+    shape_id: AtomicU32,
+    shape: Mutex<Option<std::sync::Arc<CursorShape>>>,
 }
 
 impl Default for CursorShared {
@@ -74,6 +147,8 @@ impl Default for CursorShared {
         Self {
             visible: AtomicBool::new(true),
             pos: AtomicU64::new(0),
+            shape_id: AtomicU32::new(0),
+            shape: Mutex::new(None),
         }
     }
 }
@@ -86,6 +161,7 @@ impl CursorShared {
         self.visible.store(p.visible, Ordering::Release);
         let packed = ((p.x as u32 as u64) << 32) | (p.y as u32 as u64);
         self.pos.store(packed, Ordering::Release);
+        self.shape_id.store(p.shape_id, Ordering::Release);
     }
 
     /// Host cursor visibility (shell readback for mouse-mode wiring).
@@ -97,6 +173,21 @@ impl CursorShared {
     pub fn pos(&self) -> (i32, i32) {
         let packed = self.pos.load(Ordering::Acquire);
         ((packed >> 32) as u32 as i32, packed as u32 as i32)
+    }
+
+    /// Shape id the last POS sample reported (0 = unknown/none).
+    pub fn shape_id(&self) -> u32 {
+        self.shape_id.load(Ordering::Acquire)
+    }
+
+    /// Store one decoded SHAPE message (data-channel callback thread).
+    pub fn store_shape(&self, s: CursorShape) {
+        *self.shape.lock().expect("cursor shape lock") = Some(std::sync::Arc::new(s));
+    }
+
+    /// Latest host cursor shape, if any has arrived this session.
+    pub fn shape(&self) -> Option<std::sync::Arc<CursorShape>> {
+        self.shape.lock().expect("cursor shape lock").clone()
     }
 }
 
@@ -124,15 +215,16 @@ mod tests {
                 y: -2,
                 vw: 2560,
                 vh: 1440,
+                shape_id: 0, // v1 frame — no shape_id on the wire
             }
         );
     }
 
-    /// POS v2 (cursor P2) appends a u32 shape_id this client does not
-    /// consume yet — decode must tolerate the longer buffer by reading
-    /// the first 14 bytes (additive wire evolution pin).
+    /// POS v2 (cursor P2) appends a u32 shape_id — shared byte pin with
+    /// `streamer/src/transport/cursor_wire.rs` `pos_byte_pin` and
+    /// `tests/cursor_wire.test.mjs`; change all three or none.
     #[test]
-    fn pos_v2_trailing_shape_id_is_tolerated() {
+    fn pos_v2_byte_pin() {
         let mut bytes = vec![
             0x00, 0x01, // kind, visible
             0xE8, 0x03, 0x00, 0x00, // x = 1000
@@ -141,9 +233,10 @@ mod tests {
             0xA0, 0x05, // vh = 1440
         ];
         bytes.extend_from_slice(&7u32.to_le_bytes()); // shape_id = 7
-        let p = decode_pos(&bytes).expect("v2 decodes via the first 14 bytes");
+        let p = decode_pos(&bytes).expect("v2 decodes");
         assert_eq!(p.x, 1000);
         assert_eq!(p.vh, 1440);
+        assert_eq!(p.shape_id, 7);
     }
 
     #[test]
@@ -171,7 +264,7 @@ mod tests {
     #[test]
     fn unknown_kind_is_none() {
         let mut bytes = [0u8; CURSOR_POS_LEN];
-        bytes[0] = 0x01; // no other kind is defined yet
+        bytes[0] = 0x02; // no such kind is defined
         assert_eq!(decode_pos(&bytes), None);
     }
 
@@ -180,6 +273,105 @@ mod tests {
         // 13 bytes: correct kind, one byte short of a full POS frame.
         let bytes = [0u8; CURSOR_POS_LEN - 1];
         assert_eq!(decode_pos(&bytes), None);
+    }
+
+    /// Shared byte pin with `streamer/src/transport/cursor_wire.rs`
+    /// `shape_byte_pin` and `tests/cursor_wire.test.mjs` — change all
+    /// three or none.
+    #[test]
+    fn shape_byte_pin() {
+        let bytes = [
+            0x01, // kind
+            0x07, 0x00, 0x00, 0x00, // shape_id = 7
+            0x20, 0x00, // w = 32
+            0x20, 0x00, // h = 32
+            0x03, 0x00, // hot_x = 3
+            0x04, 0x00, // hot_y = 4
+            0x03, 0x00, 0x00, 0x00, // png_len = 3
+            0xAA, 0xBB, 0xCC, // png bytes
+        ];
+        let s = decode_shape(&bytes).expect("decodes");
+        assert_eq!(
+            s,
+            CursorShape {
+                shape_id: 7,
+                w: 32,
+                h: 32,
+                hot_x: 3,
+                hot_y: 4,
+                png: vec![0xAA, 0xBB, 0xCC],
+            }
+        );
+    }
+
+    #[test]
+    fn shape_rejects_png_len_over_cap() {
+        let mut bytes = vec![0x01u8, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0];
+        bytes.extend_from_slice(&((CURSOR_SHAPE_MAX_PNG_LEN + 1) as u32).to_le_bytes());
+        bytes.resize(CURSOR_SHAPE_HEADER_LEN + CURSOR_SHAPE_MAX_PNG_LEN + 1, 0);
+        assert_eq!(decode_shape(&bytes), None);
+    }
+
+    #[test]
+    fn shape_truncated_body_is_none() {
+        // Header claims 3 png bytes but only 2 are present.
+        let mut bytes = vec![0x01u8, 7, 0, 0, 0, 32, 0, 32, 0, 3, 0, 4, 0];
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&[0xAA, 0xBB]);
+        assert_eq!(decode_shape(&bytes), None);
+    }
+
+    #[test]
+    fn shape_truncated_header_is_none() {
+        assert_eq!(decode_shape(&[0x01u8; CURSOR_SHAPE_HEADER_LEN - 1]), None);
+        assert_eq!(decode_shape(&[]), None);
+    }
+
+    #[test]
+    fn shape_trailing_bytes_are_tolerated() {
+        // Matches web parse: exactly png_len bytes are taken.
+        let mut bytes = vec![0x01u8, 7, 0, 0, 0, 32, 0, 32, 0, 3, 0, 4, 0];
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&[0xAA, 0xBB, 0xEE, 0xEE]); // 2 png + 2 trailing
+        let s = decode_shape(&bytes).expect("decodes");
+        assert_eq!(s.png, vec![0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn shape_wrong_kind_is_none() {
+        let mut bytes = vec![0x00u8, 7, 0, 0, 0, 32, 0, 32, 0, 3, 0, 4, 0];
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(decode_shape(&bytes), None);
+    }
+
+    #[test]
+    fn shared_shape_store_readback() {
+        let shared = CursorShared::default();
+        assert_eq!(shared.shape_id(), 0);
+        assert!(shared.shape().is_none());
+
+        shared.store_shape(CursorShape {
+            shape_id: 3,
+            w: 32,
+            h: 32,
+            hot_x: 1,
+            hot_y: 2,
+            png: vec![1, 2, 3],
+        });
+        let s = shared.shape().expect("stored");
+        assert_eq!(s.shape_id, 3);
+        assert_eq!(s.png, vec![1, 2, 3]);
+
+        // POS carries the id the shell should match against.
+        shared.store(CursorPos {
+            visible: true,
+            x: 0,
+            y: 0,
+            vw: 1,
+            vh: 1,
+            shape_id: 3,
+        });
+        assert_eq!(shared.shape_id(), 3);
     }
 
     #[test]
@@ -194,6 +386,7 @@ mod tests {
             y: 2000,
             vw: 1920,
             vh: 1080,
+            shape_id: 0,
         });
         assert!(!shared.visible());
         assert_eq!(shared.pos(), (-100, 2000));
@@ -204,6 +397,7 @@ mod tests {
             y: i32::MAX,
             vw: 0,
             vh: 0,
+            shape_id: 9,
         });
         assert!(shared.visible());
         assert_eq!(shared.pos(), (i32::MIN, i32::MAX));

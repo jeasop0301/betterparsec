@@ -462,9 +462,19 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   `capture_cursor` config(+런타임 토글 Ctrl+Alt+Shift+N, config.cpp:1341
   — `display_cursor` 전역 직결)가 존재 — **포크 패치 불필요**. 활성화 =
   호스트 conf `capture_cursor=false` + `clientCursor` 기본 on + 라이브
-  판정. 단 네이티브 클라는 아직 구움 커서 의존(자체 shape 렌더 부재)
-  → 기본 전환은 네이티브 shape 렌더 후, 그 전엔 웹 세션 한정 실험.
-  streamer 200 + 웹 160 + client-transport 47 tests.
+  판정. **네이티브 shape 렌더 완성** (2026-07-16 새벽, 헤드리스 검증):
+  client-transport POS v2 `shape_id` 소비 + SHAPE 디코드(3면 바이트-핀
+  락스텝, 웹 parse 시맨틱 동일 — cap/절단/트레일링) + `CursorShared`
+  최신-1 shape 슬롯(모양은 변화당 새 id 전체 재전송이라 단일 슬롯이
+  완전 상태) → app-native `cursor_icon.rs`: PNG→BGRA(순수) →
+  32bpp 알파 DIB+제로 AND 마스크 `CreateIconIndirect`(실 USER32
+  라운드트립 test) → `ClientCursor` 펌프(id당 1회 빌드, 실패는 영구
+  미스, HCURSOR 링 4로 사용-중 파괴 방지, 접속 단위 리셋) →
+  WM_SETCURSOR/WM_MOUSEMOVE가 `SetCursor(NULL)` 대신 active 핸들
+  적용. **`BP_CLIENT_CURSOR=1` opt-in**(구움 커서와 이중 방지 — 웹
+  `clientCursor` 기본 off와 동일 자세). 이제 기본 전환 잔여 = 호스트
+  `capture_cursor=false` 세션에서 웹+네이티브 라이브 판정만.
+  client-transport 54 + app-native 33 tests.
 - [~] **immersive 모드** — 전체화면 + pointer lock + Keyboard Lock 일괄
   토글. **웹 완성** (2026-07-15, 헤드리스 검증): 사이드바 Immersive
   버튼 — 진입 = fullscreen 확인 후 keyboard.lock(가드) +

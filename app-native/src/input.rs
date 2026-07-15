@@ -36,6 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::VideoShared;
+use crate::cursor_icon::ActiveCursor;
 
 /// Attached to the stream child window (GWLP_USERDATA) when a session
 /// is running; owned by `StreamSurface`.
@@ -43,6 +44,9 @@ pub struct InputCtx {
     pub sender: InputSender,
     /// Stream dimensions source (`VideoShared::dims`, `w << 32 | h`).
     pub video: Arc<VideoShared>,
+    /// Cursor the child should show over its client area (0 = hide) —
+    /// written by the shell pump (M4 cursor P2, cursor_icon.rs).
+    pub cursor: Arc<ActiveCursor>,
 }
 
 /// Geometry needed to map client coordinates onto the stream.
@@ -76,7 +80,7 @@ fn cursor_debug_log(what: &str) {
     use std::sync::atomic::AtomicU32;
     static COUNT: AtomicU32 = AtomicU32::new(0);
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 4 || n % 256 == 0 {
+    if n < 4 || n.is_multiple_of(256) {
         tracing::debug!(n, "[cursor] {what}");
     }
 }
@@ -177,6 +181,16 @@ fn current_modifiers() -> KeyModifiers {
     m
 }
 
+/// Applies the shell-published stream cursor (0 = hide — the P1 posture;
+/// non-zero = client-rendered host shape, M4 cursor P2).
+fn apply_cursor(ctx: &InputCtx) {
+    let handle = ctx.cursor.get();
+    let cursor = (handle != 0).then_some(windows::Win32::UI::WindowsAndMessaging::HCURSOR(
+        handle as *mut core::ffi::c_void,
+    ));
+    unsafe { SetCursor(cursor) };
+}
+
 /// Window-message hook called from the stream surface wndproc (UI
 /// thread). `Some(_)` = handled (message consumed — also suppresses the
 /// Alt/F10 system-menu default for SYSKEY messages).
@@ -187,24 +201,26 @@ pub fn handle(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> Option<LRESULT> {
-    // Single-cursor: the host cursor lives in the video (module doc).
+    // Single-cursor: the host cursor lives in the video (module doc) —
+    // unless the shell pump published a client-rendered shape (M4 cursor
+    // P2, `BP_CLIENT_CURSOR=1`): then that HCURSOR is applied instead.
     if msg == WM_SETCURSOR {
         if !setcursor_hides(lparam.0) {
             cursor_debug_log("WM_SETCURSOR non-client — keeping system cursor");
             return None; // DefWindowProc → normal system cursor
         }
-        unsafe { SetCursor(None) };
-        cursor_debug_log("WM_SETCURSOR client — SetCursor(NULL)");
+        apply_cursor(ctx);
+        cursor_debug_log("WM_SETCURSOR client — applied stream cursor");
         return Some(LRESULT(1)); // TRUE: cursor handled, no arrow reset
     }
     // Reinforcement (field report 2026-07-15: arrow still follows on
-    // hover): re-assert the hidden cursor on every mouse move so anything
+    // hover): re-assert the stream cursor on every mouse move so anything
     // that reset the thread cursor between moves (parent chrome, other
     // in-process code) is overridden at the next movement — exactly the
     // moments a "following" arrow is visible. WM_MOUSEMOVE still falls
     // through to translate() below.
     if msg == WM_MOUSEMOVE {
-        unsafe { SetCursor(None) };
+        apply_cursor(ctx);
     }
 
     // Focus and drag-capture side effects first.

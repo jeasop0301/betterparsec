@@ -38,7 +38,7 @@ use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 use crate::capi::RxCore;
-use crate::cursor::{CursorShared, decode_pos};
+use crate::cursor::{CursorShared, decode_pos, decode_shape};
 use crate::flow::{FlowAction, FlowConfig, SignalingFlow, StreamParams};
 use crate::tls::{ServerTrust, client_config};
 use crate::watchdog::{StallWatchdog, WatchdogAction, WatchdogConfig};
@@ -710,14 +710,16 @@ async fn create_peer(
                 }
             }
             "cursor" => {
-                // Direct atomic store into `CursorShared`, not routed
-                // through `LocalEvent`: see the struct's doc comment for
-                // why (pure atomics, no ordering dependency on the
-                // session loop).
+                // Direct store into `CursorShared`, not routed through
+                // `LocalEvent`: see the struct's doc comment for why
+                // (POS = pure atomics on the mouse-move hot path; SHAPE =
+                // low-rate Mutex slot, sent only on shape change).
                 let cursor_shared = cursor_shared.clone();
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
                     if let Some(pos) = decode_pos(&msg.data) {
                         cursor_shared.store(pos);
+                    } else if let Some(shape) = decode_shape(&msg.data) {
+                        cursor_shared.store_shape(shape);
                     }
                     done()
                 }));

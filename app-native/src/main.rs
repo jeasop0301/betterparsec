@@ -50,7 +50,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
-            .with_title("BetterParsec — build 07-16b (low-latency)"),
+            .with_title("BetterParsec — build 07-16c (nv12 gpu present)"),
         ..Default::default()
     };
     eframe::run_native(
@@ -95,7 +95,7 @@ impl FpsWindow {
 #[derive(Default)]
 struct VideoShared {
     /// Newest decoded picture; the presenter takes it (newest-wins).
-    frame: Mutex<Option<video::RgbaFrame>>,
+    frame: Mutex<Option<video::DecodedFrame>>,
     /// Signaled per stored frame; the raw present thread blocks here.
     frame_ready: Condvar,
     /// Bumped once per stored frame so the UI knows when to re-upload
@@ -114,6 +114,11 @@ struct VideoShared {
     /// Live-adjustable from the shell UI; the present thread reads it each
     /// frame. Seeded from `BP_SHARPEN` at surface creation.
     sharpen_pct: std::sync::atomic::AtomicU32,
+    /// Opt-in GPU NV12 present: the decoder emits NV12 planes and the raw
+    /// present converts on the GPU (skips the CPU swscale + RGBA upload).
+    /// Live toggle from the shell UI; only takes effect while the raw D3D11
+    /// present and hardware decode are both active. Default off (RGBA).
+    nv12: AtomicBool,
 }
 
 #[cfg(feature = "video")]
@@ -173,12 +178,25 @@ impl DecodeState {
             return;
         }
         self.wait_for_key = false;
-        match dec.decode(&unit.data) {
+        // Opt-in GPU NV12 present: only when the raw D3D11 path and hardware
+        // decode are active (software decode yields YUV420P, not NV12). Any
+        // decode error falls through to the shared IDR-request handling.
+        let want_nv12 = shared.nv12.load(Ordering::Relaxed)
+            && shared.raw_present_active()
+            && shared.hw_device.load(Ordering::Relaxed);
+        let decoded = if want_nv12 {
+            dec.decode_nv12(&unit.data)
+                .map(|o| o.map(video::DecodedFrame::Nv12))
+        } else {
+            dec.decode(&unit.data)
+                .map(|o| o.map(video::DecodedFrame::Rgba))
+        };
+        match decoded {
             Ok(Some(frame)) => {
-                shared.dims.store(
-                    ((frame.width as u64) << 32) | frame.height as u64,
-                    Ordering::Relaxed,
-                );
+                let (w, h) = frame.dims();
+                shared
+                    .dims
+                    .store(((w as u64) << 32) | h as u64, Ordering::Relaxed);
                 *shared.frame.lock().unwrap_or_else(PoisonError::into_inner) = Some(frame);
                 shared.generation.fetch_add(1, Ordering::Release);
                 shared.decoded.fetch_add(1, Ordering::Relaxed);
@@ -727,6 +745,15 @@ impl eframe::App for App {
                         run.video
                             .sharpen_pct
                             .store(self.sharpen_pct, Ordering::Relaxed);
+                        // Opt-in GPU NV12 present (skips the CPU color
+                        // roundtrip); live toggle, default off (proven RGBA).
+                        let mut nv12 = run.video.nv12.load(Ordering::Relaxed);
+                        if ui
+                            .checkbox(&mut nv12, "Fast GPU present (NV12, experimental)")
+                            .changed()
+                        {
+                            run.video.nv12.store(nv12, Ordering::Relaxed);
+                        }
                     }
                     ui.add_space(8.0);
                     let disconnect = ui.button("Disconnect").clicked();
@@ -933,18 +960,23 @@ impl eframe::App for App {
                                         .unwrap_or_else(PoisonError::into_inner)
                                         .take()
                                 {
-                                    let img = egui::ColorImage::from_rgba_unmultiplied(
-                                        [f.width, f.height],
-                                        &f.rgba,
-                                    );
-                                    match self.video_tex.as_mut() {
-                                        Some(t) => t.set(img, egui::TextureOptions::LINEAR),
-                                        None => {
-                                            self.video_tex = Some(ctx.load_texture(
-                                                "stream",
-                                                img,
-                                                egui::TextureOptions::LINEAR,
-                                            ));
+                                    // NV12 only occurs while the raw present
+                                    // path is active, so the egui fallback only
+                                    // ever sees RGBA here; skip other forms.
+                                    if let video::DecodedFrame::Rgba(r) = &f {
+                                        let img = egui::ColorImage::from_rgba_unmultiplied(
+                                            [r.width, r.height],
+                                            &r.rgba,
+                                        );
+                                        match self.video_tex.as_mut() {
+                                            Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                                            None => {
+                                                self.video_tex = Some(ctx.load_texture(
+                                                    "stream",
+                                                    img,
+                                                    egui::TextureOptions::LINEAR,
+                                                ));
+                                            }
                                         }
                                     }
                                     self.video_gen = generation;

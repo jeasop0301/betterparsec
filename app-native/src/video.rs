@@ -22,6 +22,38 @@ pub struct RgbaFrame {
     pub rgba: Vec<u8>,
 }
 
+/// One decoded picture as NV12 planes (tight strides), for the GPU present
+/// path: Y plane (`width*height` bytes) + interleaved UV plane
+/// (`width*(height/2)` bytes) plus the YUV->RGB matrix the shader applies.
+/// Avoids the CPU swscale and halves the CPU->GPU upload vs `RgbaFrame`.
+pub struct Nv12Frame {
+    pub width: usize,
+    pub height: usize,
+    pub y: Vec<u8>,
+    pub uv: Vec<u8>,
+    /// Row-major YUV->RGB: `out_c = m[c][0]*Y + m[c][1]*U + m[c][2]*V + m[c][3]`
+    /// with Y,U,V the R8 / R8G8-normalized samples in [0,1].
+    pub matrix: [[f32; 4]; 3],
+}
+
+/// A decoded picture in whichever form the pump produced: `Rgba` (the
+/// swscale CPU path, and the software-decode / egui-fallback form) or
+/// `Nv12` (the GPU present path — planes + matrix, no CPU color convert).
+pub enum DecodedFrame {
+    Rgba(RgbaFrame),
+    Nv12(Nv12Frame),
+}
+
+impl DecodedFrame {
+    /// Picture dimensions (width, height) regardless of form.
+    pub fn dims(&self) -> (u32, u32) {
+        match self {
+            DecodedFrame::Rgba(f) => (f.width as u32, f.height as u32),
+            DecodedFrame::Nv12(f) => (f.width as u32, f.height as u32),
+        }
+    }
+}
+
 /// Decode failure. The pump latches needs-IDR upstream and keeps going;
 /// nothing here is fatal to the session.
 #[derive(Debug)]
@@ -113,6 +145,41 @@ fn is_full_range(av_color_range: i32, pix_fmt: i32) -> bool {
         return true;
     }
     pix_fmt == ff::AVPixelFormat::AV_PIX_FMT_YUVJ420P as i32
+}
+
+/// YUV->RGB matrix rows for a decoded frame's colorspace selector (an
+/// `SWS_CS_*` value from [`sws_cs_for`]) and range. Computed from the ITU
+/// luma coefficients so the present shader is a fixed dot product; mirrors
+/// the swscale path's matrix + range so the GPU output matches the CPU one.
+fn yuv_to_rgb_matrix(sws_cs: i32, full_range: bool) -> [[f32; 4]; 3] {
+    let (kr, kb) = match sws_cs {
+        SWS_CS_ITU601_ => (0.299_f32, 0.114_f32),
+        SWS_CS_BT2020_ => (0.2627_f32, 0.0593_f32),
+        _ => (0.2126_f32, 0.0722_f32), // BT.709 (and the ≥720p default)
+    };
+    let kg = 1.0 - kr - kb;
+    let cr = 2.0 * (1.0 - kr); // R <- Cr(V)
+    let cb = 2.0 * (1.0 - kb); // B <- Cb(U)
+    let gu = -kb * cb / kg; // G <- Cb(U)
+    let gv = -kr * cr / kg; // G <- Cr(V)
+    // Sample normalization: limited range has Y in [16,235]/255 and chroma in
+    // [16,240]/255; full range uses the raw [0,1] with a 128/255 chroma bias.
+    let (ys, yo, cscale, co) = if full_range {
+        (1.0_f32, 0.0_f32, 1.0_f32, 128.0 / 255.0)
+    } else {
+        (255.0 / 219.0, 16.0 / 255.0, 255.0 / 224.0, 128.0 / 255.0)
+    };
+    // Y' = (Y-yo)*ys ; Cb = (U-co)*cscale ; Cr = (V-co)*cscale.
+    // out = Y' + a*Cb + b*Cr, expanded to [wY, wU, wV, offset].
+    let row = |a: f32, b: f32| {
+        [
+            ys,
+            a * cscale,
+            b * cscale,
+            -ys * yo - a * cscale * co - b * cscale * co,
+        ]
+    };
+    [row(0.0, cr), row(gu, gv), row(cb, 0.0)]
 }
 
 pub struct Decoder {
@@ -367,6 +434,89 @@ impl Decoder {
             })
         }
     }
+
+    /// Like [`Decoder::decode`] but returns the newest picture as NV12 planes
+    /// for the GPU present path (no CPU color conversion). `Err` on a
+    /// non-NV12 (software-decode YUV420P) frame so the caller falls back to
+    /// the RGBA path for that frame.
+    pub fn decode_nv12(&mut self, data: &[u8]) -> Result<Option<Nv12Frame>, DecodeError> {
+        if data.is_empty() {
+            return Ok(None);
+        }
+        unsafe {
+            let rc = ff::av_new_packet(self.pkt, data.len() as i32);
+            if rc < 0 {
+                return Err(DecodeError(format!("av_new_packet: {}", err_str(rc))));
+            }
+            ptr::copy_nonoverlapping(data.as_ptr(), (*self.pkt).data, data.len());
+            let rc = ff::avcodec_send_packet(self.ctx, self.pkt);
+            ff::av_packet_unref(self.pkt);
+            if rc < 0 && rc != ff::AVERROR(libc::EAGAIN) {
+                return Err(DecodeError(format!("send_packet: {}", err_str(rc))));
+            }
+            let mut out = None;
+            loop {
+                let rc = ff::avcodec_receive_frame(self.ctx, self.frame);
+                if rc == ff::AVERROR(libc::EAGAIN) || rc == ff::AVERROR_EOF {
+                    break;
+                }
+                if rc < 0 {
+                    return Err(DecodeError(format!("receive_frame: {}", err_str(rc))));
+                }
+                out = Some(self.frame_to_nv12()?);
+                ff::av_frame_unref(self.frame);
+            }
+            Ok(out)
+        }
+    }
+
+    /// Download (when on a D3D11 surface) the current `self.frame` and copy
+    /// its NV12 planes tightly packed. `Err` for non-NV12 formats so the
+    /// caller can fall back to the RGBA path.
+    unsafe fn frame_to_nv12(&mut self) -> Result<Nv12Frame, DecodeError> {
+        unsafe {
+            let mut src: *mut ff::AVFrame = self.frame;
+            if (*self.frame).format == ff::AVPixelFormat::AV_PIX_FMT_D3D11 as i32 {
+                ff::av_frame_unref(self.sw_frame);
+                let rc = ff::av_hwframe_transfer_data(self.sw_frame, self.frame, 0);
+                if rc < 0 {
+                    return Err(DecodeError(format!("hwframe transfer: {}", err_str(rc))));
+                }
+                src = self.sw_frame;
+            }
+            if (*src).format != ff::AVPixelFormat::AV_PIX_FMT_NV12 as i32 {
+                return Err(DecodeError("decoded frame is not NV12".into()));
+            }
+            let w = (*src).width;
+            let h = (*src).height;
+            if w <= 0 || h <= 0 {
+                return Err(DecodeError("decoded frame has no dimensions".into()));
+            }
+            let (w, h) = (w as usize, h as usize);
+            let y_ls = (*src).linesize[0] as usize;
+            let y_ptr = (*src).data[0];
+            let mut y = Vec::with_capacity(w * h);
+            for r in 0..h {
+                y.extend_from_slice(std::slice::from_raw_parts(y_ptr.add(r * y_ls), w));
+            }
+            let uv_ls = (*src).linesize[1] as usize;
+            let uv_ptr = (*src).data[1];
+            let uv_h = h / 2;
+            let mut uv = Vec::with_capacity(w * uv_h);
+            for r in 0..uv_h {
+                uv.extend_from_slice(std::slice::from_raw_parts(uv_ptr.add(r * uv_ls), w));
+            }
+            let cs = sws_cs_for((*src).colorspace as i32, h as i32);
+            let full = is_full_range((*src).color_range as i32, (*src).format);
+            Ok(Nv12Frame {
+                width: w,
+                height: h,
+                y,
+                uv,
+                matrix: yuv_to_rgb_matrix(cs, full),
+            })
+        }
+    }
 }
 
 impl Drop for Decoder {
@@ -386,6 +536,55 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::process::Command;
+
+    fn apply_matrix(m: &[[f32; 4]; 3], y: f32, u: f32, v: f32) -> [f32; 3] {
+        [
+            m[0][0] * y + m[0][1] * u + m[0][2] * v + m[0][3],
+            m[1][0] * y + m[1][1] * u + m[1][2] * v + m[1][3],
+            m[2][0] * y + m[2][1] * u + m[2][2] * v + m[2][3],
+        ]
+    }
+
+    #[test]
+    fn nv12_matrix_grayscale_axis() {
+        // BT.709 limited: neutral chroma (128/255) maps the luma ramp
+        // [16,235]/255 onto [0,1] RGB gray — the GPU shader must match the
+        // swscale path exactly on the achromatic axis.
+        let m = yuv_to_rgb_matrix(SWS_CS_ITU709_, false);
+        let c = 128.0 / 255.0;
+        let black = apply_matrix(&m, 16.0 / 255.0, c, c);
+        let white = apply_matrix(&m, 235.0 / 255.0, c, c);
+        for ch in 0..3 {
+            assert!(black[ch].abs() < 1e-3, "black[{ch}] = {}", black[ch]);
+            assert!(
+                (white[ch] - 1.0).abs() < 1e-3,
+                "white[{ch}] = {}",
+                white[ch]
+            );
+        }
+        // Full range: raw [0,1] luma, neutral chroma.
+        let mf = yuv_to_rgb_matrix(SWS_CS_ITU709_, true);
+        let fb = apply_matrix(&mf, 0.0, c, c);
+        let fw = apply_matrix(&mf, 1.0, c, c);
+        for ch in 0..3 {
+            assert!(fb[ch].abs() < 1e-3, "full black[{ch}] = {}", fb[ch]);
+            assert!((fw[ch] - 1.0).abs() < 1e-3, "full white[{ch}] = {}", fw[ch]);
+        }
+    }
+
+    #[test]
+    fn nv12_matrix_chroma_direction() {
+        // Cr (V) above neutral pushes red up; Cb (U) above neutral pushes
+        // blue up — sanity that the chroma coefficients have the right sign.
+        let m = yuv_to_rgb_matrix(SWS_CS_ITU709_, false);
+        let c = 128.0 / 255.0;
+        let mid = 128.0 / 255.0;
+        let neutral = apply_matrix(&m, mid, c, c);
+        let more_v = apply_matrix(&m, mid, c, 200.0 / 255.0);
+        let more_u = apply_matrix(&m, mid, 200.0 / 255.0, c);
+        assert!(more_v[0] > neutral[0] + 0.1, "R must rise with Cr");
+        assert!(more_u[2] > neutral[2] + 0.1, "B must rise with Cb");
+    }
 
     /// The pinned FFmpeg CLI from tools/bootstrap-ffmpeg.ps1 (same tree the
     /// `video` feature links against). None → skip fixture generation.

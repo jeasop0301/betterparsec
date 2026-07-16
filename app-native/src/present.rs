@@ -32,7 +32,8 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN,
+    DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
@@ -50,7 +51,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{Interface, PCSTR, PCWSTR, s, w};
 
 use crate::VideoShared;
-use crate::video::RgbaFrame;
+use crate::video::{DecodedFrame, Nv12Frame, RgbaFrame};
 
 /// Present failure. Fatal to the raw surface only: the caller latches
 /// the egui-texture fallback and the session keeps running.
@@ -228,6 +229,51 @@ fn compile_hlsl(src: &str, entry: PCSTR, target: PCSTR) -> Result<Vec<u8>, Prese
     }
 }
 
+/// Inline HLSL for the GPU NV12->RGB present path: the same full-screen
+/// triangle vertex shader as [`SHARPEN_HLSL`], followed by a pixel shader
+/// that samples the Y (R8) and UV (R8G8) planes and applies the
+/// decoder-supplied YUV->RGB matrix (range + offset already folded in —
+/// see [`crate::video::Nv12Frame::matrix`]).
+const NV12_HLSL: &str = r#"
+Texture2D texY : register(t0);
+Texture2D texUV : register(t1);
+SamplerState smp : register(s0);
+
+cbuffer Cb : register(b0) {
+    float4 m0;
+    float4 m1;
+    float4 m2;
+};
+
+struct VSOut {
+    float4 pos : SV_POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+VSOut VSMain(uint id : SV_VertexID) {
+    VSOut o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.uv = uv;
+    o.pos = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+    return o;
+}
+
+float4 PSMain(VSOut i) : SV_TARGET {
+    float Y = texY.Sample(smp, i.uv).r;
+    float2 uvss = texUV.Sample(smp, i.uv).rg;
+    float4 yuv1 = float4(Y, uvss.x, uvss.y, 1.0);
+    return float4(dot(m0, yuv1), dot(m1, yuv1), dot(m2, yuv1), 1.0);
+}
+"#;
+
+/// Matches the NV12 shader's `Cb` HLSL cbuffer layout (three 16-byte
+/// aligned `float4` rows — no padding needed, `[[f32; 4]; 3]` is already
+/// tightly packed and matrix-order compatible).
+#[repr(C)]
+struct Nv12CbData {
+    matrix: [[f32; 4]; 3],
+}
+
 /// D3D11 device + FLIP_DISCARD swapchain bound to the stream child HWND.
 /// Split from the thread loop so tests can drive draw/present/readback
 /// synchronously.
@@ -254,6 +300,20 @@ struct Renderer {
     sharpen_sampler: Option<ID3D11SamplerState>,
     /// `SharpenCB` constant buffer (inverse resolution + strength).
     sharpen_cbuf: Option<ID3D11Buffer>,
+    /// GPU NV12->RGB present path (additive to the RGBA `upload` path
+    /// above): DEFAULT-usage Y (`R8_UNORM`, full res) and UV
+    /// (`R8G8_UNORM`, half res) planes, their SRVs, the shared full-screen
+    /// triangle vertex shader, NV12 pixel shader, a linear-clamp sampler,
+    /// and the per-frame YUV->RGB matrix constant buffer. All lazily
+    /// created on first NV12 frame and resolution-tied like `upload`.
+    tex_y: Option<ID3D11Texture2D>,
+    tex_uv: Option<ID3D11Texture2D>,
+    srv_y: Option<ID3D11ShaderResourceView>,
+    srv_uv: Option<ID3D11ShaderResourceView>,
+    nv12_vs: Option<ID3D11VertexShader>,
+    nv12_ps: Option<ID3D11PixelShader>,
+    nv12_sampler: Option<ID3D11SamplerState>,
+    nv12_cbuf: Option<ID3D11Buffer>,
     width: u32,
     height: u32,
 }
@@ -326,6 +386,14 @@ impl Renderer {
                 sharpen_ps: None,
                 sharpen_sampler: None,
                 sharpen_cbuf: None,
+                tex_y: None,
+                tex_uv: None,
+                srv_y: None,
+                srv_uv: None,
+                nv12_vs: None,
+                nv12_ps: None,
+                nv12_sampler: None,
+                nv12_cbuf: None,
                 width,
                 height,
             })
@@ -338,6 +406,11 @@ impl Renderer {
         }
         self.upload = None; // release before ResizeBuffers
         self.upload_srv = None; // tied to the (now-stale) upload texture
+        // NV12 upload textures/SRVs are resolution-tied the same way.
+        self.tex_y = None;
+        self.tex_uv = None;
+        self.srv_y = None;
+        self.srv_uv = None;
         unsafe {
             self.swapchain
                 .ResizeBuffers(
@@ -403,6 +476,203 @@ impl Renderer {
             } else {
                 self.ctx.CopyResource(&back, &upload);
             }
+        }
+        Ok(())
+    }
+
+    /// GPU NV12->RGB present: upload the Y/UV planes, run the NV12 pixel
+    /// shader with the frame's YUV->RGB matrix straight onto the
+    /// backbuffer. Additive to [`Self::draw`] — the RGBA path above is
+    /// untouched.
+    fn draw_nv12(&mut self, frame: &Nv12Frame) -> Result<(), PresentError> {
+        let (w, h) = (frame.width as u32, frame.height as u32);
+        if w == 0
+            || h == 0
+            || frame.y.len() != frame.width * frame.height
+            || frame.uv.len() != frame.width * (frame.height / 2)
+        {
+            return Err(PresentError("bad NV12 frame dimensions".into()));
+        }
+        self.ensure_size(w, h)?;
+        unsafe {
+            // 100ms cap: a lost waitable must never stall the pipe.
+            WaitForSingleObjectEx(self.waitable, 100, false);
+
+            if self.tex_y.is_none() {
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: w,
+                    Height: h,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_R8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                    ..Default::default()
+                };
+                let mut tex = None;
+                self.device
+                    .CreateTexture2D(&desc, None, Some(&mut tex))
+                    .map_err(|e| PresentError(format!("CreateTexture2D (Y): {e}")))?;
+                self.tex_y = tex;
+                // The old SRV (if any) pointed at the texture we just
+                // replaced — never reuse it across textures.
+                self.srv_y = None;
+            }
+            if self.tex_uv.is_none() {
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: w / 2,
+                    Height: h / 2,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_R8G8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                    ..Default::default()
+                };
+                let mut tex = None;
+                self.device
+                    .CreateTexture2D(&desc, None, Some(&mut tex))
+                    .map_err(|e| PresentError(format!("CreateTexture2D (UV): {e}")))?;
+                self.tex_uv = tex;
+                self.srv_uv = None;
+            }
+            // Cloned (COM AddRef, not a copy): the borrows end here so the
+            // lazy SRV/shader creation below can take `&mut self`.
+            let tex_y = self.tex_y.clone().expect("just created");
+            let tex_uv = self.tex_uv.clone().expect("just created");
+            // Row pitch is tight: `w` bytes/row for R8 (Y) and for R8G8 at
+            // `w/2` texels (2 bytes/texel * w/2 == w bytes/row).
+            self.ctx
+                .UpdateSubresource(&tex_y, 0, None, frame.y.as_ptr().cast(), w, 0);
+            self.ctx
+                .UpdateSubresource(&tex_uv, 0, None, frame.uv.as_ptr().cast(), w, 0);
+
+            self.ensure_nv12_resources()?;
+
+            if self.srv_y.is_none() {
+                let mut srv = None;
+                self.device
+                    .CreateShaderResourceView(&tex_y, None, Some(&mut srv))
+                    .map_err(|e| PresentError(format!("CreateShaderResourceView (Y): {e}")))?;
+                self.srv_y = srv;
+            }
+            if self.srv_uv.is_none() {
+                let mut srv = None;
+                self.device
+                    .CreateShaderResourceView(&tex_uv, None, Some(&mut srv))
+                    .map_err(|e| PresentError(format!("CreateShaderResourceView (UV): {e}")))?;
+                self.srv_uv = srv;
+            }
+            let srv_y = self.srv_y.clone().expect("just created");
+            let srv_uv = self.srv_uv.clone().expect("just created");
+
+            let back: ID3D11Texture2D = self.swapchain.GetBuffer(0)?;
+            let mut rtv: Option<ID3D11RenderTargetView> = None;
+            self.device
+                .CreateRenderTargetView(&back, None, Some(&mut rtv))
+                .map_err(|e| PresentError(format!("CreateRenderTargetView: {e}")))?;
+            let rtv = rtv.ok_or_else(|| PresentError("no render target view".into()))?;
+
+            let cbuf = self.nv12_cbuf.clone().expect("ensured above");
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.ctx
+                .Map(&cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
+                .map_err(|e| PresentError(format!("Map cbuffer (NV12): {e}")))?;
+            let data = Nv12CbData {
+                matrix: frame.matrix,
+            };
+            std::ptr::copy_nonoverlapping(&data, mapped.pData.cast(), 1);
+            self.ctx.Unmap(&cbuf, 0);
+
+            let viewport = D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: w as f32,
+                Height: h as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            self.ctx.RSSetViewports(Some(&[viewport]));
+            self.ctx
+                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            self.ctx.VSSetShader(self.nv12_vs.as_ref(), None);
+            self.ctx.PSSetShader(self.nv12_ps.as_ref(), None);
+            self.ctx
+                .PSSetShaderResources(0, Some(&[Some(srv_y), Some(srv_uv)]));
+            self.ctx
+                .PSSetSamplers(0, Some(std::slice::from_ref(&self.nv12_sampler)));
+            self.ctx.PSSetConstantBuffers(0, Some(&[Some(cbuf)]));
+            self.ctx.OMSetRenderTargets(Some(&[Some(rtv)]), None);
+            self.ctx.Draw(3, 0);
+
+            // Unbind the SRVs/RTV: the next frame's UpdateSubresource on
+            // the same tex_y/tex_uv (and the next FLIP_DISCARD buffer's
+            // implicit reuse) must never race a still-bound view —
+            // debug-layer hazard otherwise (mirrors `draw_sharpen`).
+            self.ctx.PSSetShaderResources(0, Some(&[None, None]));
+            self.ctx.OMSetRenderTargets(None, None);
+        }
+        Ok(())
+    }
+
+    /// Lazily compile/create the NV12 pass's device-level resources
+    /// (shaders, sampler, constant buffer). Independent of resolution —
+    /// created once per `Renderer` and reused across frames/resizes.
+    fn ensure_nv12_resources(&mut self) -> Result<(), PresentError> {
+        if self.nv12_vs.is_some() {
+            return Ok(());
+        }
+        unsafe {
+            let vs_bytecode = compile_hlsl(NV12_HLSL, s!("VSMain"), s!("vs_5_0"))?;
+            let ps_bytecode = compile_hlsl(NV12_HLSL, s!("PSMain"), s!("ps_5_0"))?;
+
+            let mut vs = None;
+            self.device
+                .CreateVertexShader(&vs_bytecode, None, Some(&mut vs))
+                .map_err(|e| PresentError(format!("CreateVertexShader (NV12): {e}")))?;
+            let mut ps = None;
+            self.device
+                .CreatePixelShader(&ps_bytecode, None, Some(&mut ps))
+                .map_err(|e| PresentError(format!("CreatePixelShader (NV12): {e}")))?;
+
+            let sampler_desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                ComparisonFunc: D3D11_COMPARISON_NEVER,
+                MaxLOD: f32::MAX,
+                ..Default::default()
+            };
+            let mut sampler = None;
+            self.device
+                .CreateSamplerState(&sampler_desc, Some(&mut sampler))
+                .map_err(|e| PresentError(format!("CreateSamplerState (NV12): {e}")))?;
+
+            let cbuf_desc = D3D11_BUFFER_DESC {
+                ByteWidth: size_of::<Nv12CbData>() as u32,
+                Usage: D3D11_USAGE_DYNAMIC,
+                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                ..Default::default()
+            };
+            let mut cbuf = None;
+            self.device
+                .CreateBuffer(&cbuf_desc, None, Some(&mut cbuf))
+                .map_err(|e| PresentError(format!("CreateBuffer (Nv12CB): {e}")))?;
+
+            self.nv12_vs = vs;
+            self.nv12_ps = ps;
+            self.nv12_sampler = sampler;
+            self.nv12_cbuf = cbuf;
         }
         Ok(())
     }
@@ -841,14 +1111,11 @@ fn render_loop(hwnd: HWND, shared: &Arc<VideoShared>) {
             }
         };
 
+        let (fw, fh) = frame.dims();
         if renderer.is_none() {
-            match Renderer::new(hwnd, frame.width as u32, frame.height as u32) {
+            match Renderer::new(hwnd, fw, fh) {
                 Ok(r) => {
-                    tracing::info!(
-                        w = frame.width,
-                        h = frame.height,
-                        "raw D3D11 FLIP_DISCARD surface up"
-                    );
+                    tracing::info!(w = fw, h = fh, "raw D3D11 FLIP_DISCARD surface up");
                     renderer = Some(r);
                 }
                 Err(e) => {
@@ -863,14 +1130,22 @@ fn render_loop(hwnd: HWND, shared: &Arc<VideoShared>) {
         let r = renderer.as_mut().expect("initialized above");
         // Live sharpen strength from the shell UI (0..100 percent).
         r.sharpen = (shared.sharpen_pct.load(Ordering::Relaxed).min(100) as f32) / 100.0;
-        if let Err(e) = r.draw(&frame).and_then(|()| r.present()) {
+        let draw = match &frame {
+            DecodedFrame::Rgba(f) => r.draw(f),
+            DecodedFrame::Nv12(f) => r.draw_nv12(f),
+        };
+        if let Err(e) = draw.and_then(|()| r.present()) {
             // Device removed/reset etc.: retry a fresh device once per
             // frame; latch fallback only if recreation also fails.
             tracing::warn!(err = %e, "present failed — recreating device");
             renderer = None;
-            match Renderer::new(hwnd, frame.width as u32, frame.height as u32) {
+            match Renderer::new(hwnd, fw, fh) {
                 Ok(mut r) => {
-                    if r.draw(&frame).and_then(|()| r.present()).is_ok() {
+                    let draw2 = match &frame {
+                        DecodedFrame::Rgba(f) => r.draw(f),
+                        DecodedFrame::Nv12(f) => r.draw_nv12(f),
+                    };
+                    if draw2.and_then(|()| r.present()).is_ok() {
                         renderer = Some(r);
                     }
                 }

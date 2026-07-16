@@ -44,6 +44,10 @@ Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $zip -Force
 # the zip is downloadable at https://<server>:8080/betterparsec-portable.zip
 # (re-run this script after every `Copy-Item dist static` redeploy — the
 # redeploy wipes static/).
+# NOTE: the Cloudflare distribution site (betterparsec.kje12e4.workers.dev)
+# streams the zip from R2, NOT from static/ — updating that path requires
+# tools/publish-cf.ps1 (which re-runs this script, uploads to R2, deploys).
+# This script alone only refreshes the self-served :8080 copy.
 $staticDir = Join-Path $root 'static'
 if (Test-Path $staticDir) {
     Copy-Item $zip $staticDir -Force

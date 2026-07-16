@@ -1,6 +1,8 @@
 # 라이브 스모크 체크리스트 — 2026-07-16 빌드 (한 세션 최대 검증)
 
-**배포**: `https://<server>:8080/betterparsec-portable.zip` (13:38 빌드 — 오늘 전 변경 포함).
+**배포**: `https://betterparsec.kje12e4.workers.dev` (비번 게이트 다운로드 — R2, 14:10 07-16e 업로드)
+또는 `https://<server>:8080/betterparsec-portable.zip` (self-serve). **실행 후 타이틀바가
+`build 07-16e (settings + hard-disconnect)`인지 먼저 확인** — 아니면 구버전.
 **로그**: `run-incheon.bat` 실행 시 `RUST_LOG=info,betterparsec::input=debug` 자동. 스톨/이상 시 콘솔 캡처.
 
 ## ⚠️ 먼저 알 것

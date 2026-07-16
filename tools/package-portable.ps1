@@ -29,6 +29,16 @@ foreach ($f in $files) {
     'start betterparsec.exe'
 ) | Set-Content -Path (Join-Path $staging 'run-incheon.bat')
 
+# Zero-config defaults: the exe reads this next to itself and pre-fills the
+# connect form (Parsec-style — download, run, type only the password). Keep
+# the values in sync with run-incheon.bat above; the password is never baked.
+@(
+    'base_url=https://121.167.176.91:8080',
+    'username=kje12e4',
+    'host_id=2062835576',
+    'app_id=881448767'
+) | Set-Content -Path (Join-Path $staging 'betterparsec.conf')
+
 Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $zip -Force
 # Self-serve: the release web-server serves static/ at the site root, so
 # the zip is downloadable at https://<server>:8080/betterparsec-portable.zip

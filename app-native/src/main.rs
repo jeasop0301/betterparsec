@@ -50,7 +50,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
-            .with_title("BetterParsec — build 07-16c (nv12 gpu present)"),
+            .with_title("BetterParsec — build 07-16d (nv12 + prefilled connect)"),
         ..Default::default()
     };
     eframe::run_native(
@@ -418,20 +418,59 @@ struct ConnectForm {
     app_id: u32,
 }
 
+/// Deployment defaults from a `betterparsec.conf` (simple `key=value` lines)
+/// sitting next to the exe, written by `tools/package-portable.ps1`. Lets a
+/// double-clicked portable build pre-fill the connect form (Parsec-style
+/// zero-config: download, run, type only the password) without env vars or
+/// the launch `.bat`. Missing file → empty map; env vars still override.
+fn packaged_conf() -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Some(path) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("betterparsec.conf")))
+    else {
+        return map;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return map;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            map.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    map
+}
+
 impl Default for ConnectForm {
     fn default() -> Self {
+        let conf = packaged_conf();
+        // Precedence: env var (dev override) > betterparsec.conf (packaged
+        // deployment defaults) > built-in fallback. The password is never
+        // baked — it is the user's account secret, typed at connect time.
+        let text = |env: &str, key: &str, fallback: &str| -> String {
+            std::env::var(env)
+                .ok()
+                .or_else(|| conf.get(key).cloned())
+                .unwrap_or_else(|| fallback.to_string())
+        };
+        let id = |env: &str, key: &str| -> u32 {
+            std::env::var(env)
+                .ok()
+                .or_else(|| conf.get(key).cloned())
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0)
+        };
         Self {
-            base_url: std::env::var("BP_URL").unwrap_or_else(|_| "https://localhost:8080".into()),
-            username: std::env::var("BP_USER").unwrap_or_default(),
+            base_url: text("BP_URL", "base_url", "https://localhost:8080"),
+            username: text("BP_USER", "username", ""),
             password: std::env::var("BP_PASS").unwrap_or_default(),
-            host_id: std::env::var("BP_HOST_ID")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            app_id: std::env::var("BP_APP_ID")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
+            host_id: id("BP_HOST_ID", "host_id"),
+            app_id: id("BP_APP_ID", "app_id"),
         }
     }
 }

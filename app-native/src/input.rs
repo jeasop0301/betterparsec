@@ -25,16 +25,18 @@ use moonlight_common::stream::control::{
     KeyAction, KeyFlags, KeyModifiers, MouseButton, MouseButtonAction,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_LWIN,
     VK_MENU, VK_OEM_3, VK_Q, VK_RWIN, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetClientRect, HHOOK, HTCLIENT, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, SetCursor,
-    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP,
-    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    CallNextHookEx, DispatchMessageW, GetClientRect, GetMessageW, HTCLIENT, KBDLLHOOKSTRUCT,
+    LLKHF_ALTDOWN, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetCursor,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_INPUT, WM_KEYDOWN,
+    WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use crate::VideoShared;
@@ -560,12 +562,6 @@ pub fn hook_decision(vk: u32, alt_down: bool, key_up: bool, capture_on: bool) ->
     }
 }
 
-/// An `HHOOK` is a process-global handle, not tied to the installing
-/// thread (same reasoning as `cursor_icon::OwnedCursor`); wrap it so the
-/// static slot below can hold it.
-struct HookHandle(HHOOK);
-unsafe impl Send for HookHandle {}
-
 /// Per-session state the hook proc needs — stashed in [`HOOK_STATE`]
 /// because a raw `HOOKPROC` gets no user context (no lparam/closure
 /// capture, unlike `GWLP_USERDATA` for the wndproc).
@@ -576,7 +572,9 @@ struct HookShared {
 }
 
 struct HookState {
-    hook: HookHandle,
+    /// Dedicated pump-thread id — `uninstall` posts `WM_QUIT` here.
+    thread_id: u32,
+    join: Option<std::thread::JoinHandle<()>>,
     shared: HookShared,
 }
 
@@ -588,39 +586,85 @@ fn hook_state() -> &'static Mutex<Option<HookState>> {
     HOOK_STATE.get_or_init(|| Mutex::new(None))
 }
 
-/// Installs the WH_KEYBOARD_LL hook (idempotent — a second call while
-/// already installed is a no-op). **Must run on the UI thread**: a
-/// low-level hook executes in the context of the thread that installed
-/// it, and that thread must keep pumping messages (`GetMessage`/
-/// `DispatchMessage`) or the hook call adds visible system-wide input
-/// lag — the eframe main thread already does this for the window
-/// message loop, so it qualifies.
+/// Installs the WH_KEYBOARD_LL hook on a DEDICATED message-pump thread
+/// (idempotent — a second call while installed is a no-op). A low-level
+/// hook executes in the context of its installing thread; installing on
+/// the busy eframe/render thread starves callback deadlines under load
+/// and Windows then SILENTLY removes the hook (LowLevelHooksTimeout) —
+/// field report 2026-07-16: Alt+Tab stopped being swallowed during
+/// immersive while the wndproc fallbacks kept working. The dedicated
+/// thread does nothing but pump, so hook callbacks return immediately.
 pub fn install_keyboard_hook(capture: Arc<CaptureShared>, sender: InputSender) {
     let mut guard = hook_state().lock().unwrap_or_else(PoisonError::into_inner);
     if guard.is_some() {
         return;
     }
     let shared = HookShared { capture, sender };
-    let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) };
-    match hook {
-        Ok(h) => {
-            *guard = Some(HookState {
-                hook: HookHandle(h),
-                shared,
-            })
-        }
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
+    let join = std::thread::Builder::new()
+        .name("kb-hook-pump".into())
+        .spawn(move || unsafe {
+            // Force-create this thread's message queue so the WM_QUIT that
+            // uninstall posts can never race a queue that does not exist.
+            let mut msg = MSG::default();
+            let _ = PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE);
+            match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) {
+                Ok(hook) => {
+                    let _ = ready_tx.send(Ok(GetCurrentThreadId()));
+                    tracing::info!("WH_KEYBOARD_LL installed on dedicated pump thread");
+                    while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    let _ = UnhookWindowsHookEx(hook);
+                    tracing::info!("WH_KEYBOARD_LL uninstalled");
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e.to_string()));
+                }
+            }
+        });
+    let join = match join {
+        Ok(j) => j,
         Err(e) => {
+            tracing::warn!(err = %e, "keyboard hook pump thread spawn failed — Win/Alt-Tab capture unavailable");
+            return;
+        }
+    };
+    match ready_rx.recv() {
+        Ok(Ok(thread_id)) => {
+            *guard = Some(HookState {
+                thread_id,
+                join: Some(join),
+                shared,
+            });
+        }
+        Ok(Err(e)) => {
             tracing::warn!(err = %e, "SetWindowsHookExW(WH_KEYBOARD_LL) failed — Win/Alt-Tab capture unavailable");
+            let _ = join.join();
+        }
+        Err(_) => {
+            tracing::warn!("keyboard hook pump thread died during install");
+            let _ = join.join();
         }
     }
 }
 
 /// Uninstalls the hook (idempotent — safe to call with none installed).
 pub fn uninstall_keyboard_hook() {
-    let mut guard = hook_state().lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(state) = guard.take() {
+    // Take the state and DROP the lock before joining: the hook proc locks
+    // the same mutex, so a key event delivered between take() and WM_QUIT
+    // would deadlock the pump thread against this join otherwise.
+    let state = {
+        let mut guard = hook_state().lock().unwrap_or_else(PoisonError::into_inner);
+        guard.take()
+    };
+    if let Some(mut state) = state {
         unsafe {
-            let _ = UnhookWindowsHookEx(state.hook.0);
+            let _ = PostThreadMessageW(state.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+        if let Some(join) = state.join.take() {
+            let _ = join.join();
         }
     }
 }

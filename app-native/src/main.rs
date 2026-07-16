@@ -81,7 +81,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
-            .with_title("BetterParsec — build 07-16g (fec-only wire dedup)"),
+            .with_title("BetterParsec — build 07-16h (hook pump thread + nv12 sharpen)"),
         ..Default::default()
     };
     eframe::run_native(
@@ -212,9 +212,15 @@ impl DecodeState {
         // Opt-in GPU NV12 present: only when the raw D3D11 path and hardware
         // decode are active (software decode yields YUV420P, not NV12). Any
         // decode error falls through to the shared IDR-request handling.
+        // Sharpen runs only in the RGBA present path (draw_sharpen); the
+        // NV12 fast path renders its own NV12→RGB shader straight to the
+        // backbuffer with no sharpen pass (field report 2026-07-16:
+        // "sharpen stopped working" with NV12 on). While sharpen is
+        // non-zero, fall back to the RGBA path so the slider always works.
         let want_nv12 = shared.nv12.load(Ordering::Relaxed)
             && shared.raw_present_active()
-            && shared.hw_device.load(Ordering::Relaxed);
+            && shared.hw_device.load(Ordering::Relaxed)
+            && shared.sharpen_pct.load(Ordering::Relaxed) == 0;
         let decoded = if want_nv12 {
             dec.decode_nv12(&unit.data)
                 .map(|o| o.map(video::DecodedFrame::Nv12))

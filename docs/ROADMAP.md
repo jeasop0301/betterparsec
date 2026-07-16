@@ -419,7 +419,7 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   (709/601/2020 + full/limited, 미지정 시 ≥720p→709 폴백). 순수 `sws_cs_for`/
   `is_full_range` +2 tests, app-native 52 tests. quality-efficiency-audit.md §F.
 - [ ] **8-bit present 천장** — R8G8B8A8 스왑체인, 10-bit 디코드 절단. R10G10B10A2 필요
-- [ ] **present CPU 왕복 제거(제로카피 NV12 텍스처)** — 지연·효율, present.rs Phase B
+- [~] **present CPU 왕복 제거(제로카피 NV12 텍스처)** — [x] **opt-in 경로 완성** (2026-07-16, 01b4968 — 아래 M6 실행 버스트 ⑷): 'Fast GPU present (NV12)' 인앱 체크박스, swscale GPU→CPU→GPU 왕복 제거·8MB→3MB 업로드, 기본 off·무회귀. 잔여: [ ] 라이브 A/B + 기본 전환 판정
 
 ### 신규 capability (진짜 미구현)
 - [~] **클라 샤픈/CAS 셰이더** — [x] **기계 완성** (2026-07-16 새벽, 헤드리스
@@ -648,6 +648,16 @@ exclusive, Raw 입력. 웹 클라는 간편/호환 티어로 유지(동일 백�
 - [ ] CUVID `ulMaxDisplayDelay=0` + `FLIP_DISCARD`/`ALLOW_TEARING`/waitable(1)
   프레젠트 + WASAPI exclusive + RawInputBuffer/GameInput
 - [ ] (장기) Rust 네이티브(nvcodec-rs+wgpu+windows-rs) 전환 판단
+- [~] **네이티브 클라 실행 버스트 + 인천 배포판 패키징** (2026-07-16 오전, 헤드리스 빌드·검증 — 7커밋 9f2912b…9def901, 워킹트리 클린): 인천 물리 모니터 필드 배포를 겨냥한 app-native 실행 묶음.
+  ⑴ **한글 IME 수리**(21943ce): 스트림 자식 HWND의 IME 컨텍스트 분리(`ImmAssociateContext(NULL)`)로 클라측 조합을 막아 raw Win32 VK 키다운이 와이어로 직행 → 호스트 IME가 한글 조합(웹의 브라우저-IME 억제와 동치). `Win32_UI_Input_Ime` 피처 추가.
+  ⑵ **immersive OS 리드백 웨지 수리**(8a41f52): 상태머신이 `viewport().fullscreen/focused` OS 리드백을 캡처 게이트로 삼아 필드 클라에서 리드백이 영영 true로 안 뒤집혀 Entering에 영구 갇힘(전체화면은 됐으나 캡처·자식 리사이즈 무발 = immersive가 no-op처럼). 리드백 게이트 제거 → fullscreen 요청 후 1 settle 프레임에 Engage, 이탈은 명시 토글/Ctrl+Alt+Shift+Q 해치만(LL 훅이 이미 Win/Alt-Tab 삼켜서 focus-loss 자동이탈은 중복·오탈출 원인이라 제거). 매프레임 커서 재클립이 지오메트리 보정 + immersive 전체화면 사이징(자식을 `screen_rect` 풀윈도, 비immersive는 뷰포트 aspect-fit). Alt+Tab 수리(c688881): LL 훅 modifier를 GetKeyState 대신 `LLKHF_ALTDOWN`+GetAsyncKeyState로.
+  ⑶ **프레젠트 지연 바운드**(c688881): 프레임 펌프가 매 이터레이션 큐를 비우고(`try_pop`/`try_frame`) 스테일 유닛은 `Decoder::decode_drop`(receive+unref만, download/convert 없음 — P프레임 참조체인 유지)로 넘긴 뒤 **최신 유닛만** convert·present. HW 디코드가 60fps를 쉽게 버텨서 참조는 안 밀림 → convert/present가 아무리 밀려도 프레젠트 지연은 1프레임 고정(기존 16-deep FIFO 백업 ~266ms→IDR 플러시 히칭 해소). fps 리드아웃은 이제 실 present 레이트 반영.
+  ⑷ **NV12 GPU 프레젠트 경로**(01b4968, opt-in): `decode_nv12`가 d3d11va NV12 평면 타이트 복사 + YUV→RGB 매트릭스(709/601/2020+range) Rust 산출 → Y(R8)+UV(R8G8) 텍스처 업로드 + 셰이더 변환(CPU swscale 없음, ~3MB). `DecodedFrame`이 RGBA/NV12 양형 운반, 'Fast GPU present (NV12)' 체크박스(기본 off, raw+HW 둘 다 활성 시만) — 검증된 RGBA 경로 기본·무회귀. 색매트릭스 그레이스케일축·크로마 부호 유닛테스트. **M3 "present CPU 왕복 제거" [~]로.**
+  ⑸ **WASAPI exclusive 오디오**(13283aa, opt-in `BP_AUDIO_EXCLUSIVE=1`): 이벤트 구동 전용 스레드(thread::scope, 디바이스 이벤트 대기) 렌더, init 실패(포맷/AUDCLNT_E_*/이벤트) 시 shared 폴링으로 폴백(오디오 무사망). shared 버퍼 지연 절감 지반 — 인앱 토글 전까지 opt-in(필드 클라 env 불가). + `frame_to_rgba` 매프레임 8MB `vec![0u8;…]` memset 낭비 제거(reserve+set_len).
+  ⑹ **샤픈 인앱 슬라이더**(9f2912b): `VideoShared.sharpen_pct`를 present 스레드가 라이브 리드, egui 슬라이더 — 스크립트/env 없이 원격 샤픈 A/B(M3 샤픈 "강도 라이브 튜닝" 잔여 해소, `BP_SHARPEN`은 기본 시드 유지).
+  ⑺ **제로컨피그 접속폼 프리필**(9def901): 더블클릭 배포 exe가 localhost·빈 user/host/app로 열려 접속 실패 상습 원인이던 것 수리 — `ConnectForm::default`가 exe 옆 `betterparsec.conf`(key=value, package-portable.ps1 생성) 읽음, 우선순위 env>conf>기본, **비밀번호는 절대 굽지 않음**(사용자 타이핑). 다운로드 즉시 전부 프리필, 사용자는 비번만.
+  **배포 산출물**(09:36, 커밋과 동시): `tools/package-portable.ps1`이 exe+FFmpeg DLL+`run-incheon.bat`+`betterparsec.conf`를 zip → `static/betterparsec-portable.zip`(65MB)로 복사, 가동 중 web-server가 `https://<server>:8080/betterparsec-portable.zip` 자가 배포. 정식 빌드 = `cargo build --release -p app-native --features video`.
+  **잔여(전부 라이브 게이트, owner·인천 물리 모니터)**: ①한글 IME 입력 ②immersive 게임 세션(웨지 수리 후) ③present 지연 히칭 소멸 ④WASAPI exclusive 오디오 A/B(체감 지연) ⑤NV12 fast-present A/B ⑥host-authority 호버 단일커서. 인앱 오디오 exclusive 토글은 라이브 판정 후 추가 후보.
 - **검증:** Gate C 외부 input-to-photon 계측으로 LAN 120Hz G2G 8–12ms 가설
   (리서치 05 §3) 검증. 착수 조건 없음(owner 티어 판정으로 must-do) — 단 지연
   우위 **대외 주장**은 Gate C 통과 후.

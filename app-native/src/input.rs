@@ -27,7 +27,7 @@ use moonlight_common::stream::control::{
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_LWIN,
-    VK_MENU, VK_Q, VK_RWIN, VK_SHIFT, VK_TAB,
+    VK_MENU, VK_OEM_3, VK_Q, VK_RWIN, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetClientRect, HHOOK, HTCLIENT, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, SetCursor,
@@ -66,6 +66,11 @@ pub struct CaptureShared {
     /// so the sidebar "Exit immersive" button is unreachable — this is
     /// the only way out.
     exit_requested: AtomicBool,
+    /// Set by the hard-disconnect hotkey (Ctrl+Alt+`, Parsec parity) —
+    /// hook or wndproc path; the shell consumes it once per frame and
+    /// tears the whole session down (same path as the Disconnect
+    /// button), so a fullscreen stream can never trap the user.
+    disconnect_requested: AtomicBool,
 }
 
 impl CaptureShared {
@@ -88,6 +93,18 @@ impl CaptureShared {
     /// tick. The shell calls this once per frame (main.rs).
     pub fn take_exit_requested(&self) -> bool {
         self.exit_requested.swap(false, Ordering::AcqRel)
+    }
+
+    /// Requests a full session disconnect (Ctrl+Alt+` — hook thread or
+    /// wndproc, same-process atomic).
+    pub fn request_disconnect(&self) {
+        self.disconnect_requested.store(true, Ordering::Release);
+    }
+
+    /// Consumes a pending disconnect request; the shell calls this once
+    /// per frame and folds it into the Disconnect-button path.
+    pub fn take_disconnect_requested(&self) -> bool {
+        self.disconnect_requested.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -325,6 +342,17 @@ fn is_wndproc_escape(
     relative && matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN) && vk == VK_Q.0 && ctrl && alt && shift
 }
 
+/// Pure predicate for the session hard-disconnect hotkey Ctrl+Alt+`
+/// (`VK_OEM_3` — Parsec parity): key-down with Ctrl+Alt held,
+/// shift-agnostic, and NOT gated on capture — it must work in fullscreen
+/// immersive AND in a plain windowed session whenever the stream child
+/// has focus, hook installed or not. The shell folds the request into
+/// the Disconnect-button teardown, so a fullscreen stream can never
+/// trap the user.
+fn is_disconnect_combo(msg: u32, vk: u16, ctrl: bool, alt: bool) -> bool {
+    matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN) && vk == VK_OEM_3.0 && ctrl && alt
+}
+
 /// Window-message hook called from the stream surface wndproc (UI
 /// thread). `Some(_)` = handled (message consumed — also suppresses the
 /// Alt/F10 system-menu default for SYSKEY messages).
@@ -398,6 +426,19 @@ pub fn handle(
         release_sticky_keys(&ctx.sender);
         return Some(LRESULT(0)); // consume Q; do not forward it to the host
     }
+    // Hard disconnect (Ctrl+Alt+`): tears the whole session down via the
+    // shell (same as the Disconnect button) — the always-available way
+    // out of a fullscreen stream, Parsec-style.
+    if is_disconnect_combo(
+        msg,
+        wparam.0 as u16,
+        unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0,
+        unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } < 0,
+    ) {
+        release_sticky_keys(&ctx.sender);
+        ctx.capture.request_disconnect();
+        return Some(LRESULT(0)); // consume ` — never forward it
+    }
 
     // Focus and drag-capture side effects first.
     match msg {
@@ -449,6 +490,8 @@ pub enum HookAction {
     SwallowForward,
     /// The Ctrl+Alt+Shift+Q escape hatch fired.
     ExitImmersive,
+    /// The Ctrl+Alt+` hard-disconnect hotkey fired (Parsec parity).
+    Disconnect,
 }
 
 /// Pure Keyboard Lock decision table (unit-tested, no Win32).
@@ -476,6 +519,15 @@ pub fn hook_decision(vk: u32, alt_down: bool, key_up: bool, capture_on: bool) ->
     if vk == VK_Q.0 as u32 {
         return if !key_up && alt_down {
             HookAction::ExitImmersive
+        } else {
+            HookAction::Pass
+        };
+    }
+    if vk == VK_OEM_3.0 as u32 {
+        // Ctrl+Alt+` hard disconnect (Parsec parity). `alt_down` carries
+        // the Ctrl+Alt condition (shift-agnostic) for this vk.
+        return if !key_up && alt_down {
+            HookAction::Disconnect
         } else {
             HookAction::Pass
         };
@@ -573,6 +625,9 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             let shift_down = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0;
             let alt_down = if vk == VK_TAB.0 as u32 {
                 kb.flags.contains(LLKHF_ALTDOWN)
+            } else if vk == VK_OEM_3.0 as u32 {
+                // Ctrl+Alt+` hard disconnect: Ctrl+Alt, shift-agnostic.
+                kb.flags.contains(LLKHF_ALTDOWN) && ctrl_down
             } else {
                 // VK_Q escape hatch: full Ctrl+Alt+Shift combo.
                 kb.flags.contains(LLKHF_ALTDOWN) && ctrl_down && shift_down
@@ -582,6 +637,11 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                 HookAction::ExitImmersive => {
                     shared.capture.request_exit();
                     release_sticky_keys(&shared.sender);
+                    return LRESULT(1);
+                }
+                HookAction::Disconnect => {
+                    release_sticky_keys(&shared.sender);
+                    shared.capture.request_disconnect();
                     return LRESULT(1);
                 }
                 HookAction::SwallowForward => {
@@ -911,5 +971,50 @@ mod tests {
         assert!(!is_wndproc_escape(true, WM_KEYDOWN, 0x41, true, true, true));
         // Key-up (WM_KEYUP) is not a trigger edge.
         assert!(!is_wndproc_escape(true, WM_KEYUP, VK_Q.0, true, true, true));
+    }
+
+    #[test]
+    fn disconnect_combo_fires_on_ctrl_alt_backtick_keydown() {
+        assert!(is_disconnect_combo(WM_KEYDOWN, VK_OEM_3.0, true, true));
+        // Alt held makes it a syskey — same result.
+        assert!(is_disconnect_combo(WM_SYSKEYDOWN, VK_OEM_3.0, true, true));
+        // Key-up is not a trigger edge.
+        assert!(!is_disconnect_combo(WM_KEYUP, VK_OEM_3.0, true, true));
+        // Missing either modifier → no disconnect.
+        assert!(!is_disconnect_combo(WM_KEYDOWN, VK_OEM_3.0, false, true));
+        assert!(!is_disconnect_combo(WM_KEYDOWN, VK_OEM_3.0, true, false));
+        // Wrong key → no disconnect.
+        assert!(!is_disconnect_combo(WM_KEYDOWN, 0x41, true, true));
+    }
+
+    #[test]
+    fn hook_decision_disconnect_fires_on_key_down_only() {
+        assert_eq!(
+            hook_decision(VK_OEM_3.0 as u32, true, false, true),
+            HookAction::Disconnect
+        );
+        // Key-up edge, unsatisfied combo, and capture-off all pass.
+        assert_eq!(
+            hook_decision(VK_OEM_3.0 as u32, true, true, true),
+            HookAction::Pass
+        );
+        assert_eq!(
+            hook_decision(VK_OEM_3.0 as u32, false, false, true),
+            HookAction::Pass
+        );
+        assert_eq!(
+            hook_decision(VK_OEM_3.0 as u32, true, false, false),
+            HookAction::Pass
+        );
+    }
+
+    #[test]
+    fn capture_shared_disconnect_request_roundtrip() {
+        let c = CaptureShared::default();
+        assert!(!c.take_disconnect_requested());
+        c.request_disconnect();
+        assert!(c.take_disconnect_requested());
+        // Consuming clears it.
+        assert!(!c.take_disconnect_requested());
     }
 }

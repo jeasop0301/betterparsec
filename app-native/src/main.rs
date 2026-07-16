@@ -971,6 +971,11 @@ impl eframe::App for App {
                     }
                     ui.add_space(8.0);
                     let disconnect = ui.button("Disconnect").clicked();
+                    // Hard-disconnect hotkey (Ctrl+Alt+`, input.rs):
+                    // consumed once per frame; rides the same teardown
+                    // as the button — works from fullscreen immersive.
+                    #[cfg(all(windows, feature = "video"))]
+                    let disconnect = disconnect || self.capture.take_disconnect_requested();
                     // M4 Phase B: one toggle = fullscreen + RawInput
                     // relative mouse + cursor clip (immersive.rs).
                     #[cfg(all(windows, feature = "video"))]

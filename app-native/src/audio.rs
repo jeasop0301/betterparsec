@@ -3,9 +3,11 @@
 //!
 //! Opus decode through libavcodec's built-in decoder (same FFmpeg pin as
 //! video — no new native dependency) and WASAPI **shared**-mode render
-//! with a plain polling fill loop. Phase B replaces the sink with
-//! exclusive event-driven 128-frame buffers (spike §C-3); the decode
-//! half survives that switch.
+//! with a plain polling fill loop. An opt-in exclusive-mode, event-driven
+//! sink (`BP_AUDIO_EXCLUSIVE=1`, spike §C-3) is available alongside it —
+//! [`run`] falls back to the shared-mode sink on any exclusive-mode init
+//! failure, so the default remains unchanged. The decode half is shared
+//! by both sinks.
 //!
 //! The host sends opus 48 kHz stereo over an RTP track (RFC 7587, one
 //! packet per payload); `client-transport` queues raw packets in
@@ -189,15 +191,36 @@ impl Drop for OpusDecoder {
 #[cfg(windows)]
 mod sink {
     use super::AudioError;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
     use windows::Win32::Media::Audio::{
-        AUDCLNT_SHAREMODE_SHARED, IAudioClient, IAudioRenderClient, IMMDeviceEnumerator,
-        MMDeviceEnumerator, WAVEFORMATEXTENSIBLE, eConsole, eRender,
+        AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK, IAudioClient, IAudioRenderClient, IMMDeviceEnumerator,
+        MMDeviceEnumerator, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0, eConsole,
+        eRender,
     };
     use windows::Win32::System::Com::{
         CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
         CoUninitialize,
     };
-    use windows::core::GUID;
+    use windows::Win32::System::Threading::WaitForSingleObject;
+    use windows::core::{BOOL, GUID, PCWSTR};
+
+    // `windows::Win32::System::Threading::CreateEventW`'s signature takes
+    // an `Option<*const Win32::Security::SECURITY_ATTRIBUTES>`, which
+    // needs the `Win32_Security` cargo feature — not currently enabled in
+    // app-native's Cargo.toml, and this module always passes NULL there.
+    // Bind kernel32's CreateEventW directly rather than adding a feature
+    // for a parameter type we never touch (see the exclusive-mode sink
+    // below for the only caller).
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateEventW(
+            lpeventattributes: *const core::ffi::c_void,
+            bmanualreset: BOOL,
+            binitialstate: BOOL,
+            lpname: PCWSTR,
+        ) -> HANDLE;
+    }
 
     const TAG_IEEE_FLOAT: u16 = 0x0003;
     const TAG_EXTENSIBLE: u16 = 0xFFFE;
@@ -313,10 +336,189 @@ mod sink {
             }
         }
     }
+    /// Build an IEEE-float `WAVEFORMATEXTENSIBLE` for the exclusive-mode
+    /// format probe/`Initialize` call — `rate`/`channels` fixed to the
+    /// decode output so no resampling is needed on this path (module
+    /// doc: "if it gets complex, prefer to bail").
+    fn ieee_float_ext(rate: u32, channels: u16) -> WAVEFORMATEXTENSIBLE {
+        let block_align = channels * 4; // f32 = 4 bytes/sample
+        WAVEFORMATEXTENSIBLE {
+            Format: WAVEFORMATEX {
+                wFormatTag: TAG_EXTENSIBLE,
+                nChannels: channels,
+                nSamplesPerSec: rate,
+                nAvgBytesPerSec: rate * block_align as u32,
+                nBlockAlign: block_align,
+                wBitsPerSample: 32,
+                cbSize: 22, // trailing Samples + dwChannelMask + SubFormat
+            },
+            Samples: WAVEFORMATEXTENSIBLE_0 {
+                wValidBitsPerSample: 32,
+            },
+            dwChannelMask: match channels {
+                1 => 0x4, // SPEAKER_FRONT_CENTER
+                2 => 0x3, // SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT
+                _ => 0,   // unspecified; IsFormatSupported below will reject if unhappy
+            },
+            SubFormat: SUBTYPE_IEEE_FLOAT,
+        }
+    }
+
+    /// Exclusive-mode, event-driven render endpoint (opt-in via
+    /// `BP_AUDIO_EXCLUSIVE=1`). Bypasses the shared audio engine's mixer
+    /// entirely, so it owns the device outright and only accepts the one
+    /// format it was built for — [`super::run`] is expected to fall back
+    /// to [`WasapiOut`] on any [`Self::new`] failure.
+    pub struct WasapiExclusiveOut {
+        client: IAudioClient,
+        render: IAudioRenderClient,
+        event: HANDLE,
+        buffer_frames: u32,
+        pub rate: u32,
+        pub channels: u16,
+    }
+
+    // SAFETY: the interface pointers are exclusively owned by whichever
+    // single thread holds this `WasapiExclusiveOut` at a time (moved
+    // wholesale into the dedicated render thread in `run_exclusive`,
+    // never touched from elsewhere afterward) — same discipline as
+    // `OpusDecoder`'s `Send` impl above.
+    unsafe impl Send for WasapiExclusiveOut {}
+
+    impl WasapiExclusiveOut {
+        /// `channels` must match the channel count already produced by
+        /// the decode + convert stage.
+        pub fn new(channels: u16) -> Result<Self, AudioError> {
+            unsafe {
+                let enumerator: IMMDeviceEnumerator =
+                    CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+                let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
+
+                let rate = 48_000u32;
+                let wfx = ieee_float_ext(rate, channels);
+                let fmt = (&raw const wfx).cast::<WAVEFORMATEX>();
+
+                let mut client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
+                // Exclusive mode requires ppClosestMatch == NULL; anything
+                // but S_OK means the device cannot do this exact format —
+                // bail to the shared-mode fallback rather than negotiate
+                // a second format.
+                client
+                    .IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, fmt, None)
+                    .ok()
+                    .map_err(|e| {
+                        AudioError(format!(
+                            "exclusive format ({rate} Hz / {channels} ch f32) unsupported: {e}"
+                        ))
+                    })?;
+
+                let mut default_period = 0i64;
+                let mut min_period = 0i64;
+                client.GetDevicePeriod(Some(&mut default_period), Some(&mut min_period))?;
+                let mut period = min_period.max(1);
+
+                let mut rc = client.Initialize(
+                    AUDCLNT_SHAREMODE_EXCLUSIVE,
+                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                    period,
+                    period,
+                    fmt,
+                    None,
+                );
+                // WASAPI exclusive-mode contract: a misaligned period must
+                // be corrected from the device's own aligned buffer size
+                // and the client re-activated fresh — it cannot be
+                // re-initialized in place after this particular failure
+                // (MSDN "Initializing a Rendering or Capture Client").
+                if let Err(e) = &rc
+                    && e.code() == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED
+                {
+                    let frames = client.GetBufferSize()?;
+                    period = (10_000_000i64 * frames as i64 + rate as i64 - 1) / rate as i64;
+                    client = device.Activate(CLSCTX_ALL, None)?;
+                    rc = client.Initialize(
+                        AUDCLNT_SHAREMODE_EXCLUSIVE,
+                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                        period,
+                        period,
+                        fmt,
+                        None,
+                    );
+                }
+                rc.map_err(|e| AudioError(format!("exclusive Initialize failed: {e}")))?;
+
+                let event = CreateEventW(std::ptr::null(), BOOL(0), BOOL(0), PCWSTR::null());
+                if event.is_invalid() {
+                    return Err(AudioError(
+                        "CreateEventW failed for exclusive render".into(),
+                    ));
+                }
+                if let Err(e) = client.SetEventHandle(event) {
+                    let _ = CloseHandle(event);
+                    return Err(AudioError(format!("SetEventHandle failed: {e}")));
+                }
+                let buffer_frames = client.GetBufferSize()?;
+                let render: IAudioRenderClient = match client.GetService() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = CloseHandle(event);
+                        return Err(e.into());
+                    }
+                };
+                client.Start()?;
+                Ok(Self {
+                    client,
+                    render,
+                    event,
+                    buffer_frames,
+                    rate,
+                    channels,
+                })
+            }
+        }
+
+        /// Blocks up to `timeout_ms` for the device's buffer-ready event;
+        /// returns `false` on timeout so the caller can re-check `stopped`
+        /// instead of waiting forever on a device that stopped signaling.
+        pub fn wait(&self, timeout_ms: u32) -> bool {
+            unsafe { WaitForSingleObject(self.event, timeout_ms) == WAIT_OBJECT_0 }
+        }
+
+        /// Pull exactly the frames the engine is ready for
+        /// (`buffer_frames - padding`, normally the whole period right
+        /// after the event fires) from `fifo`, padding with silence on
+        /// underrun — same contract as [`WasapiOut::fill`], just without
+        /// a shared-engine mixer to hide a short write.
+        pub fn fill(&self, fifo: &mut std::collections::VecDeque<f32>) -> Result<(), AudioError> {
+            let ch = self.channels as usize;
+            unsafe {
+                let padding = self.client.GetCurrentPadding()?;
+                let frames = self.buffer_frames.saturating_sub(padding) as usize;
+                if frames == 0 {
+                    return Ok(());
+                }
+                let buf = self.render.GetBuffer(frames as u32)?.cast::<f32>();
+                for i in 0..frames * ch {
+                    *buf.add(i) = fifo.pop_front().unwrap_or(0.0);
+                }
+                self.render.ReleaseBuffer(frames as u32, 0)?;
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for WasapiExclusiveOut {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = self.client.Stop();
+                let _ = CloseHandle(self.event);
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
-pub use sink::{ComGuard, WasapiOut};
+pub use sink::{ComGuard, WasapiExclusiveOut, WasapiOut};
 
 // ── Format conversion (48 kHz stereo → device format) ─────────────────────
 
@@ -430,11 +632,13 @@ fn debug_delay_samples(rate: u32, channels: u16, delay_ms: u64) -> usize {
 // ── Audio thread ───────────────────────────────────────────────────────────
 
 /// Audio thread body: drain the session's opus queue, decode, fill the
-/// default render endpoint. Returns when `stopped` is set. A dead render
-/// device (init failure or mid-session invalidation — e.g. the default
-/// endpoint switching when a Parsec virtual device attaches) drops the
-/// sink and retries every [`SINK_RETRY`]; packets are received-and-dropped
-/// meanwhile (keeps the sample queue from backing up).
+/// default render endpoint. Returns when `stopped` is set.
+///
+/// `BP_AUDIO_EXCLUSIVE=1` (opt-in) tries the exclusive, event-driven
+/// [`WasapiExclusiveOut`] sink first; any init failure — unsupported
+/// format, `AUDCLNT_E_*`, event setup — falls back to [`run_shared`], the
+/// default WASAPI **shared**-mode path, so audio always works. Unset (or
+/// any other value) goes straight to [`run_shared`].
 #[cfg(windows)]
 pub fn run(core: &RxCore, shared: &AudioShared, stopped: &AtomicBool) {
     let _com = ComGuard::init();
@@ -450,6 +654,54 @@ pub fn run(core: &RxCore, shared: &AudioShared, stopped: &AtomicBool) {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
+    let mut dec = match OpusDecoder::new() {
+        Ok(d) => Some(d),
+        Err(e) => {
+            // Decoder init cannot recover by retry — audio stays off.
+            tracing::error!(err = %e, "opus decoder init failed — audio off");
+            shared.state.store(AUDIO_FAILED, Ordering::Release);
+            None
+        }
+    };
+
+    if std::env::var("BP_AUDIO_EXCLUSIVE").as_deref() == Ok("1") {
+        const DECODED_CHANNELS: u16 = 2;
+        match WasapiExclusiveOut::new(DECODED_CHANNELS) {
+            Ok(out) => {
+                if run_exclusive(core, shared, stopped, out, &mut dec, delay_ms) {
+                    return;
+                }
+                tracing::warn!(
+                    "WASAPI exclusive render failed mid-session — falling back to shared mode"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    "BP_AUDIO_EXCLUSIVE=1 requested but exclusive init failed — falling back to shared mode"
+                );
+            }
+        }
+    }
+
+    run_shared(core, shared, stopped, dec, delay_ms);
+}
+
+/// Default WASAPI **shared**-mode path: fill the shared audio engine via
+/// a plain polling loop. Returns when `stopped` is set. A dead render
+/// device (init failure or mid-session invalidation — e.g. the default
+/// endpoint switching when a Parsec virtual device attaches) drops the
+/// sink and retries every [`SINK_RETRY`]; packets are received-and-dropped
+/// meanwhile (keeps the sample queue from backing up). Also the fallback
+/// target when the opt-in exclusive path (see [`run`]) fails.
+#[cfg(windows)]
+fn run_shared(
+    core: &RxCore,
+    shared: &AudioShared,
+    stopped: &AtomicBool,
+    mut dec: Option<OpusDecoder>,
+    delay_ms: u64,
+) {
     // Device-format FIFO between decode and fill; ~250 ms cap (+ debug
     // delay), drop oldest (latency beats continuity for realtime audio).
     let mut fifo: VecDeque<f32> = VecDeque::new();
@@ -484,22 +736,13 @@ pub fn run(core: &RxCore, shared: &AudioShared, stopped: &AtomicBool) {
 
     let mut out = build_sink(&mut fifo, &mut fifo_cap);
     shared.state.store(
-        if out.is_some() {
+        if out.is_some() && dec.is_some() {
             AUDIO_RUNNING
         } else {
             AUDIO_FAILED
         },
         Ordering::Release,
     );
-    let mut dec = match OpusDecoder::new() {
-        Ok(d) => Some(d),
-        Err(e) => {
-            // Decoder init cannot recover by retry — audio stays off.
-            tracing::error!(err = %e, "opus decoder init failed — audio off");
-            shared.state.store(AUDIO_FAILED, Ordering::Release);
-            None
-        }
-    };
 
     loop {
         match core.wait_audio(Duration::from_millis(20)) {
@@ -558,6 +801,120 @@ pub fn run(core: &RxCore, shared: &AudioShared, stopped: &AtomicBool) {
             }
         }
     }
+}
+
+/// Exclusive-mode path (`BP_AUDIO_EXCLUSIVE=1`, see [`run`]): a dedicated
+/// render thread blocks on the WASAPI buffer-ready event (via
+/// [`std::thread::scope`] so it can safely borrow `shared`/`stopped`
+/// without a `'static` bound) while this thread keeps draining and
+/// decoding the opus queue exactly like [`run_shared`], handing decoded
+/// PCM to the render thread through a small mutex-guarded FIFO.
+///
+/// No mid-session retry here (unlike [`run_shared`]'s `SINK_RETRY`
+/// rebuild loop) — a fatal render error just ends the exclusive attempt
+/// and the caller falls back to shared mode, which does its own retries.
+///
+/// Returns `true` when `stopped` ended the session cleanly (caller
+/// should return), `false` when the render thread hit a fatal error
+/// (caller should fall back to [`run_shared`]).
+#[cfg(windows)]
+fn run_exclusive(
+    core: &RxCore,
+    shared: &AudioShared,
+    stopped: &AtomicBool,
+    out: WasapiExclusiveOut,
+    dec: &mut Option<OpusDecoder>,
+    delay_ms: u64,
+) -> bool {
+    let rate = out.rate;
+    let channels = out.channels;
+    tracing::info!(rate, ch = channels, "WASAPI exclusive render up");
+    shared.state.store(AUDIO_RUNNING, Ordering::Release);
+
+    // Device-format FIFO between decode and fill; same ~250 ms cap policy
+    // as run_shared's build_sink, shared across the two threads below.
+    let fifo = std::sync::Mutex::new(VecDeque::<f32>::new());
+    let fifo_cap = rate as usize / 4 * channels as usize;
+    if delay_ms > 0 {
+        let silence = debug_delay_samples(rate, channels, delay_ms);
+        fifo.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(std::iter::repeat_n(0.0f32, silence));
+        tracing::info!(delay_ms, samples = silence, "audio debug delay armed");
+    }
+    let failed = AtomicBool::new(false);
+    // `move` below must only take ownership of `out`; `fifo`/`failed` stay
+    // owned by this function and are shared with the render thread as
+    // plain references (both outlive the scope, so this borrows fine).
+    let fifo_ref = &fifo;
+    let failed_ref = &failed;
+
+    std::thread::scope(|s| {
+        // Render thread: owns `out` outright (it is not `Sync`; see its
+        // `Send` impl in the sink module) and is the only caller of
+        // `wait`/`fill` for the rest of this function's lifetime.
+        s.spawn(move || {
+            loop {
+                if stopped.load(Ordering::Acquire) {
+                    return;
+                }
+                // Poll interval bounds worst-case shutdown latency; a
+                // healthy device signals well under this every period.
+                if !out.wait(50) {
+                    continue;
+                }
+                let mut f = fifo_ref
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let r = out.fill(&mut f);
+                drop(f);
+                if let Err(e) = r {
+                    tracing::error!(err = %e, "WASAPI exclusive fill failed");
+                    shared.state.store(AUDIO_FAILED, Ordering::Release);
+                    failed_ref.store(true, Ordering::Release);
+                    return;
+                }
+            }
+        });
+
+        // Decode/produce thread: this thread. Mirrors run_shared's
+        // packet loop, minus the per-iteration fill call (the render
+        // thread above owns that).
+        let mut pcm: Vec<f32> = Vec::new();
+        loop {
+            if failed.load(Ordering::Acquire) {
+                return false;
+            }
+            match core.wait_audio(Duration::from_millis(20)) {
+                Some(pkt) => {
+                    shared.packets.fetch_add(1, Ordering::Relaxed);
+                    if let Some(d) = dec.as_mut() {
+                        pcm.clear();
+                        if let Err(e) = d.decode(&pkt, &mut pcm) {
+                            shared.decode_errors.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(err = %e, "opus decode failed — skipping packet");
+                        } else {
+                            const DECODED_CHANNELS: u16 = 2;
+                            let mut f = fifo
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            convert_into(&pcm, DECODED_CHANNELS, 48_000, rate, channels, &mut f);
+                            while f.len() > fifo_cap {
+                                f.pop_front();
+                            }
+                        }
+                    }
+                }
+                None => {
+                    if stopped.load(Ordering::Acquire) {
+                        return true;
+                    }
+                    // Closed queue returns instantly; cap the spin.
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+    })
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

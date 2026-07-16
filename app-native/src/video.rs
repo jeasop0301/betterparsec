@@ -332,7 +332,11 @@ impl Decoder {
                 );
             }
 
-            let mut rgba = vec![0u8; w as usize * h as usize * 4];
+            // Fill without the wasted zero-init: sws_scale overwrites every
+            // one of `len` bytes below (full frame, tight w*4 stride), so the
+            // per-frame 8 MB memset is pure overhead at 60 fps.
+            let len = w as usize * h as usize * 4;
+            let mut rgba: Vec<u8> = Vec::with_capacity(len);
             let dst_data: [*mut u8; 4] = [
                 rgba.as_mut_ptr(),
                 ptr::null_mut(),
@@ -352,6 +356,10 @@ impl Decoder {
             if rc < 0 {
                 return Err(DecodeError(format!("sws_scale: {}", err_str(rc))));
             }
+            // SAFETY: sws_scale returned >= 0 above, so it wrote all `len`
+            // destination bytes; the capacity was reserved for exactly `len`.
+            #[allow(clippy::uninit_vec)]
+            rgba.set_len(len);
             Ok(RgbaFrame {
                 width: w as usize,
                 height: h as usize,

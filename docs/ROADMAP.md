@@ -582,7 +582,20 @@ UDP 차단 망에서는 접속 자체가 실패하고 WARP(1.1.1.1)로만 우회
   유지(auto-switch는 relative 플래그+클립만 토글). input.rs 무변경(기존
   `capture.relative()` 분기가 절대/상대 전환을 이미 처리). present.rs
   `release_cursor_clip`(ClipCursor(None)) 추가. app-native 50 tests.
-  잔여 = 라이브 판정(물리 모니터 게임 세션).
+  잔여 = 라이브 판정(물리 모니터 게임 세션). **필드 버그 수리** (2026-07-16,
+  owner 라이브 리포트 — 헤드리스 검증, cef622a): ⑴ **Alt(및 Ctrl/Shift/Win)
+  스턱** — 탈출 시 스트림 child가 포커스를 잃어 물리 key-up이 와이어에 못
+  닿으면 호스트가 모디파이어를 latch(해치 Ctrl+Alt+Shift+Q는 그 셋, Alt+Tab은
+  Alt). `input::release_sticky_keys(sender)`가 Alt/Ctrl/Shift/Win/Tab/Q key-up
+  강제 — 훅 ExitImmersive·wndproc 탈출·WM_KILLFOCUS·사이드바 Exit(main.rs
+  Release) 전 경로에서 호출. ⑵ **전체화면 갇힘→앱 강제종료** — 해치가 LL 훅에만
+  있었는데 `SetWindowsHookExW`는 실패 시 warn만 하고 진행 → 훅 실패면 클립된
+  커서로 완전히 갇힘. 훅-독립 탈출(`is_wndproc_escape`, 순수+6 tests) 추가 —
+  캡처된 child가 포커스 보유 시 Ctrl+Alt+Shift+Q가 wndproc에서도 발화(훅 정상
+  시 Q를 먼저 삼켜 이중발화 없음). ⑶ **진짜 포커스 상실**(실패 훅으로 Alt+Tab
+  이탈·시스템 다이얼로그·UAC) — 캡처된 child의 WM_KILLFOCUS가 sticky 키 해제 +
+  immersive 탈출 요청(커서 언클립). app-native 55 tests. 잔여 관찰 = 스톨 중
+  UI 스레드 자체가 얼면 인앱 탈출 불가는 별개 신뢰성 축(스톨 근원).
 - [x] **웹 UI/UX 폴리시 패스** (2026-07-16 새벽, task 병렬 — owner
   "moonlight-web 느낌 너무 구리고 불편" 대응): 타이포 스케일(14px UI
   베이스, h1/h2/h3 위계, 전역 text-shadow 제거), 유휴 네온 글로우
@@ -657,7 +670,7 @@ exclusive, Raw 입력. 웹 클라는 간편/호환 티어로 유지(동일 백�
   ⑹ **샤픈 인앱 슬라이더**(9f2912b): `VideoShared.sharpen_pct`를 present 스레드가 라이브 리드, egui 슬라이더 — 스크립트/env 없이 원격 샤픈 A/B(M3 샤픈 "강도 라이브 튜닝" 잔여 해소, `BP_SHARPEN`은 기본 시드 유지).
   ⑺ **제로컨피그 접속폼 프리필**(9def901): 더블클릭 배포 exe가 localhost·빈 user/host/app로 열려 접속 실패 상습 원인이던 것 수리 — `ConnectForm::default`가 exe 옆 `betterparsec.conf`(key=value, package-portable.ps1 생성) 읽음, 우선순위 env>conf>기본, **비밀번호는 절대 굽지 않음**(사용자 타이핑). 다운로드 즉시 전부 프리필, 사용자는 비번만.
   **배포 산출물**(09:36, 커밋과 동시): `tools/package-portable.ps1`이 exe+FFmpeg DLL+`run-incheon.bat`+`betterparsec.conf`를 zip → `static/betterparsec-portable.zip`(65MB)로 복사, 가동 중 web-server가 `https://<server>:8080/betterparsec-portable.zip` 자가 배포. 정식 빌드 = `cargo build --release -p app-native --features video`.
-  **잔여(전부 라이브 게이트, owner·인천 물리 모니터)**: ①한글 IME 입력 ②immersive 게임 세션(웨지 수리 후) ③present 지연 히칭 소멸 ④WASAPI exclusive 오디오 A/B(체감 지연) ⑤NV12 fast-present A/B ⑥host-authority 호버 단일커서. **인앱 exclusive 오디오 토글 완성** (2026-07-16, 후속 커밋 — `AudioShared::exclusive` 아톰 + App `audio_exclusive`(env `BP_AUDIO_EXCLUSIVE` 시드) + 사이드바 체크박스 "Exclusive audio (low latency, reconnect to apply)", `Running::start`가 스레드 스폰 전 시드, cargo check 클린): **원 로드맵의 "토글은 판정 후" 순서는 오판** — 배포 exe는 더블클릭이라 env 불가 = 토글 없이는 필드에서 exclusive 자체를 못 켜므로 토글이 판정의 **전제조건**. 잔여 튜닝: FIFO 캡이 shared/exclusive 공통 250ms(`rate/4*ch`)라 exclusive에서도 버스트 시 250ms까지 적체 가능 — 저지연 취지상 exclusive 캡 축소(예 30–50ms) 후보. **필드 반영엔 release 재빌드 + package-portable 재실행 필요.**
+  **잔여(전부 라이브 게이트, owner·인천 물리 모니터)**: ①한글 IME 입력 ②immersive 게임 세션(웨지 수리 후) ③present 지연 히칭 소멸 ④WASAPI exclusive 오디오 A/B(체감 지연) ⑤NV12 fast-present A/B ⑥host-authority 호버 단일커서 ⑦immersive Alt-스턱·탈출 수리(위 immersive 항). **인앱 exclusive 오디오 토글 완성** (2026-07-16 f5ada37 — `AudioShared::exclusive` 아톰 + App `audio_exclusive`(env `BP_AUDIO_EXCLUSIVE` 시드) + 사이드바 체크박스, `Running::start`가 스레드 스폰 전 시드): **원 로드맵의 "토글은 판정 후" 순서는 오판** — 배포 exe는 더블클릭이라 env 불가 = 토글 없이는 필드에서 exclusive 자체를 못 켜므로 토글이 판정의 **전제조건**. **exclusive FIFO 캡 40ms 축소 완료** (cef622a — 기존 shared/exclusive 공통 250ms(`rate/4*ch`)라 exclusive에서도 버스트 시 250ms 적체하던 것을 exclusive만 40ms로, run_shared 250ms 불변, +1 test). **필드 zip 재빌드·재배포 완료(11:42)**: IME·immersive 웨지·present 바운드·NV12·exclusive 오디오 토글·immersive 스턱/탈출 수리 전부 포함. **설정 통합 방향** = docs/design/config-model.md(제로컨피그 북극성 + 프리셋 + BP_* env→인앱 토글 이관 + 호스트 설정 통합).
 - **검증:** Gate C 외부 input-to-photon 계측으로 LAN 120Hz G2G 8–12ms 가설
   (리서치 05 §3) 검증. 착수 조건 없음(owner 티어 판정으로 must-do) — 단 지연
   우위 **대외 주장**은 Gate C 통과 후.

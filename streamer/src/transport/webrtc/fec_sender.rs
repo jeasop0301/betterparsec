@@ -20,7 +20,7 @@ use tokio::{
     sync::{Mutex, Notify, mpsc},
     task,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 use webrtc::data_channel::RTCDataChannel;
 
 use transport_core::fec::{FecConfig, FecEncoder};
@@ -93,6 +93,7 @@ pub(crate) struct FecSenderHandle {
     queue: Arc<Mutex<VecDeque<FecFrame>>>,
     queue_notify: Arc<Notify>,
     ack_tx: mpsc::Sender<AckCmd>,
+    needs_idr: Arc<AtomicBool>,
 }
 
 impl FecSenderHandle {
@@ -117,6 +118,7 @@ impl FecSenderHandle {
             queue: queue.clone(),
             queue_notify: queue_notify.clone(),
             ack_tx,
+            needs_idr: needs_idr.clone(),
         };
 
         task::spawn(run_fec_sender(
@@ -150,12 +152,13 @@ impl FecSenderHandle {
 
     /// Enqueue a frame for FEC processing.
     ///
-    /// No-op (immediate return) when `!is_active()`.
-    /// Key frames clear the entire queue and are always accepted.
-    /// Non-key frames are silently dropped when the queue is at capacity.
-    pub(crate) async fn enqueue(&self, data: Bytes, is_key: bool, timestamp_us: u32) {
+    /// Returns `true` only when this frame was accepted. Key frames clear the
+    /// queue and are always accepted. If a non-key frame hits capacity, the
+    /// predictive chain is broken for FEC-primary clients: reject it, request
+    /// an IDR, and return `false` instead of silently claiming it was carried.
+    pub(crate) async fn enqueue(&self, data: Bytes, is_key: bool, timestamp_us: u32) -> bool {
         if !self.active.load(Ordering::Acquire) {
-            return;
+            return false;
         }
         let frame = FecFrame {
             data,
@@ -164,14 +167,10 @@ impl FecSenderHandle {
         };
         let mut guard = self.queue.lock().await;
         if is_key {
-            // INTENTIONAL TOTAL WIPE: mirrors sender.rs enqueue_frame IDR-supersede.
-            // Spec: "key frame clears the whole queue and is always accepted"
-            // (task description) + fec-framing.md §4.
-            // Blast radius: up to QUEUE_CAPACITY (4) frames, irrecoverable from FEC.
-            // Cleared frames are NOT recoverable from this queue after the call.
-            // The parallel RTP media track continues to deliver the same frames
-            // (FEC is an additive path), so no video content is lost to the user.
-            // Pre-removal logging so the affected set is observable before wipe.
+            // An IDR supersedes queued deltas. FEC-primary clients have no RTP
+            // fallback, but the keyframe itself resets the decoder reference
+            // chain, so clearing stale queued deltas is safe.
+            // Pre-removal logging keeps the affected set observable.
             let n = guard.len();
             if n > 0 {
                 debug!(
@@ -181,12 +180,15 @@ impl FecSenderHandle {
             }
             guard.clear();
         } else if guard.len() >= QUEUE_CAPACITY {
-            return;
+            self.needs_idr.store(true, Ordering::Release);
+            warn!("[FecSender] queue full — dropped delta and requested IDR");
+            return false;
         }
         // push_front + pop_back = FIFO (mirrors sender.rs enqueue_frame).
         guard.push_front(frame);
         drop(guard);
         self.queue_notify.notify_one();
+        true
     }
 
     /// Forward an `AckMsg` parsed from `video_fec_ack` to the sender task.
@@ -378,10 +380,12 @@ mod tests {
             "queue should be full"
         );
 
-        // At capacity: non-key must be rejected.
-        handle
+        // At capacity: non-key is rejected and forces reference repair.
+        let accepted = handle
             .enqueue(Bytes::from_static(b"extra_delta"), false, 0)
             .await;
+        assert!(!accepted);
+        assert!(needs_idr.load(Ordering::Acquire));
         assert_eq!(
             handle.queue.lock().await.len(),
             QUEUE_CAPACITY,
@@ -455,10 +459,9 @@ mod tests {
         assert!(q.front().unwrap().is_key);
     }
 
-    /// Non-key at capacity boundary: frame silently dropped, queue N → N.
-    /// (Boundary row: is_key=false, len==CAPACITY.)
+    /// Non-key at capacity is rejected and requests immediate IDR repair.
     #[tokio::test]
-    async fn test_non_key_at_capacity_silent_drop() {
+    async fn test_non_key_at_capacity_requests_idr() {
         let generation = Arc::new(AtomicU32::new(1));
         let needs_idr = Arc::new(AtomicBool::new(false));
         let handle = make_handle(
@@ -471,14 +474,16 @@ mod tests {
         for _ in 0..QUEUE_CAPACITY {
             handle.enqueue(Bytes::from_static(b"d"), false, 0).await;
         }
-        // One more non-key — must be dropped.
-        handle
+        // One more non-key is rejected without growing the queue.
+        let accepted = handle
             .enqueue(Bytes::from_static(b"overflow"), false, 0)
             .await;
+        assert!(!accepted);
+        assert!(needs_idr.load(Ordering::Acquire));
         assert_eq!(
             handle.queue.lock().await.len(),
             QUEUE_CAPACITY,
-            "capacity row: queue stays at QUEUE_CAPACITY, overflow frame silently dropped"
+            "capacity row: queue stays bounded while IDR repair is requested"
         );
     }
 

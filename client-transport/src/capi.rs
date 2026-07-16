@@ -91,6 +91,10 @@ impl RxCore {
     pub fn frames_delivered(&self) -> u64 {
         self.frames_delivered.load(Ordering::Relaxed)
     }
+    /// Snapshot FEC/reassembly recovery state for stall diagnostics.
+    pub fn video_stats(&self) -> transport_core::video_rx::VideoReceiverStats {
+        lock_ignore_poison(&self.rx).stats()
+    }
 
     /// Latch a needs-IDR request from the decode side. Collapses with the
     /// receiver/overflow flags into the next [`RxCore::poll_needs_idr`].

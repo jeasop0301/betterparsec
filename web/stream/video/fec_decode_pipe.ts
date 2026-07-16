@@ -42,6 +42,7 @@ export interface FecDecodePipeOptions {
 // seqs (recovered vs directly received) contributed to a completed frame.
 export interface FecDecodePipeStats extends FecDecoderStats {
     framesRecovered: number
+    framesDroppedAwaitingIdr: number
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────
@@ -75,6 +76,7 @@ export class FecDecodePipe implements DataPipe {
     private decoder: FecDecoder
 
     private framesRecovered = 0
+    private framesDroppedAwaitingIdr = 0
     // Reassembly state
     private pending = new Map<number, PendingFrame>()
     // Eviction order — insertion-ordered frame_ids
@@ -82,6 +84,9 @@ export class FecDecodePipe implements DataPipe {
 
     // needsIdr flag
     private needsIdr = false
+    // Unrecoverable loss invalidates predictive references. Delta frames stay
+    // gated until a keyframe arrives, avoiding persistent decoder mushing.
+    private awaitingIdr = false
 
     // Duration tracking (mirrors DepacketizeVideoPipe)
     private lastTimestampUs = 0
@@ -189,7 +194,11 @@ export class FecDecodePipe implements DataPipe {
     /** Snapshot of recovery/loss-span counters accumulated so far. Returns a
      * fresh copy; safe to call at any time. */
     getStats(): FecDecodePipeStats {
-        return { ...this.decoder.getStats(), framesRecovered: this.framesRecovered }
+        return {
+            ...this.decoder.getStats(),
+            framesRecovered: this.framesRecovered,
+            framesDroppedAwaitingIdr: this.framesDroppedAwaitingIdr,
+        }
     }
 
     // ── Private helpers ───────────────────────────────────────────────────
@@ -215,6 +224,7 @@ export class FecDecodePipe implements DataPipe {
                 const evictId = this.pendingOrder.shift()!
                 this.pending.delete(evictId)
                 this.needsIdr = true
+                this.awaitingIdr = true
             }
             frame = {
                 frameType,
@@ -239,8 +249,20 @@ export class FecDecodePipe implements DataPipe {
         }
     }
 
-    /** Concatenate all parts and call submitDecodeUnit. */
+    /** Concatenate a complete frame and submit it when its references are safe. */
     private assembleFrame(frameId: number, frame: PendingFrame): void {
+        // Remove first so a gated delta cannot leak pending state.
+        this.pending.delete(frameId)
+        const pendingIdx = this.pendingOrder.indexOf(frameId)
+        if (pendingIdx >= 0) this.pendingOrder.splice(pendingIdx, 1)
+
+        if (this.awaitingIdr && frame.frameType !== 1) {
+            this.framesDroppedAwaitingIdr++
+            return
+        }
+        if (frame.frameType === 1) {
+            this.awaitingIdr = false
+        }
         // Concatenate fragments
         let totalLen = 0
         for (let i = 0; i < frame.chunkCount; i++) {
@@ -270,24 +292,18 @@ export class FecDecodePipe implements DataPipe {
         }
         this.base.submitDecodeUnit(unit)
 
-        // Remove from pending
-        this.pending.delete(frameId)
-        const idx = this.pendingOrder.indexOf(frameId)
-        if (idx >= 0) this.pendingOrder.splice(idx, 1)
     }
 
     /**
-     * A LossSpan [fromSeq, toSeqExclusive) means those source seqs are gone.
-     * Any pending frame whose chunks include seqs in that span is undecodable.
-     * We drop all pending frames (conservative: we don't track per-chunk seqs)
-     * and set needsIdr.
+     * A LossSpan means source seqs are unrecoverably gone. This invalidates
+     * predictive references even if the lost frame contributed no chunks and
+     * `pending` is empty. Request an IDR and gate deltas until it arrives.
      */
     private handleLossSpan(_from: number, _to: number): void {
-        if (this.pending.size > 0) {
-            this.pending.clear()
-            this.pendingOrder.length = 0
-            this.needsIdr = true
-        }
+        this.pending.clear()
+        this.pendingOrder.length = 0
+        this.needsIdr = true
+        this.awaitingIdr = true
     }
 
     /**

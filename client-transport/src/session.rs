@@ -453,7 +453,18 @@ async fn run_session(
                 match dog.tick(now_ms()) {
                     Some(WatchdogAction::Stall) => {
                         watchdog_status.stalled.store(true, Ordering::Release);
-                        warn!("stall watchdog: no frames delivered — indicator up");
+                        let fec = core.video_stats();
+                        warn!(
+                            frames_delivered = core.frames_delivered(),
+                            source_symbols = fec.source_symbols_received,
+                            repair_symbols = fec.repair_symbols_received,
+                            symbols_recovered = fec.symbols_recovered,
+                            frames_recovered = fec.frames_recovered,
+                            deltas_gated = fec.frames_dropped_awaiting_idr,
+                            loss_spans = fec.loss_spans,
+                            loss_spans_recovered = fec.loss_spans_recovered,
+                            "stall watchdog: no frames delivered — indicator up"
+                        );
                     }
                     Some(WatchdogAction::RequestIdr { attempt }) => {
                         info!(attempt, "stall watchdog: requesting IDR via signaling");

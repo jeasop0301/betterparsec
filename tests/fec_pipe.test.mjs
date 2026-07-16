@@ -255,8 +255,9 @@ test("stats: unrecoverable gap increments lossSpans, not lossSpansRecovered", ()
     const stats = pipe.getStats()
     assert.equal(stats.lossSpans, 1, "one loss episode observed")
     assert.equal(stats.lossSpansRecovered, 0, "the episode was skipped, not healed")
-    // needs-IDR latch/clear contract is unaffected by the new counters.
-    const first = pipe.pollRequestIdr()
+    // Any unrecoverable source gap invalidates predictive references, even if
+    // the lost frame had no pending chunks.
+    assert.equal(pipe.pollRequestIdr(), true, "unrecoverable gap requests IDR")
     assert.equal(pipe.pollRequestIdr(), false, "needsIdr cleared after one poll")
 })
 

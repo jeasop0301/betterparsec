@@ -82,6 +82,9 @@ pub struct VideoReceiverStats {
     /// `used_recovery` flag accumulated in [`PendingFrame`] as chunks
     /// arrived — set at [`VideoReceiver::deliver_chunk`]).
     pub frames_recovered: u64,
+    /// Complete delta frames discarded after unrecoverable loss until the
+    /// next keyframe resets decoder reference state.
+    pub frames_dropped_awaiting_idr: u64,
     pub loss_spans: u64,
     pub loss_spans_recovered: u64,
 }
@@ -121,6 +124,10 @@ pub struct VideoReceiver {
 
     /// Latched until polled (mirrors TS `pollRequestIdr`).
     needs_idr: bool,
+    /// Unrecoverable source loss invalidates the inter-frame reference chain.
+    /// Delta frames are withheld until a keyframe arrives, preventing decoder
+    /// concealment from presenting persistent macroblock corruption.
+    awaiting_idr: bool,
 
     /// Duration tracking (mirrors DepacketizeVideoPipe / TS pipe).
     last_timestamp_us: u32,
@@ -132,6 +139,7 @@ pub struct VideoReceiver {
     /// Completed frames that used >=1 FEC-recovered symbol (see
     /// [`VideoReceiverStats::frames_recovered`]).
     frames_recovered: u64,
+    frames_dropped_awaiting_idr: u64,
 }
 
 impl VideoReceiver {
@@ -142,11 +150,13 @@ impl VideoReceiver {
             pending: HashMap::new(),
             pending_order: Vec::new(),
             needs_idr: false,
+            awaiting_idr: false,
             last_timestamp_us: 0,
             symbols_since_ack: 0,
             last_ack_time_ms: now_ms,
             last_acked_highest: None,
             frames_recovered: 0,
+            frames_dropped_awaiting_idr: 0,
         }
     }
 
@@ -205,6 +215,7 @@ impl VideoReceiver {
             repair_symbols_received: d.repair_symbols_received,
             symbols_recovered: d.symbols_recovered,
             frames_recovered: self.frames_recovered,
+            frames_dropped_awaiting_idr: self.frames_dropped_awaiting_idr,
             loss_spans: d.loss_spans,
             loss_spans_recovered: d.loss_spans_recovered,
         }
@@ -229,11 +240,13 @@ impl VideoReceiver {
         }
 
         if !self.pending.contains_key(&hdr.frame_id) {
-            // Evict oldest if at cap (TS mirror: eviction latches needs_idr).
+            // Evict oldest if at cap. Missing an assembled frame invalidates
+            // the predictive reference chain, so request and await an IDR.
             if self.pending_order.len() >= MAX_PENDING_FRAMES {
                 let evict_id = self.pending_order.remove(0);
                 self.pending.remove(&evict_id);
                 self.needs_idr = true;
+                self.awaiting_idr = true;
             }
             self.pending.insert(
                 hdr.frame_id,
@@ -274,6 +287,13 @@ impl VideoReceiver {
                 .remove(&hdr.frame_id)
                 .expect("present: just mutated");
             self.pending_order.retain(|&id| id != hdr.frame_id);
+            if self.awaiting_idr && !frame.is_key {
+                self.frames_dropped_awaiting_idr += 1;
+                return None;
+            }
+            if frame.is_key {
+                self.awaiting_idr = false;
+            }
             return Some(self.assemble_frame(hdr.frame_id, frame));
         }
         None
@@ -306,15 +326,15 @@ impl VideoReceiver {
         }
     }
 
-    /// A LossSpan means source seqs are unrecoverably gone. Any pending frame
-    /// may depend on them; we conservatively drop all pending frames (we do
-    /// not track per-chunk seqs) and latch needs_idr. TS mirror.
+    /// A LossSpan means source seqs are unrecoverably gone. This invalidates
+    /// the predictive reference chain even when every chunk of the lost frame
+    /// was absent and `pending` is empty. Drop partial frames, request an IDR,
+    /// and withhold subsequent deltas until a keyframe arrives.
     fn handle_loss_span(&mut self) {
-        if !self.pending.is_empty() {
-            self.pending.clear();
-            self.pending_order.clear();
-            self.needs_idr = true;
-        }
+        self.pending.clear();
+        self.pending_order.clear();
+        self.needs_idr = true;
+        self.awaiting_idr = true;
     }
 
     /// ACK cadence gate — called on every recovered symbol and from `tick`.
@@ -593,6 +613,28 @@ mod tests {
         assert!(!rx.poll_needs_idr(), "needs_idr cleared after one poll");
     }
 
+    #[test]
+    fn loss_without_pending_requests_idr_and_gates_deltas_until_keyframe() {
+        let mut rx = VideoReceiver::new(0);
+        rx.handle_loss_span();
+        assert!(rx.poll_needs_idr());
+
+        let delta = build_chunk_payload(1, 0, 1, false, 1_000, &[0x11]);
+        assert!(frames_of(&rx.on_message(&source_msg(0, &delta), 0)).is_empty());
+        assert_eq!(rx.stats().frames_dropped_awaiting_idr, 1);
+
+        let key = build_chunk_payload(2, 0, 1, true, 2_000, &[0x22]);
+        let key_events = rx.on_message(&source_msg(1, &key), 0);
+        let frames = frames_of(&key_events);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].is_key);
+
+        let delta = build_chunk_payload(3, 0, 1, false, 3_000, &[0x33]);
+        assert_eq!(
+            frames_of(&rx.on_message(&source_msg(2, &delta), 0)).len(),
+            1
+        );
+    }
     #[test]
     fn pending_cap_evicts_oldest_and_sets_needs_idr() {
         let mut rx = VideoReceiver::new(0);

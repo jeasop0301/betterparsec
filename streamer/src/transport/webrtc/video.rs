@@ -433,9 +433,9 @@ impl WebRtcVideo {
             && fec.is_active()
         {
             let ts_us = unit.timestamp.as_micros() as u32;
-            fec.enqueue(Bytes::copy_from_slice(&full_frame), important, ts_us)
+            fec_carried = fec
+                .enqueue(Bytes::copy_from_slice(&full_frame), important, ts_us)
                 .await;
-            fec_carried = true;
         }
 
         // FEC-primary client: the frame is already on the wire via the

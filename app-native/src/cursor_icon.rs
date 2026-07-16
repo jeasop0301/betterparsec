@@ -5,9 +5,11 @@
 //! `client_transport::cursor::CursorShared`; the shell decodes it here,
 //! builds an alpha `HCURSOR`, and the stream child's `WM_SETCURSOR`
 //! applies it instead of plain `SetCursor(NULL)` (input.rs). Opt-in via
-//! `BP_CLIENT_CURSOR=1` while the host still bakes the cursor into the
-//! video by default (`capture_cursor`); the default flip follows the
-//! host-side `capture_cursor=false` live verdict (ROADMAP cursor P2).
+//! the in-app "Client-rendered cursor" toggle (settings store), with
+//! `BP_CLIENT_CURSOR=1` as a dev override; the host still bakes the cursor
+//! into the video by default (`capture_cursor`), and the default flip
+//! follows the host-side `capture_cursor=false` live verdict (ROADMAP
+//! cursor P2).
 //!
 //! PNG decode + BGRA swizzle are pure and unit-tested headless; the
 //! `HCURSOR` build runs against real USER32/GDI (fine in headless CI

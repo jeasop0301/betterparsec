@@ -22,6 +22,7 @@ mod immersive;
 mod input;
 #[cfg(all(windows, feature = "video"))]
 mod present;
+mod settings;
 mod sunshine;
 #[cfg(feature = "video")]
 mod video;
@@ -34,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use client_transport::capi::RxCore;
 use client_transport::flow::FlowConfig;
-use client_transport::session::{H264_BIT, Session, SessionConfig, SessionState};
+use client_transport::session::{Session, SessionConfig, SessionState};
 use client_transport::tls::ServerTrust;
 #[cfg(feature = "video")]
 use transport_core::video_rx::DecodeUnit;
@@ -254,8 +255,25 @@ struct Running {
     audio_thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Effective session stream parameters (G005 S1b): derived from the
+/// settings store via `settings::to_flowconfig_fields`, folded into
+/// `FlowConfig` at connect time. Replaces the previous hardcoded
+/// bitrate_kbps=8000/width=1920/height=1080/fps=60.
+struct StreamFields {
+    bitrate_kbps: u32,
+    width: u32,
+    height: u32,
+    fps: u32,
+    supported_codecs: u32,
+}
+
 impl Running {
-    fn start(cfg: ConnectForm, audio_exclusive: bool, egui_ctx: eframe::egui::Context) -> Self {
+    fn start(
+        cfg: ConnectForm,
+        audio_exclusive: bool,
+        stream: StreamFields,
+        egui_ctx: eframe::egui::Context,
+    ) -> Self {
         #[cfg(not(all(windows, feature = "video")))]
         let _ = audio_exclusive;
         let core = Arc::new(RxCore::new(0));
@@ -278,11 +296,11 @@ impl Running {
                     app_id: cfg.app_id,
                     video_frame_queue_size: 3,
                     audio_sample_queue_size: 20,
-                    bitrate_kbps: 8000,
-                    width: 1920,
-                    height: 1080,
-                    fps: 60,
-                    supported_codecs: H264_BIT,
+                    bitrate_kbps: stream.bitrate_kbps,
+                    width: stream.width,
+                    height: stream.height,
+                    fps: stream.fps,
+                    supported_codecs: stream.supported_codecs,
                 },
             },
             core.clone(),
@@ -483,6 +501,11 @@ impl Default for ConnectForm {
 
 struct App {
     form: ConnectForm,
+    /// G005 S1b user settings store (`%APPDATA%/betterparsec/settings.json`).
+    /// Precedence slot: env(BP_*) > betterparsec.conf > THIS store >
+    /// built-in defaults. Loaded once at startup, saved on every sidebar
+    /// edit.
+    settings: settings::Settings,
     host_id_text: String,
     app_id_text: String,
     running: Option<Running>,
@@ -531,10 +554,15 @@ struct App {
 impl App {
     fn new() -> Self {
         let form = ConnectForm::default();
+        let settings = settings::load();
+        #[cfg(all(windows, feature = "video"))]
+        let client_cursor_pref = std::env::var("BP_CLIENT_CURSOR").is_ok_and(|v| v == "1")
+            || settings.client.client_cursor;
         Self {
             host_id_text: form.host_id.to_string(),
             app_id_text: form.app_id.to_string(),
             form,
+            settings,
             running: None,
             host: None,
             host_error: None,
@@ -547,7 +575,7 @@ impl App {
             #[cfg(all(windows, feature = "video"))]
             surface_failed: false,
             #[cfg(all(windows, feature = "video"))]
-            client_cursor: std::env::var("BP_CLIENT_CURSOR").is_ok_and(|v| v == "1"),
+            client_cursor: client_cursor_pref,
             #[cfg(all(windows, feature = "video"))]
             cursor_state: cursor_icon::ClientCursor::default(),
             #[cfg(all(windows, feature = "video"))]
@@ -574,6 +602,109 @@ impl App {
     #[cfg(not(all(windows, feature = "video")))]
     fn audio_exclusive_pref(&self) -> bool {
         false
+    }
+
+    /// G005 S1b: `FlowConfig`'s bitrate/width/height/fps/codecs, derived
+    /// from the settings store through the pure mode engine.
+    fn stream_fields(&self) -> StreamFields {
+        let (bitrate_kbps, width, height, fps, supported_codecs) =
+            settings::to_flowconfig_fields(&self.settings.client);
+        StreamFields {
+            bitrate_kbps,
+            width,
+            height,
+            fps,
+            supported_codecs,
+        }
+    }
+
+    /// G005 S1b sidebar: 3-way mode selector + bitrate/resolution/fps
+    /// overrides + the `BP_PRESENT_10BIT`-folding store toggle. Any change
+    /// updates the in-memory store and persists it immediately
+    /// (`settings::save`) — next connect (or a live reconnect) picks it up
+    /// via `stream_fields`/`want_10bit_pref`.
+    fn settings_panel(&mut self, ui: &mut eframe::egui::Ui) {
+        use eframe::egui;
+        let mut changed = false;
+        egui::CollapsingHeader::new("Stream settings")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Mode");
+                    egui::ComboBox::from_id_salt("stream-mode")
+                        .selected_text(match self.settings.client.mode {
+                            transport_core::mode::StreamMode::Fast => "Fast",
+                            transport_core::mode::StreamMode::Medium => "Medium",
+                            transport_core::mode::StreamMode::Quality => "Quality",
+                        })
+                        .show_ui(ui, |ui| {
+                            for (label, mode) in [
+                                ("Fast", transport_core::mode::StreamMode::Fast),
+                                ("Medium", transport_core::mode::StreamMode::Medium),
+                                ("Quality", transport_core::mode::StreamMode::Quality),
+                            ] {
+                                if ui
+                                    .selectable_value(&mut self.settings.client.mode, mode, label)
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Bitrate (kbps, 0 = mode default)");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut self.settings.client.bitrate_kbps))
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Resolution (0x0 = mode default)");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut self.settings.client.width))
+                        .changed();
+                    ui.label("x");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut self.settings.client.height))
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("FPS (0 = mode default)");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut self.settings.client.fps))
+                        .changed();
+                });
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.client.present_10bit,
+                        "10-bit present (or BP_PRESENT_10BIT=1)",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.client.client_cursor,
+                        "Client-rendered cursor (or BP_CLIENT_CURSOR=1)",
+                    )
+                    .changed();
+            });
+        if changed && let Err(e) = settings::save(&self.settings) {
+            tracing::warn!(err = %e, "settings store save failed");
+        }
+        // S1d: the live per-session flag follows the store, with the
+        // BP_CLIENT_CURSOR env override folded on top (dev-only, highest).
+        #[cfg(all(windows, feature = "video"))]
+        {
+            self.client_cursor = std::env::var("BP_CLIENT_CURSOR").is_ok_and(|v| v == "1")
+                || self.settings.client.client_cursor;
+        }
+    }
+
+    /// G005 S1b: the raw-present `want_10bit` — the store preference; the
+    /// `BP_PRESENT_10BIT` env override is folded in by `present.rs` itself
+    /// (`Renderer::new_with_10bit`), so only the store half travels here.
+    #[cfg(all(windows, feature = "video"))]
+    fn want_10bit_pref(&self) -> bool {
+        self.settings.client.present_10bit
     }
 
     /// Session teardown half of the immersive machine: run the owed
@@ -702,6 +833,8 @@ impl eframe::App for App {
                             ui.text_edit_singleline(&mut self.app_id_text);
                             ui.end_row();
                         });
+                    ui.add_space(4.0);
+                    self.settings_panel(ui);
                     ui.add_space(8.0);
                     if ui.button("Connect").clicked() {
                         self.form.host_id = self.host_id_text.trim().parse().unwrap_or(0);
@@ -717,6 +850,7 @@ impl eframe::App for App {
                         self.running = Some(Running::start(
                             self.form.clone(),
                             self.audio_exclusive_pref(),
+                            self.stream_fields(),
                             ctx.clone(),
                         ));
                     }
@@ -871,6 +1005,7 @@ impl eframe::App for App {
                                         Some(parent) => match present::StreamSurface::create(
                                             parent,
                                             run.video.clone(),
+                                            self.want_10bit_pref(),
                                         ) {
                                             Ok(mut s) => {
                                                 // A2: mouse/keyboard over the
@@ -1119,6 +1254,7 @@ impl eframe::App for App {
                         self.running = Some(Running::start(
                             self.form.clone(),
                             self.audio_exclusive_pref(),
+                            self.stream_fields(),
                             ctx.clone(),
                         ));
                     }

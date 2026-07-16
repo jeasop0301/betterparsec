@@ -357,12 +357,19 @@ struct Renderer {
 unsafe impl Send for Renderer {}
 
 impl Renderer {
-    /// Reads the `BP_PRESENT_10BIT` env gate once; tests call `new_inner`
-    /// to force `want_10bit` WITHOUT a process-global env var (setting one
-    /// races sibling present tests running in parallel and corrupts their
-    /// readback — the backbuffer would silently flip to 10-bit).
-    fn new(hwnd: HWND, width: u32, height: u32) -> Result<Self, PresentError> {
-        Self::new_inner(hwnd, width, height, present_10bit_from_env())
+    /// Reads the `BP_PRESENT_10BIT` env gate plus a caller-supplied
+    /// `want_10bit` preference (the settings store, G005 S1b) — either one
+    /// enables it. Tests call `new_inner` directly to force `want_10bit`
+    /// WITHOUT a process-global env var (setting one races sibling present
+    /// tests running in parallel and corrupts their readback — the
+    /// backbuffer would silently flip to 10-bit).
+    fn new_with_10bit(
+        hwnd: HWND,
+        width: u32,
+        height: u32,
+        want_10bit: bool,
+    ) -> Result<Self, PresentError> {
+        Self::new_inner(hwnd, width, height, present_10bit_from_env() || want_10bit)
     }
 
     fn new_inner(
@@ -960,14 +967,21 @@ pub struct StreamSurface {
 
 impl StreamSurface {
     /// `parent` is the raw Win32 handle of the eframe chrome window.
-    pub fn create(parent: isize, shared: Arc<VideoShared>) -> Result<Self, PresentError> {
+    /// `want_10bit` is the settings-store preference (G005 S1b,
+    /// `main.rs::App::want_10bit_pref`); `BP_PRESENT_10BIT=1` still wins
+    /// over a `false` store value — folded in by [`Renderer::new_with_10bit`].
+    pub fn create(
+        parent: isize,
+        shared: Arc<VideoShared>,
+        want_10bit: bool,
+    ) -> Result<Self, PresentError> {
         let hwnd = create_stream_child(HWND(parent as *mut _))?;
         let thread = {
             let shared = shared.clone();
             let hwnd_val = hwnd.0 as isize;
             std::thread::Builder::new()
                 .name("a0-present".into())
-                .spawn(move || render_loop(HWND(hwnd_val as *mut _), &shared))
+                .spawn(move || render_loop(HWND(hwnd_val as *mut _), &shared, want_10bit))
                 .map_err(|e| PresentError(format!("spawn present thread: {e}")))?
         };
         Ok(Self {
@@ -1163,7 +1177,7 @@ impl Drop for StreamSurface {
 
 /// Render thread: block on the frame condvar, then waitable → upload →
 /// copy → present. Newest-wins; a decode burst never queues presents.
-fn render_loop(hwnd: HWND, shared: &Arc<VideoShared>) {
+fn render_loop(hwnd: HWND, shared: &Arc<VideoShared>, want_10bit: bool) {
     let mut renderer: Option<Renderer> = None;
     loop {
         let frame = {
@@ -1185,7 +1199,7 @@ fn render_loop(hwnd: HWND, shared: &Arc<VideoShared>) {
 
         let (fw, fh) = frame.dims();
         if renderer.is_none() {
-            match Renderer::new(hwnd, fw, fh) {
+            match Renderer::new_with_10bit(hwnd, fw, fh, want_10bit) {
                 Ok(r) => {
                     tracing::info!(w = fw, h = fh, "raw D3D11 FLIP_DISCARD surface up");
                     renderer = Some(r);
@@ -1211,7 +1225,7 @@ fn render_loop(hwnd: HWND, shared: &Arc<VideoShared>) {
             // frame; latch fallback only if recreation also fails.
             tracing::warn!(err = %e, "present failed — recreating device");
             renderer = None;
-            match Renderer::new(hwnd, fw, fh) {
+            match Renderer::new_with_10bit(hwnd, fw, fh, want_10bit) {
                 Ok(mut r) => {
                     let draw2 = match &frame {
                         DecodedFrame::Rgba(f) => r.draw(f),
@@ -1317,7 +1331,7 @@ mod tests {
         }
 
         let f1 = gradient(64, 48);
-        let mut r = match Renderer::new(child, 64, 48) {
+        let mut r = match Renderer::new_with_10bit(child, 64, 48, false) {
             Ok(r) => r,
             Err(e) => {
                 // No hardware D3D11 device (bare CI VM): nothing to test.
@@ -1381,7 +1395,7 @@ mod tests {
 
         let (width, height) = (64usize, 32usize);
         let frame = edge_frame(width, height);
-        let mut r = match Renderer::new(child, width as u32, height as u32) {
+        let mut r = match Renderer::new_with_10bit(child, width as u32, height as u32, false) {
             Ok(r) => r,
             Err(e) => {
                 // No hardware D3D11 device (bare CI VM): nothing to test.

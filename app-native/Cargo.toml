@@ -22,6 +22,10 @@ transport-core = { workspace = true }
 # A1 host role: embedded account/pairing/signaling server (design D1/D3).
 web-server = { path = ".." }
 common = { workspace = true }
+# G005 S1b: user settings store (settings.rs) — human-json parse via
+# web-server::human_json, serde for the on-disk schema.
+serde = { workspace = true }
+serde_json = { workspace = true }
 # A2 input: wire-format field types (common::input_wire re-uses them).
 moonlight-common = { workspace = true, optional = true }
 

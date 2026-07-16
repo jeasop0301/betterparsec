@@ -81,7 +81,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
-            .with_title("BetterParsec — build 07-16f (kb-capture + 8M default + file log)"),
+            .with_title("BetterParsec — build 07-16g (fec-only wire dedup)"),
         ..Default::default()
     };
     eframe::run_native(

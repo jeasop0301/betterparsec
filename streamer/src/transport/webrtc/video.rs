@@ -109,6 +109,11 @@ pub struct WebRtcVideo {
     /// QU relay handle; `None` until the first `setup()` call.
     /// Dormant cost: idle TcpListener + epoch tracking only (no channel traffic).
     qu_handle: Option<QuRelayHandle>,
+    /// FEC-primary client (StartStream `video_over_fec_only`): video rides
+    /// the `video_fec` DataChannel, so the duplicate RTP-track send is
+    /// skipped once FEC is actually carrying frames (see
+    /// [`skip_rtp_track`]). Default false = legacy double-send.
+    video_over_fec_only: bool,
 }
 
 impl WebRtcVideo {
@@ -134,11 +139,18 @@ impl WebRtcVideo {
             fec_handle: None,
             qu_generation: Arc::new(AtomicU32::new(0)),
             qu_handle: None,
+            video_over_fec_only: false,
         }
     }
 
     pub async fn set_codecs(&mut self, supported_codecs: VideoFormats) {
         self.supported_video_formats = supported_codecs;
+    }
+
+    /// StartStream `video_over_fec_only` (FEC-primary client — the native
+    /// app). Set before [`Self::setup`], like `set_configured_bitrate_kbps`.
+    pub fn set_video_over_fec_only(&mut self, on: bool) {
+        self.video_over_fec_only = on;
     }
 
     /// M4 stall watchdog: the client asked for an IDR over the signaling
@@ -416,12 +428,30 @@ impl WebRtcVideo {
         // is_active() is one AtomicBool::load — the only per-frame overhead
         // when the client has not yet subscribed (default dormant state).
         // timestamp_us is truncated to u32, matching the existing WS data path.
+        let mut fec_carried = false;
         if let Some(fec) = &self.fec_handle
             && fec.is_active()
         {
             let ts_us = unit.timestamp.as_micros() as u32;
             fec.enqueue(Bytes::copy_from_slice(&full_frame), important, ts_us)
                 .await;
+            fec_carried = true;
+        }
+
+        // FEC-primary client: the frame is already on the wire via the
+        // video_fec DataChannel — skip the duplicate RTP-track send
+        // (otherwise every frame ships twice: RTP + FEC ≈ 2.2× nominal
+        // wire; field finding 2026-07-16). The needs_idr consumption
+        // below still runs, so loss-recovery IDR requests are unaffected.
+        if skip_rtp_track(self.video_over_fec_only, fec_carried) {
+            if self
+                .needs_idr
+                .compare_exchange_weak(true, false, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                return DecodeResult::NeedIdr;
+            }
+            return DecodeResult::Ok;
         }
 
         match &mut self.codec {
@@ -535,6 +565,15 @@ impl WebRtcVideo {
 
         DecodeResult::Ok
     }
+}
+
+/// FEC-primary skip decision (pure, unit-tested): the duplicate RTP-track
+/// send is skipped only when the client declared `video_over_fec_only`
+/// (StartStream) AND the frame actually went out on the FEC channel this
+/// call — never skip before the FEC subscribe lands, or the client would
+/// be blind during session startup.
+fn skip_rtp_track(fec_only: bool, fec_carried: bool) -> bool {
+    fec_only && fec_carried
 }
 
 pub fn register_video_codecs(media_engine: &mut MediaEngine) -> Result<(), webrtc::Error> {
@@ -761,6 +800,18 @@ mod tests {
     fn av1_high_profile_is_not_advertised() {
         assert!(video_format_to_codec(VideoFormat::Av1High8_444).is_none());
         assert!(video_format_to_codec(VideoFormat::Av1High10_444).is_none());
+    }
+
+    #[test]
+    fn fec_only_skips_rtp_track_only_once_fec_carries() {
+        // Declared + carried -> skip the duplicate RTP send.
+        assert!(skip_rtp_track(true, true));
+        // Declared but FEC not yet active (pre-subscribe startup) -> keep
+        // sending the track so the client is never blind.
+        assert!(!skip_rtp_track(true, false));
+        // Legacy clients (no declaration) never skip, FEC active or not.
+        assert!(!skip_rtp_track(false, true));
+        assert!(!skip_rtp_track(false, false));
     }
 
     #[test]

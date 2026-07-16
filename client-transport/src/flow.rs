@@ -141,6 +141,10 @@ impl SignalingFlow {
                             play_audio_local: false,
                             supported_codecs: self.config.supported_codecs,
                             hdr: false,
+                            // Native video rides the video_fec DataChannel;
+                            // tell the streamer to skip the duplicate
+                            // RTP-track send (halves the session wire).
+                            video_over_fec_only: true,
                         },
                     }),
                 ]

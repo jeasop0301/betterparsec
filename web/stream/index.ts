@@ -1388,6 +1388,9 @@ export class Stream implements Component {
             play_audio_local: this.settings.playAudioLocal,
             supported_codecs: createSupportedVideoFormatsBits(videoCodecSupport),
             hdr: this.settings.hdr ?? false,
+            // Web keeps the RTP track as the primary video path (FEC is a
+            // recovery aid) — never ask the streamer to skip the track.
+            video_over_fec_only: false,
         }
 
         const message: StreamClientMessage = {

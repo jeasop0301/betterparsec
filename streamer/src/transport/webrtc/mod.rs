@@ -513,6 +513,9 @@ impl WebRtcInner {
                 {
                     let mut video = self.video.lock().await;
                     video.set_codecs(video_supported_formats).await;
+                    // FEC-primary client (native): skip the duplicate
+                    // RTP-track send once FEC carries frames (video.rs).
+                    video.set_video_over_fec_only(settings.video_over_fec_only);
                     // Feature #1: seed the ABR ceiling from the initial bitrate.
                     video.set_configured_bitrate_kbps(settings.bitrate_kbps);
                 }

@@ -307,6 +307,13 @@ pub struct StreamSettings {
     /// This is using the [VideoFormats]
     pub supported_codecs: u32,
     pub hdr: bool,
+    /// FEC-primary client (the native app): video rides the `video_fec`
+    /// DataChannel, so the streamer skips the duplicate RTP-track send
+    /// (otherwise every frame goes out twice — RTP + FEC ≈ 2.2× nominal
+    /// wire). `serde(default)` keeps old clients/servers compatible:
+    /// missing field = false = legacy double-send behavior.
+    #[serde(default)]
+    pub video_over_fec_only: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, TS)]

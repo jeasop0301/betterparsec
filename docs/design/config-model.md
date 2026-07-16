@@ -1,196 +1,106 @@
-# BetterParsec 통합 앱 — 설정(Config) 모델 설계
+# BetterParsec 통합 앱 — 설정(Config) 모델
 
-**Date**: 2026-07-16
-**Owner 방향**: Sunshine/Moonlight 틀을 벗어나 **우리 코드·우리 앱**으로 통합
-(unified-app-architecture.md D1). 설정도 그 앱의 것으로 통합한다.
-**제약 (owner)**: "너무 어려우면 사용하기 쉽지 않다" — **일반 사용자가 설정
-파일이나 env를 만질 일이 0이어야 한다.**
+**Date**: 2026-07-16 (구현 반영본 — ralplan run 019f68d6 G005/G006)
+**Owner 방향**: Sunshine/Moonlight 틀을 벗어나 우리 앱으로 통합. 설정도 그 앱의 것.
+**제약 (owner)**: "너무 어려우면 안 된다" — **일반 사용자가 설정 파일이나 env를 만질 일이 0**이어야 한다.
 
----
-
-## 0. 북극성 — 제로컨피그 기본 경로 (Parsec 패리티)
-
-일반 사용자의 전체 여정에서 **타이핑하는 건 비밀번호 하나뿐**이어야 한다.
-
-```
-다운로드 → 실행 → 로그인 → 내 호스트 목록에서 클릭 → 스트림
-```
-
-- 설정 파일 편집 없음. env 없음. 배치파일 없음.
-- 튜닝 노브는 전부 **기본값이 "그냥 됨"** + 필요 시 인앱에서 조정.
-- 이 경로가 깨지면 어떤 고급 기능도 의미 없다. **모든 설정 결정은 이
-  경로를 해치지 않는지로 먼저 판정한다.**
-
-현재 이 경로의 실제 마찰(2026-07-16 실측):
-- 접속폼 프리필은 됐다(`betterparsec.conf`, 9def901) — 반은 온 셈.
-- 그러나 저지연/화질 레버가 `BP_*` env에 갇혀 있어 더블클릭 배포판에서
-  도달 불가였다(exclusive 오디오 등 — 오늘 인앱 토글로 이관 시작).
-- 호스트는 여전히 Sunshine `sunshine.conf`를 따로 만져야 함.
+> 이 문서는 이전의 5-프리셋 안을 **폐기**하고 shipped 구현(`transport-core/src/mode.rs`,
+> `app-native/src/settings.rs`)의 **3단 모드 + free-lunch 기본 ON** 모델로 대체한다.
 
 ---
 
-## 1. 현재 설정 표면 — 파편화 진단
+## 0. 북극성 — 제로컨피그 기본 경로
 
-| 레이어 | 위치·형식 | 누가 만지나 | 문제 |
-|---|---|---|---|
-| 클라 접속 | `betterparsec.exe` 옆 `betterparsec.conf` (key=value) | 패키저가 생성, 사용자 안 만짐 | 배포 시드용으로만 OK. 계정·다중 호스트엔 부족 |
-| 클라 기능 플래그 | `BP_*` env (`BP_AUDIO_EXCLUSIVE`, `BP_SHARPEN`, `BP_NV12`, `BP_CLIENT_CURSOR`, …) | 개발자만 | **더블클릭 배포판에서 도달 불가** — 필드 판정 블로커 |
-| 클라 인앱 | egui 토글 (sharpen·NV12·exclusive audio) | 사용자 | 방향 맞음 — 여기로 수렴시켜야 |
-| 서버 | `./server/config.json` (human-json) | 호스트 운영자 | bind/port/계정·페어링. 통합 앱이 임베드(D3) |
-| 호스트 인코드/캡처 | Foundation `sunshine.conf` | 호스트 운영자 | capture_cursor·slice_aligned_fec·encoder — **별도 틀** |
-| 웹 클라 | 브라우저 로컬 | 사용자 | 네이티브와 갈라짐 |
-
-**핵심 문제**: 같은 개념(예: 비트레이트·코덱·커서 정책)이 3~4곳에 흩어져
-있고, 저지연/화질 레버가 사용자 손이 안 닿는 env에 있다.
+전체 여정에서 **타이핑하는 건 비밀번호 하나뿐**: 다운로드 → 실행 → 로그인 → 호스트 클릭 → 스트림.
+설정 파일 편집 없음, env 없음, 배치파일 없음. 튜닝 노브는 전부 기본값이 "그냥 됨" + 필요 시 인앱 조정.
 
 ---
 
-## 2. 목표 모델 — "하나의 앱, 하나의 설정, 접힌 복잡도"
+## 1. 두 부류로 접힌 설정
 
-### 2-1. 레이어 & 우선순위 (명시적, 단일 방향)
+### 1-1. 화질 무료 점심 = 코드 기본값 (토글 아님)
+지연/비트레이트 비용이 사용자가 체감할 수 없을 만큼 ~0인 화질 레버는 **항상 켜진 상수**다.
+`transport-core/src/mode.rs`의 private `free_lunch` 모듈: `SPATIAL_AQ_ON=true`, `PRESET`,
+`WEIGHTED_PRED_ON=true`. `ModeKnobs`에 슬롯이 없고 모드/사용자로 바뀌지 않는다. (인코더 소비는
+후속 wiring goal — 현재는 예약 상수.)
 
-```
-built-in 기본값  (코드, "그냥 됨")
-  ▼ override
-배포 시드        (betterparsec.conf — 패키저가 심음, 최초 실행 시 사용자
-                  스토어로 1회 이주 후 역할 종료)
-  ▼ override
-사용자 스토어    (%APPDATA%/betterparsec/settings.json — 인앱 UI만 기록)
-  ▼ override
-연결별 기억값    (호스트마다 마지막 선택 프리셋/해상도 등)
-  ▼ override
-dev/CI env       (BP_* — 개발·자동화 전용, 일반 사용자엔 비노출·불필요)
-```
+### 1-2. 사용자 선택 = 진짜 트레이드오프만
+`StreamMode { Fast, Medium, Quality }` 3단 + 4개 per-field override
+(`UserTradeoffs { bitrate_kbps, width, height, fps }`). 모드가 기본을 정하고, **0이 아닌
+사용자 필드만** 그 필드를 덮어쓴다(free-lunch 상수는 불변). `pub fn knobs_for(mode, user) -> ModeKnobs`.
 
-- **사용자 스토어는 인앱 UI만 쓴다.** 손편집을 기대하지 않는다(가능은 하되
-  문서화된 정식 경로가 아님).
-- **env는 개발 override로 강등.** 모든 사용자용 기능은 인앱 토글이 정식.
-  (오늘 exclusive audio가 그 첫 이관. 잔여: `BP_CLIENT_CURSOR` →
-  커서 설정, `BP_SHARPEN`/`BP_NV12`는 이미 토글 존재해 env는 시드로만.)
+**shipped 모드 기본값** (`mode.rs::mode_defaults`, `canonical_vectors()`로 웹과 락스텝 검증):
 
-### 2-2. 프리셋 우선, 노브는 접기 (progressive disclosure)
+| 모드 | codec_pref | 해상도 | bitrate | fps | audio_exclusive_default |
+|---|---|---|---|---|---|
+| Fast (최저지연) | H264 | 1280×720 | 8 Mbps | 60 | on |
+| Medium (기본) | HEVC | 1920×1080 | 20 Mbps | 60 | on |
+| Quality | AV1 | 3840×2160 | 50 Mbps | 60 | off |
 
-일반 사용자에게 15개 노브를 던지지 않는다. **이름 있는 프리셋**이 노브
-묶음을 정한다:
-
-| 프리셋 | 겨냥 | 묶는 것 |
-|---|---|---|
-| **자동 (기본)** | 대부분 | 링크 측정으로 적응(동적 해상도·FEC 비율·비트레이트 CC) |
-| **게임 (최저지연)** | 경쟁 게임 | exclusive 오디오·NV12 프레젠트·present 페이싱=최저지연·FEC 낮게·immersive 유도 |
-| **화질 우선** | 영상·데스크톱 | 코덱 HEVC/AV1·preset 상향·AQ on·비트레이트 여유·페이싱=지터흡수 |
-| **나쁜 네트워크** | 제약망 | FEC 비율 높게·동적 해상도 공격적·비트레이트 보수적·TCP 폴백 관대 |
-| **배터리 절약** | 랩탑 | 디코드 부하↓·fps 상한·샤픈 off |
-
-- 기본 = **자동**. 사용자는 프리셋 하나만 고르면 끝.
-- "고급" 아코디언을 펼치면 개별 노브(코덱·비트레이트·FEC·해상도 사다리·
-  오디오 모드·페이싱·샤픈)가 프리셋 값을 시드로 노출. 만지는 순간
-  "커스텀"으로 분기.
-- **프리셋은 클라 단독 관심사와 호스트 협상 관심사를 나눠 담는다** —
-  아래 3절.
+- 상수 값은 Gate-B/C 튜닝 대상(resolution.rs/fec_ratio.rs 선례).
+- `codec_pref`는 `CodecPref{H264,Hevc,Av1}` 순수 서수 enum — `FlowConfig::supported_codecs`
+  비트마스크 flip은 **호스트+라이브 후속 goal**(현재는 전부 H264_BIT로 collapse, 문서화됨).
+- 웹 미러: `web/stream/mode.ts` `knobsFor`/`canonicalVectors` — `tests/mode.test.mjs`가 Rust
+  `canonical_vectors()` 값과 **정확 일치** 검증(단일 공유 벡터 테이블).
 
 ---
 
-## 3. 호스트 설정의 통합 (Sunshine 탈출의 핵심)
+## 2. 사용자 스토어 (`settings.rs`)
 
-지금 호스트 노브(encoder preset·AQ·codec·capture_cursor·slice_aligned_fec·
-멀티모니터·프라이버시·서라운드)는 `sunshine.conf`에 산다. 통합 앱 방향은
-이걸 **우리 앱의 "호스트" 탭 + 사용자 스토어**로 가져오는 것이다.
-
-**단계적 이주 (D2: Phase A=Sunshine 서브프로세스 → Phase B=자체 인코더)**:
-
-- **Phase A (지금)**: 사용자 스토어가 **단일 진실 소스**. 앱이 호스트 롤로
-  뜰 때 스토어의 호스트 설정 → **`sunshine.conf`를 생성**(hand-edit 금지,
-  생성 산출물로 강등). `app-native/src/host.rs`가 이미
-  `./server/config.json`을 로드하니, 동일 지점에서 sunshine.conf도
-  스토어에서 렌더링. 사용자는 Sunshine conf를 절대 직접 안 만진다.
-- **Phase B (자체 인코더)**: sunshine.conf 자체가 사라지고 호스트 설정이
-  네이티브로 앱 안에서 산다. 스키마는 그대로 재사용(아래 3-1).
-
-### 3-1. 협상되는 값 vs 로컬 값
-
-설정을 두 부류로 분리해 저장·전달을 단순화:
-
-- **협상 값 (클라 프리셋 → 세션 시작 시 호스트에 요청)**: 코덱·해상도·
-  fps·비트레이트 상한·HDR·서라운드 채널수·4:4:4. 이미 `StartStream`이
-  `supported_codecs`·`bitrate_kbps`를 나른다(streamer). 여기에 프리셋이
-  녹아든다 — **클라가 원하는 프로파일을 보내고 호스트가 능력과 교집합**.
-- **호스트 로컬 값 (호스트 스토어에만)**: 어떤 모니터를 캡처·프라이버시
-  블랭크·encoder preset/AQ·capture_cursor. 클라가 정할 수 없는 것.
-
-이 분리로 "클라 설정"과 "호스트 설정"이 UI에서도 자연히 갈린다(클라 탭 /
-호스트 탭), 사용자 혼란 감소.
-
----
-
-## 4. 스키마 스케치 (사용자 스토어)
+`%APPDATA%/betterparsec/settings.json` (비Windows: `$XDG_CONFIG_HOME`/`$HOME/.config/betterparsec/`).
+**인앱 UI만 기록**한다. human-json(주석 허용, `web_server::human_json::preprocess_human_json` 재사용).
 
 ```jsonc
-// %APPDATA%/betterparsec/settings.json  (human-json: 주석 허용)
 {
   "schema": 1,
-  "account": {                 // 재로그인-only 북극성 지원
-    "base_url": "https://…:8080",
-    "username": "…",
-    // 비밀번호는 절대 저장 안 함 (OS 자격증명 저장소 옵트인은 별도)
-    "remember": true
-  },
-  "hosts": [                   // 다중 호스트, 클릭-투-커넥트
-    { "id": 2062835576, "app_id": 881448767, "label": "집 데스크톱",
-      "last_preset": "game", "last_resolution": "1440p" }
-  ],
   "client": {
-    "preset": "auto",          // auto|game|quality|badnet|battery|custom
-    "custom": {                // preset=custom일 때만 유효
-      "codec": "auto",         // auto|h264|hevc|av1
-      "max_bitrate_kbps": 0,   // 0=자동
-      "resolution": "auto",
-      "audio_exclusive": false,
-      "nv12_present": false,
-      "sharpen_pct": 0,
-      "pacing": "balanced"     // lowlatency|balanced|smooth
-    }
-  },
-  "host": {                    // 호스트 롤일 때만
-    "capture_monitor": 0,
-    "privacy_blank": false,
-    "encoder": { "preset": "auto", "spatial_aq": true },
-    "capture_cursor": false    // clientCursor와 짝
-  },
-  "dev": {}                    // env override 미러(개발 편의), 비어있음이 정상
+    "mode": "medium",        // fast|medium|quality (미지값 → medium)
+    "bitrate_kbps": 20000,   // 0 = 모드 기본 사용
+    "width": 1920, "height": 1080, "fps": 60,
+    "present_10bit": false,  // BP_PRESENT_10BIT env가 위에서 덮음
+    "client_cursor": false   // BP_CLIENT_CURSOR env가 위에서 덮음
+  }
+  // 알 수 없는 top-level 키는 보존(#[serde(flatten)] — 구/신 빌드 왕복에 필드 유실 없음)
 }
 ```
 
-- **`schema` 버전**으로 마이그레이션. 미지 필드는 보존(포워드 호환).
-- 파싱 실패는 **표면화**(silent 기본값 override 금지 — host.rs가 이미
-  이 원칙). 단 사용자 스토어는 손상 시 백업 후 기본값 재생성 옵션.
+- **schema 버전 + 미지 필드 보존**으로 마이그레이션·포워드 호환.
+- **손상 파일**: `settings.json.bak-<unix_ts>`로 백업 후 기본값 재생성 — 채워진 파일을 백업
+  없이 조용히 덮지 않는다(host.rs 원칙 계승; 단 user 스토어라 hard-error 대신 백업+재생성).
+- 파일 부재 = 최초 실행 = 기본값(에러 아님). 사용 가능한 base dir 없으면(헤드리스/CI)
+  디스크 미접촉 in-memory 기본값.
+- `to_flowconfig_fields(&ClientSettings)`가 `knobs_for`로 FlowConfig 필드 파생 → 스토어 편집과
+  fresh install이 mode 엔진과 비트단위 일치.
 
 ---
 
-## 5. 실행 계획 (증분, 북극성 안 깨기)
+## 3. 우선순위 (명시적, 단일 방향)
 
-1. **[소형·지금 이관 중] `BP_*` → 인앱 토글**: sharpen·NV12·exclusive
-   audio 완료. 잔여 = `BP_CLIENT_CURSOR`를 커서 설정 토글로. env는 dev
-   override로 남기되 문서에서 "개발용"으로 명시.
-2. **[소형] `betterparsec.conf` → 사용자 스토어 이주**: 최초 실행 시
-   conf를 읽어 `settings.json` 시드 → 이후 인앱 계정/호스트 목록이 주도.
-   conf는 배포 시드 역할만.
-3. **[중형] 프리셋 엔진**: `transport-core`에 순수 `Preset → 노브 묶음`
-   매핑(테스트 가능, dyn-resolution/fec_ratio 컨트롤러와 결선). egui/웹
-   공통 — 한 소스, 두 프론트(session-ux 패턴).
-4. **[중형] 호스트 설정 → 스토어 → sunshine.conf 생성**: host.rs가
-   스토어에서 sunshine.conf 렌더. 사용자는 Sunshine conf 미접촉.
-5. **[대형·Phase B] 자체 인코더 전환 시** 호스트 스키마 재사용, sunshine
-   conf 소멸.
-6. **[선택] 계정 동기화**: 사용자 스토어를 계정에 저장 → 새 기기
-   다운로드 시 프리셋/호스트 목록 복원(무설치 재로그인 강화).
+**낮음 → 높음**: builtin 기본값 < 배포 시드 `betterparsec.conf` < 사용자 스토어 <
+연결별 < **dev env (`BP_*`, 최상)**.
+
+- env가 **최상**(dev override) — shipped `ConnectForm::default`("env > conf > fallback")와
+  `present_10bit_from_env` / `BP_CLIENT_CURSOR`가 스토어 값 위에서 OR로 folding.
+- 스토어는 자기 슬롯만 소유 — `betterparsec.conf`나 `BP_*`를 스스로 읽지 않고, 호출부가
+  precedence를 위에 얹는다.
+- **일반 사용자는 env를 만질 일이 0**: sharpen·NV12·exclusive audio·10-bit·client cursor는
+  전부 인앱 토글(env는 개발용 override로 잔존).
 
 ---
 
-## 6. 판정 기준 (이 설계가 "쉬운가")
+## 4. 호스트 설정 통합 (후속)
 
-- 신규 사용자가 **설정 파일/​env를 한 번도 안 만지고** 스트림에 도달하는가? (필수)
-- 저지연/화질 레버가 **전부 인앱에서** 켜지는가? (env 잔존 = 실패)
-- 프리셋 하나로 "게임/영상/나쁜망"이 **의도대로** 바뀌는가?
-- 호스트 운영자가 **sunshine.conf를 직접 안 만지고** 모니터/프라이버시/
-  인코더를 바꾸는가?
-- 새 기기에서 **재로그인만으로** 이전 프리셋·호스트가 돌아오는가? (선택)
+호스트 노브(encoder preset/AQ·capture_cursor·멀티모니터·프라이버시)는 아직 Sunshine
+`sunshine.conf`에 있다. 통합 방향(Phase A: Sunshine 서브프로세스): 사용자 스토어가 단일
+진실 소스 → 앱 호스트 롤이 `sunshine.conf`를 **생성**(hand-edit 금지). Phase B(자체 인코더):
+conf 소멸, 호스트 스키마를 스토어에 흡수. 코덱 HEVC/AV1 기본 전환·host AQ는 라이브/호스트 goal.
+
+---
+
+## 5. 판정 기준
+
+- 신규 사용자가 **설정 파일/​env 없이** 스트림 도달? (필수 — 충족)
+- 화질/지연 레버가 **전부 인앱**에서? (env 잔존은 dev-only — 충족: sharpen/NV12/exclusive/10bit/cursor)
+- **모드 하나**로 게임/영상 바뀜? (fast/medium/quality — 충족, 웹·네이티브 락스텝)
+- 호스트 운영자가 **sunshine.conf 미접촉**으로 모니터/프라이버시/인코더? (후속)
+- 새 기기 **재로그인만으로** 이전 프리셋 복원? (계정 동기화 후속)

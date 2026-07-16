@@ -56,7 +56,13 @@ mod mode_serde {
 /// per-field overrides (`transport_core::mode::UserTradeoffs`), plus the
 /// one opt-in free lever with no `ModeKnobs` slot (`present_10bit` folds
 /// into `Renderer::new_inner`'s `want_10bit`, see `present.rs`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Derived `Default` = mode Medium + every override field 0. A 0 override
+/// means "use the selected mode's default" (`knobs_for` treats 0 as
+/// no-override), so first run resolves to Medium and switching mode
+/// actually changes the resolved bitrate/resolution — seeding concrete
+/// numbers would pin one mode regardless of the selector.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ClientSettings {
     #[serde(with = "mode_serde")]
@@ -69,26 +75,6 @@ pub struct ClientSettings {
     /// Client-side rendered host cursor (M4 cursor P2, cursor_icon.rs).
     /// `BP_CLIENT_CURSOR=1` still overrides this (dev-only, highest slot).
     pub client_cursor: bool,
-}
-
-impl Default for ClientSettings {
-    fn default() -> Self {
-        // Override fields default to 0 = "use the selected mode's default"
-        // (`knobs_for` treats a 0 field as no-override). Seeding the
-        // concrete Medium numbers here would pin them regardless of the
-        // chosen mode — the mode selector must actually change the
-        // resolved bitrate/resolution, so first run stays 0 and resolves
-        // to Medium's knobs via `to_flowconfig_fields`.
-        ClientSettings {
-            mode: StreamMode::default(),
-            bitrate_kbps: 0,
-            width: 0,
-            height: 0,
-            fps: 0,
-            present_10bit: false,
-            client_cursor: false,
-        }
-    }
 }
 
 /// The on-disk settings document. `unknown` preserves any top-level keys

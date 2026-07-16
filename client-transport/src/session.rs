@@ -240,11 +240,15 @@ type WsSink = futures::stream::SplitSink<
     WsMessage,
 >;
 
-/// Peer/channel callback → session loop events.
+/// Peer/channel callback → session loop control events.
+///
+/// Video FEC payloads deliberately bypass this bounded queue and feed
+/// `RxCore` directly. A single encoded frame spans many DataChannel messages;
+/// routing those bursts through `try_send` could silently drop shards when the
+/// 256-entry control queue filled, producing reference corruption and stalls.
 enum LocalEvent {
     PeerState(RTCPeerConnectionState),
     LocalCandidate(RTCIceCandidateInit),
-    FecData(Vec<u8>),
     FecAckOpen(Arc<RTCDataChannel>),
     /// A host-created input channel opened (id = `TransportChannelId`).
     InputOpen(u8, Arc<RTCDataChannel>),
@@ -479,9 +483,6 @@ async fn run_session(
             ev = ev_rx.recv() => {
                 let Some(ev) = ev else { break };
                 match ev {
-                    LocalEvent::FecData(data) => {
-                        core.on_message(&data, now_ms());
-                    }
                     LocalEvent::FecAckOpen(ch) => {
                         // Subscribe: activates the host FEC sender.
                         ch.send(&bytes::Bytes::from_static(&[0x01]))
@@ -552,6 +553,7 @@ async fn run_session(
                                     ev_tx.clone(),
                                     core.clone(),
                                     cursor_shared.clone(),
+                                    started,
                                 )
                                     .await?,
                             );
@@ -652,6 +654,7 @@ async fn create_peer(
     ev_tx: mpsc::Sender<LocalEvent>,
     core: Arc<RxCore>,
     cursor_shared: Arc<CursorShared>,
+    started: Instant,
 ) -> anyhow::Result<Arc<RTCPeerConnection>> {
     let rtc_config = RTCConfiguration {
         ice_servers: ice_servers
@@ -695,14 +698,18 @@ async fn create_peer(
     }));
 
     let tx = ev_tx.clone();
+    let video_core = core.clone();
     peer.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let label = dc.label().to_string();
         debug!("data channel from host: \"{label}\"");
         match label.as_str() {
             "video_fec" => {
-                let tx = tx.clone();
+                let core = video_core.clone();
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
-                    let _ = tx.try_send(LocalEvent::FecData(msg.data.to_vec()));
+                    core.on_message(
+                        &msg.data,
+                        started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    );
                     done()
                 }));
             }

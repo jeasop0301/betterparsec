@@ -726,7 +726,10 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                 // VK_Q escape hatch: full Ctrl+Alt+Shift combo.
                 alt_pressed && ctrl_down && shift_down
             };
-            match hook_decision(vk, alt_down, key_up, shared.capture.keyboard_capture()) {
+            // Installation itself is the immersive-capture lifetime boundary.
+            // Do not re-gate on the shell atomic here: a stale false edge would
+            // pass Alt+Tab to the client OS even though the hook is live.
+            match hook_decision(vk, alt_down, key_up, true) {
                 HookAction::Pass => {}
                 HookAction::ExitImmersive => {
                     shared.capture.request_exit();

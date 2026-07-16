@@ -51,7 +51,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
-            .with_title("BetterParsec — build 07-16d (nv12 + prefilled connect)"),
+            .with_title("BetterParsec — build 07-16e (settings + hard-disconnect)"),
         ..Default::default()
     };
     eframe::run_native(

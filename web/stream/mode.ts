@@ -68,7 +68,7 @@ function modeDefaults(mode: StreamMode): ModeKnobs {
                 codecPref: 'h264',
                 width: 1280,
                 height: 720,
-                bitrateKbps: 8_000,
+                bitrateKbps: 5_000,
                 fps: 60,
                 audioExclusiveDefault: true,
             }
@@ -77,7 +77,7 @@ function modeDefaults(mode: StreamMode): ModeKnobs {
                 codecPref: 'hevc',
                 width: 1920,
                 height: 1080,
-                bitrateKbps: 20_000,
+                bitrateKbps: 8_000,
                 fps: 60,
                 audioExclusiveDefault: true,
             }
@@ -86,7 +86,7 @@ function modeDefaults(mode: StreamMode): ModeKnobs {
                 codecPref: 'av1',
                 width: 3840,
                 height: 2160,
-                bitrateKbps: 50_000,
+                bitrateKbps: 25_000,
                 fps: 60,
                 audioExclusiveDefault: false,
             }

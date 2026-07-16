@@ -41,17 +41,47 @@ use client_transport::tls::ServerTrust;
 use transport_core::video_rx::DecodeUnit;
 
 fn main() -> eframe::Result {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,webrtc=warn,webrtc_ice=warn,webrtc_sctp=warn".into()),
-        )
-        .init();
+    // Console + always-on file log (betterparsec.log next to the exe,
+    // append). The field client is double-clicked — no env, no console
+    // capture — so without the file sink a mid-session stall leaves zero
+    // evidence. `betterparsec::input=debug` is on by default for the
+    // cursor/immersive diagnostics; RUST_LOG still overrides everything.
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            "info,betterparsec::input=debug,webrtc=warn,webrtc_ice=warn,webrtc_sctp=warn".into()
+        });
+        let file = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("betterparsec.log")))
+            .and_then(|p| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .ok()
+            });
+        let registry = tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer());
+        match file {
+            Some(f) => registry
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(std::sync::Mutex::new(f)),
+                )
+                .init(),
+            None => registry.init(),
+        }
+    }
+    tracing::info!("=== betterparsec build 07-16f starting ===");
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
-            .with_title("BetterParsec — build 07-16e (settings + hard-disconnect)"),
+            .with_title("BetterParsec — build 07-16f (kb-capture + 8M default + file log)"),
         ..Default::default()
     };
     eframe::run_native(
@@ -719,6 +749,7 @@ impl App {
                 }
                 immersive::Action::Release => {
                     self.capture.set_relative(false);
+                    self.capture.set_keyboard_capture(false);
                     present::release_mouse_capture_global();
                 }
                 immersive::Action::Engage => {} // reset never engages
@@ -1130,6 +1161,7 @@ impl eframe::App for App {
                                                             run.session.cursor().visible(),
                                                         ),
                                                     );
+                                                    self.capture.set_keyboard_capture(true);
                                                     s.engage_mouse_capture(
                                                         self.capture.clone(),
                                                         run.session.input_sender(),
@@ -1137,6 +1169,7 @@ impl eframe::App for App {
                                                 }
                                                 immersive::Action::Release => {
                                                     self.capture.set_relative(false);
+                                                    self.capture.set_keyboard_capture(false);
                                                     s.release_mouse_capture();
                                                     // Clear any host-latched
                                                     // modifiers on exit (stuck

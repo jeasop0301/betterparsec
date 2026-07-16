@@ -1,13 +1,15 @@
 # 라이브 스모크 체크리스트 — 2026-07-16 빌드 (한 세션 최대 검증)
 
-**배포**: `https://betterparsec.kje12e4.workers.dev` (비번 게이트 다운로드 — R2, 14:10 07-16e 업로드)
-또는 `https://<server>:8080/betterparsec-portable.zip` (self-serve). **실행 후 타이틀바가
-`build 07-16e (settings + hard-disconnect)`인지 먼저 확인** — 아니면 구버전.
+**배포**: `https://betterparsec.kje12e4.workers.dev` (비번 게이트 다운로드 — R2). **실행 후
+타이틀바가 `build 07-16f (kb-capture + 8M default + file log)`인지 먼저 확인** — 아니면 구버전.
 **로그**: `run-incheon.bat` 실행 시 `RUST_LOG=info,betterparsec::input=debug` 자동. 스톨/이상 시 콘솔 캡처.
 
 ## ⚠️ 먼저 알 것
-- **기본 비트레이트가 8→20 Mbps로 변경**(기본 모드 = Medium 1080p60). WAN에서 버벅이면
-  접속화면 Stream settings에서 **Fast**(720p/8M)로 바꾸거나 비트레이트 수동 입력.
+- **07-16f: 기본 비트레이트를 검증된 8 Mbps로 회귀**(Medium 1080p60/8M — 20M 기본이
+  30초 내 끊김의 유력 원인이라 라이브 A/B 전까지 미검증 상향 금지. Fast=5M, Quality=25M).
+- **07-16f: exe 옆 `betterparsec.log` 상시 기록**(append) — 끊김/스톨 나면 그 파일 통째로 확보.
+- **07-16f: immersive Alt+Tab 수리** — 훅 게이트가 마우스 relative에 걸려 있어 호스트 커서가
+  보이는 동안(데스크톱) Alt+Tab이 클라에서 먹던 버그 → immersive 세션 전체로 게이트 교체.
 - **접속시점 반영**(바꾸면 재접속 필요): 모드/비트레이트/해상도/fps · 10-bit · Exclusive audio.
 - **라이브 토글**(세션 중 즉시): sharpen 슬라이더 · NV12 · Immersive · client cursor.
 - 설정은 `%APPDATA%/betterparsec/settings.json`에 자동 저장 — 앱 재시작에도 유지.
@@ -37,8 +39,8 @@
 16. [ ] 미지원 GPU였다면 콘솔에 R8 폴백 로그 + 정상 렌더
 
 ## 세션 4 — 모드 셀렉터 실효 (P1 픽스 검증)
-17. [ ] **Fast** 선택 → 재접속 → 720p/8M로 실제 변경(사이드바 stats/체감)
-18. [ ] (선택) **Quality** → 4K/50M 요청 — 호스트/망이 못 받으면 동작 관찰만
+17. [ ] **Fast** 선택 → 재접속 → 720p/5M로 실제 변경(사이드바 stats/체감)
+18. [ ] (선택) **Quality** → 4K/25M 요청 — 호스트/망이 못 받으면 동작 관찰만
 19. [ ] 앱 종료 → 재실행 → **설정 유지** 확인(모드/토글)
 
 ## 옵션 (호스트 설정 가능할 때)

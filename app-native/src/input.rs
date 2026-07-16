@@ -71,6 +71,13 @@ pub struct CaptureShared {
     /// tears the whole session down (same path as the Disconnect
     /// button), so a fullscreen stream can never trap the user.
     disconnect_requested: AtomicBool,
+    /// True for the WHOLE immersive session (Engage → Release), unlike
+    /// `relative` which the host-authority auto-switch toggles per frame
+    /// (host cursor visible ⇒ relative off). The keyboard hook and the
+    /// wndproc escape/focus-loss paths gate on THIS — otherwise Alt+Tab/
+    /// Win capture silently dies whenever the host shows its cursor
+    /// (field report: Alt+Tab switched CLIENT windows during immersive).
+    keyboard_capture: AtomicBool,
 }
 
 impl CaptureShared {
@@ -105,6 +112,16 @@ impl CaptureShared {
     /// per frame and folds it into the Disconnect-button path.
     pub fn take_disconnect_requested(&self) -> bool {
         self.disconnect_requested.swap(false, Ordering::AcqRel)
+    }
+
+    /// Immersive-session-scoped keyboard capture (see field doc): set
+    /// true on Engage, false on every Release path.
+    pub fn set_keyboard_capture(&self, on: bool) {
+        self.keyboard_capture.store(on, Ordering::Release);
+    }
+
+    pub fn keyboard_capture(&self) -> bool {
+        self.keyboard_capture.load(Ordering::Acquire)
     }
 }
 
@@ -324,7 +341,9 @@ pub fn release_sticky_keys(sender: &InputSender) {
 }
 
 /// Pure predicate for the hook-independent immersive escape in [`handle`]:
-/// Ctrl+Alt+Shift+Q on a key-down while relative capture is engaged.
+/// Ctrl+Alt+Shift+Q on a key-down while immersive keyboard capture is
+/// engaged (session-scoped — NOT the per-frame relative flag, which the
+/// host-authority auto-switch drops whenever the host cursor is visible).
 /// Mirrors the LL-hook `hook_decision` combo so that a *failed* hook
 /// install (`SetWindowsHookExW` only warns) still leaves a way out — the
 /// clipped cursor otherwise traps the user with the sidebar button
@@ -332,14 +351,14 @@ pub fn release_sticky_keys(sender: &InputSender) {
 /// installed it swallows Q before the wndproc sees it, so this never
 /// double-fires.
 fn is_wndproc_escape(
-    relative: bool,
+    captured: bool,
     msg: u32,
     vk: u16,
     ctrl: bool,
     alt: bool,
     shift: bool,
 ) -> bool {
-    relative && matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN) && vk == VK_Q.0 && ctrl && alt && shift
+    captured && matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN) && vk == VK_Q.0 && ctrl && alt && shift
 }
 
 /// Pure predicate for the session hard-disconnect hotkey Ctrl+Alt+`
@@ -406,7 +425,7 @@ pub fn handle(
     // loss, not our own re-focus. Release held modifiers (the host would
     // otherwise keep Alt latched) and request immersive exit so the cursor
     // unclips and the user is never trapped fullscreen.
-    if msg == WM_KILLFOCUS && ctx.capture.relative() {
+    if msg == WM_KILLFOCUS && ctx.capture.keyboard_capture() {
         release_sticky_keys(&ctx.sender);
         ctx.capture.request_exit();
         return None; // DefWindowProc still does its normal kill-focus work
@@ -415,7 +434,7 @@ pub fn handle(
     // captured child has focus, so a failed keyboard-hook install cannot
     // trap the user.
     if is_wndproc_escape(
-        ctx.capture.relative(),
+        ctx.capture.keyboard_capture(),
         msg,
         wparam.0 as u16,
         unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0,
@@ -632,7 +651,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                 // VK_Q escape hatch: full Ctrl+Alt+Shift combo.
                 kb.flags.contains(LLKHF_ALTDOWN) && ctrl_down && shift_down
             };
-            match hook_decision(vk, alt_down, key_up, shared.capture.relative()) {
+            match hook_decision(vk, alt_down, key_up, shared.capture.keyboard_capture()) {
                 HookAction::Pass => {}
                 HookAction::ExitImmersive => {
                     shared.capture.request_exit();

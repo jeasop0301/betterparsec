@@ -33,9 +33,9 @@
 
 | 모드 | codec_pref | 해상도 | bitrate | fps | audio_exclusive_default |
 |---|---|---|---|---|---|
-| Fast (최저지연) | H264 | 1280×720 | 8 Mbps | 60 | on |
-| Medium (기본) | HEVC | 1920×1080 | 20 Mbps | 60 | on |
-| Quality | AV1 | 3840×2160 | 50 Mbps | 60 | off |
+| Fast (최저지연) | H264 | 1280×720 | 5 Mbps | 60 | on |
+| Medium (기본) | HEVC | 1920×1080 | 8 Mbps | 60 | on |
+| Quality | AV1 | 3840×2160 | 25 Mbps | 60 | off |
 
 - 상수 값은 Gate-B/C 튜닝 대상(resolution.rs/fec_ratio.rs 선례).
 - `codec_pref`는 `CodecPref{H264,Hevc,Av1}` 순수 서수 enum — `FlowConfig::supported_codecs`
@@ -55,7 +55,7 @@
   "schema": 1,
   "client": {
     "mode": "medium",        // fast|medium|quality (미지값 → medium)
-    "bitrate_kbps": 20000,   // 0 = 모드 기본 사용
+    "bitrate_kbps": 8000,    // 0 = 모드 기본 사용
     "width": 1920, "height": 1080, "fps": 60,
     "present_10bit": false,  // BP_PRESENT_10BIT env가 위에서 덮음
     "client_cursor": false   // BP_CLIENT_CURSOR env가 위에서 덮음

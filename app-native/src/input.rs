@@ -31,7 +31,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetClientRect, HHOOK, HTCLIENT, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, SetCursor,
-    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP,
+    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP,
     WM_XBUTTONDOWN, WM_XBUTTONUP,
@@ -285,6 +285,39 @@ fn apply_cursor(ctx: &InputCtx) {
     unsafe { SetCursor(cursor) };
 }
 
+/// Sends key-up to the host for the modifiers/keys most prone to sticking
+/// when immersive capture tears down. After an exit (the Ctrl+Alt+Shift+Q
+/// hatch holds those three; Alt+Tab holds Alt; the Start-menu swallow
+/// holds Win) the stream child can lose focus before the physical key-ups
+/// arrive, so those key-ups never reach the wire and the host keeps them
+/// latched (field report: "Alt stays held"). Releasing them explicitly on
+/// every exit clears it; a redundant up for a key that was not down is a
+/// no-op on the host.
+pub fn release_sticky_keys(sender: &InputSender) {
+    for vk in [
+        VK_MENU, VK_CONTROL, VK_SHIFT, VK_LWIN, VK_RWIN, VK_TAB, VK_Q,
+    ] {
+        sender.send(&InboundPacket::Key {
+            action: KeyAction::Up,
+            modifiers: KeyModifiers::empty(),
+            key: vk.0,
+            flags: KeyFlags::empty(),
+        });
+    }
+}
+
+/// Pure predicate for the hook-independent immersive escape in [`handle`]:
+/// Ctrl+Alt+Shift+Q on a key-down while relative capture is engaged.
+/// Mirrors the LL-hook `hook_decision` combo so that a *failed* hook
+/// install (`SetWindowsHookExW` only warns) still leaves a way out — the
+/// clipped cursor otherwise traps the user with the sidebar button
+/// unreachable (field report: had to kill the app). When the hook is
+/// installed it swallows Q before the wndproc sees it, so this never
+/// double-fires.
+fn is_wndproc_escape(relative: bool, msg: u32, vk: u16, ctrl: bool, alt: bool, shift: bool) -> bool {
+    relative && matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN) && vk == VK_Q.0 && ctrl && alt && shift
+}
+
 /// Window-message hook called from the stream surface wndproc (UI
 /// thread). `Some(_)` = handled (message consumed — also suppresses the
 /// Alt/F10 system-menu default for SYSKEY messages).
@@ -330,6 +363,33 @@ pub fn handle(
                 .send(&InboundPacket::MouseMove { delta_x, delta_y });
         }
         return None; // DefWindowProc performs WM_INPUT cleanup
+    }
+
+    // Genuine focus loss while captured (Alt+Tab that slipped past a
+    // failed keyboard hook, a system dialog, UAC): the stream child holds
+    // keyboard focus during immersive, so WM_KILLFOCUS here means a real
+    // loss, not our own re-focus. Release held modifiers (the host would
+    // otherwise keep Alt latched) and request immersive exit so the cursor
+    // unclips and the user is never trapped fullscreen.
+    if msg == WM_KILLFOCUS && ctx.capture.relative() {
+        release_sticky_keys(&ctx.sender);
+        ctx.capture.request_exit();
+        return None; // DefWindowProc still does its normal kill-focus work
+    }
+    // Hook-independent escape (see is_wndproc_escape): works whenever the
+    // captured child has focus, so a failed keyboard-hook install cannot
+    // trap the user.
+    if is_wndproc_escape(
+        ctx.capture.relative(),
+        msg,
+        wparam.0 as u16,
+        unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0,
+        unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } < 0,
+        unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0,
+    ) {
+        ctx.capture.request_exit();
+        release_sticky_keys(&ctx.sender);
+        return Some(LRESULT(0)); // consume Q; do not forward it to the host
     }
 
     // Focus and drag-capture side effects first.
@@ -514,6 +574,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                 HookAction::Pass => {}
                 HookAction::ExitImmersive => {
                     shared.capture.request_exit();
+                    release_sticky_keys(&shared.sender);
                     return LRESULT(1);
                 }
                 HookAction::SwallowForward => {
@@ -814,5 +875,63 @@ mod tests {
     fn hook_decision_ordinary_keys_pass_through() {
         // 'A' — the wndproc WM_KEYDOWN path already forwards it.
         assert_eq!(hook_decision(0x41, false, false, true), HookAction::Pass);
+    }
+
+    #[test]
+    fn wndproc_escape_fires_only_on_full_combo_keydown_while_captured() {
+        // Full Ctrl+Alt+Shift+Q key-down while captured → escape.
+        assert!(is_wndproc_escape(
+            true,
+            WM_KEYDOWN,
+            VK_Q.0,
+            true,
+            true,
+            true
+        ));
+        // Alt makes Q a syskey — same result.
+        assert!(is_wndproc_escape(
+            true,
+            WM_SYSKEYDOWN,
+            VK_Q.0,
+            true,
+            true,
+            true
+        ));
+        // Not captured → never (normal desktop use must not trap Q).
+        assert!(!is_wndproc_escape(
+            false,
+            WM_KEYDOWN,
+            VK_Q.0,
+            true,
+            true,
+            true
+        ));
+        // Missing any modifier → no escape.
+        assert!(!is_wndproc_escape(
+            true,
+            WM_KEYDOWN,
+            VK_Q.0,
+            true,
+            false,
+            true
+        ));
+        // Wrong key → no escape.
+        assert!(!is_wndproc_escape(
+            true,
+            WM_KEYDOWN,
+            0x41,
+            true,
+            true,
+            true
+        ));
+        // Key-up (WM_KEYUP) is not a trigger edge.
+        assert!(!is_wndproc_escape(
+            true,
+            WM_KEYUP,
+            VK_Q.0,
+            true,
+            true,
+            true
+        ));
     }
 }

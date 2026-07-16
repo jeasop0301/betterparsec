@@ -998,6 +998,12 @@ impl eframe::App for App {
                                                 immersive::Action::Release => {
                                                     self.capture.set_relative(false);
                                                     s.release_mouse_capture();
+                                                    // Clear any host-latched
+                                                    // modifiers on exit (stuck
+                                                    // Alt — input.rs).
+                                                    input::release_sticky_keys(
+                                                        &run.session.input_sender(),
+                                                    );
                                                 }
                                             }
                                         }

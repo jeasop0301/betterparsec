@@ -837,15 +837,17 @@ fn run_exclusive(
     tracing::info!(rate, ch = channels, "WASAPI exclusive render up");
     shared.state.store(AUDIO_RUNNING, Ordering::Release);
 
-    // Device-format FIFO between decode and fill; same ~250 ms cap policy
-    // as run_shared's build_sink, shared across the two threads below.
+    // Device-format FIFO between decode and fill. Exclusive mode targets
+    // minimal latency, so the FIFO is deliberately far tighter than
+    // run_shared's ~250 ms cap.
     let fifo = std::sync::Mutex::new(VecDeque::<f32>::new());
-    let fifo_cap = rate as usize / 4 * channels as usize;
+    let mut fifo_cap = (rate as usize * 40 / 1000) * channels as usize;
     if delay_ms > 0 {
         let silence = debug_delay_samples(rate, channels, delay_ms);
         fifo.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extend(std::iter::repeat_n(0.0f32, silence));
+        fifo_cap += silence;
         tracing::info!(delay_ms, samples = silence, "audio debug delay armed");
     }
     let failed = AtomicBool::new(false);
@@ -947,6 +949,15 @@ mod tests {
             debug_delay_samples(48_000, 2, 2_000)
         );
         assert_eq!(debug_delay_samples(48_000, 2, 0), 0);
+    }
+
+    /// Pins run_exclusive's steady-state FIFO cap formula (40 ms window).
+    #[test]
+    fn exclusive_fifo_cap_base_formula() {
+        let rate = 48_000usize;
+        let channels = 2usize;
+        let fifo_cap = (rate * 40 / 1000) * channels;
+        assert_eq!(fifo_cap, 3_840);
     }
 
     /// Encode a sine with libavcodec's opus encoder (libopus, or the

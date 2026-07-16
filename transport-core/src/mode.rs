@@ -23,9 +23,10 @@
 //! dead outputs. When they grow a consumer, add fields then.
 //!
 //! Free-lunch quality levers (spatial adaptive-quantization on, encoder
-//! preset, weighted-prediction intent) are code *defaults*, never toggles:
-//! they live in the private [`FreeLunch`] constants below, are never varied
-//! by mode or user, and are not exposed on `ModeKnobs`.
+//! preset, weighted-prediction intent) are reserved shipping *defaults*,
+//! never toggles: they live in the private [`free_lunch`] constants below,
+//! are never varied by mode or user, are not exposed on `ModeKnobs`, and
+//! are consumed by a later encoder-wiring goal (no encoder reads them yet).
 
 /// Coarse user-facing streaming mode. `Fast` biases every default toward
 /// low latency; `Quality` biases toward fidelity; `Medium` sits between.

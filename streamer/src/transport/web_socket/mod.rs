@@ -352,7 +352,9 @@ fn should_request_idr(
     frame_interval_ms: u32,
     max_latency_ms: u32,
 ) -> bool {
-    let queue_latency_ms = (frame_queue_size as u32).saturating_mul(frame_interval_ms);
+    let queue_latency_ms = u32::try_from(frame_queue_size)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(frame_interval_ms);
     queue_latency_ms.saturating_add(rtt_ms) > max_latency_ms
 }
 

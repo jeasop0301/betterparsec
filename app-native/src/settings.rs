@@ -73,16 +73,18 @@ pub struct ClientSettings {
 
 impl Default for ClientSettings {
     fn default() -> Self {
-        // "sensible defaults = knobs_for(Medium, default)" per the
-        // assignment — keeps the store's own defaults from silently
-        // drifting away from the mode engine's Medium vector.
-        let knobs = knobs_for(StreamMode::default(), UserTradeoffs::default());
+        // Override fields default to 0 = "use the selected mode's default"
+        // (`knobs_for` treats a 0 field as no-override). Seeding the
+        // concrete Medium numbers here would pin them regardless of the
+        // chosen mode — the mode selector must actually change the
+        // resolved bitrate/resolution, so first run stays 0 and resolves
+        // to Medium's knobs via `to_flowconfig_fields`.
         ClientSettings {
             mode: StreamMode::default(),
-            bitrate_kbps: knobs.bitrate_kbps,
-            width: knobs.width,
-            height: knobs.height,
-            fps: knobs.fps,
+            bitrate_kbps: 0,
+            width: 0,
+            height: 0,
+            fps: 0,
             present_10bit: false,
             client_cursor: false,
         }
@@ -370,6 +372,30 @@ mod tests {
         };
         let (bitrate, ..) = to_flowconfig_fields(&client);
         assert_eq!(bitrate, 12_345);
+    }
+
+    #[test]
+    fn default_store_mode_switch_changes_flowconfig() {
+        // P1 guard: with a DEFAULT store (0-sentinel overrides), switching
+        // mode must actually change the resolved bitrate/resolution — the
+        // default must NOT pre-seed concrete numbers that pin one mode.
+        let mut c = ClientSettings::default();
+        assert_eq!(
+            (c.bitrate_kbps, c.width, c.height, c.fps),
+            (0, 0, 0, 0),
+            "default overrides are 0-sentinels, not concrete numbers"
+        );
+        c.mode = StreamMode::Fast;
+        let fast = to_flowconfig_fields(&c);
+        c.mode = StreamMode::Quality;
+        let quality = to_flowconfig_fields(&c);
+        assert_ne!(
+            fast, quality,
+            "mode selector must change the resolved fields"
+        );
+        let fk = knobs_for(StreamMode::Fast, UserTradeoffs::default());
+        assert_eq!(fast.0, fk.bitrate_kbps);
+        assert_eq!(fast.1, fk.width as u32);
     }
 
     #[test]

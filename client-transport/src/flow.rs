@@ -1,16 +1,17 @@
 //! Pure signaling flow state machine (m6-native-spike.md §F-1).
 //!
-//! Consumes parsed [`StreamServerMessage`]s plus local peer events and emits
-//! the outgoing [`StreamClientMessage`] sequence. No I/O, no WebRTC — the
-//! async session drives it; tests pin the message order contract:
+//! Consumes parsed [`StreamServerMessage`]s and emits the outgoing
+//! [`StreamClientMessage`] sequence. No I/O, no WebRTC — the async session
+//! drives it; tests pin the message order contract:
 //!
-//! `Init` → (server `Setup`) → `SetTransport(WebRTC)` → answer/ICE relay →
-//! (peer connected) → `StartStream` exactly once → (server
-//! `ConnectionComplete` / `ConnectionTerminated`).
+//! `Init` → (server `Setup`) → `SetTransport(WebRTC)` → `StartStream` →
+//! answer/ICE relay → (server `ConnectionComplete` / `ConnectionTerminated`).
+
+use std::num::NonZeroU32;
 
 use common::api_bindings::{
-    RtcIceCandidate, RtcIceServer, RtcSessionDescription, StreamClientMessage, StreamServerMessage,
-    StreamSettings, StreamSignalingMessage, TransportType,
+    RtcIceCandidate, RtcIceServer, RtcSessionDescription, StreamCapabilities, StreamClientMessage,
+    StreamServerMessage, StreamSettings, StreamSignalingMessage, TransportType,
 };
 
 /// Instructions for the driving session.
@@ -26,8 +27,47 @@ pub enum FlowAction {
     AddRemoteCandidate(RtcIceCandidate),
     /// Server confirmed the moonlight session: decoder setup parameters.
     Complete(StreamParams),
+    /// A locally detected protocol violation. The session must fail locally;
+    /// this is not a server-originated `ConnectionTerminated`.
+    ProtocolError(FlowProtocolError),
     /// Server terminated the stream.
     Terminated { error_code: i32 },
+}
+
+/// A malformed selected FEC capability or invalid signaling order is a local
+/// protocol error, never a request to silently downgrade the native decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowProtocolError {
+    InvalidFecCapabilityTuple {
+        selected_fec_protocol_version: Option<u8>,
+        fec_epoch: Option<u32>,
+    },
+    ConnectionCompleteBeforeSetup,
+    DuplicateConnectionComplete,
+    ConnectionCompleteAfterTermination,
+}
+
+/// Validate the exact selected FEC capability tuple and return the version and
+/// sender-owned epoch that must be latched for this stream.
+pub fn negotiated_fec_parameters(
+    capabilities: &StreamCapabilities,
+) -> Result<(u8, Option<NonZeroU32>), FlowProtocolError> {
+    match (
+        capabilities.selected_fec_protocol_version,
+        capabilities.fec_epoch,
+    ) {
+        (None, None) | (Some(1), None) => Ok((1, None)),
+        (Some(2), Some(epoch)) if epoch != 0 => Ok((
+            2,
+            Some(NonZeroU32::new(epoch).expect("epoch checked nonzero")),
+        )),
+        (selected_fec_protocol_version, fec_epoch) => {
+            Err(FlowProtocolError::InvalidFecCapabilityTuple {
+                selected_fec_protocol_version,
+                fec_epoch,
+            })
+        }
+    }
 }
 
 /// Decoder/audio setup parameters from `ConnectionComplete`
@@ -44,6 +84,10 @@ pub struct StreamParams {
     pub audio_coupled_streams: u32,
     pub audio_samples_per_frame: u32,
     pub audio_mapping: [u8; 8],
+    /// FEC wire version selected by the exact validated capability tuple.
+    pub fec_protocol_version: u8,
+    /// Sender-owned v2 epoch. This is absent for legacy v1 streams.
+    pub fec_epoch: Option<NonZeroU32>,
 }
 
 /// Clamp an SDP-negotiated audio channel count into the decodable range.
@@ -87,7 +131,7 @@ enum Phase {
     Negotiating,
     /// ConnectionComplete received.
     Streaming,
-    /// ConnectionTerminated received.
+    /// Server termination or a locally detected protocol error.
     Terminated,
 }
 
@@ -145,6 +189,9 @@ impl SignalingFlow {
                             // tell the streamer to skip the duplicate
                             // RTP-track send (halves the session wire).
                             video_over_fec_only: true,
+                            // Native client supports the exact v2 FEC wire
+                            // format while still accepting a v1 selection.
+                            requested_fec_protocol_version: Some(2),
                         },
                     }),
                 ]
@@ -156,6 +203,7 @@ impl SignalingFlow {
                 vec![FlowAction::AddRemoteCandidate(cand)]
             }
             StreamServerMessage::ConnectionComplete {
+                capabilities,
                 format,
                 width,
                 height,
@@ -166,8 +214,28 @@ impl SignalingFlow {
                 audio_coupled_streams,
                 audio_samples_per_frame,
                 audio_mapping,
-                ..
             } => {
+                let phase_error = match self.phase {
+                    Phase::AwaitSetup => Some(FlowProtocolError::ConnectionCompleteBeforeSetup),
+                    Phase::Streaming => Some(FlowProtocolError::DuplicateConnectionComplete),
+                    Phase::Terminated => {
+                        Some(FlowProtocolError::ConnectionCompleteAfterTermination)
+                    }
+                    Phase::Negotiating => None,
+                };
+                if let Some(error) = phase_error {
+                    self.phase = Phase::Terminated;
+                    return vec![FlowAction::ProtocolError(error)];
+                }
+
+                let (fec_protocol_version, fec_epoch) =
+                    match negotiated_fec_parameters(&capabilities) {
+                        Ok(parameters) => parameters,
+                        Err(error) => {
+                            self.phase = Phase::Terminated;
+                            return vec![FlowAction::ProtocolError(error)];
+                        }
+                    };
                 self.phase = Phase::Streaming;
                 vec![FlowAction::Complete(StreamParams {
                     format,
@@ -180,6 +248,8 @@ impl SignalingFlow {
                     audio_coupled_streams,
                     audio_samples_per_frame,
                     audio_mapping,
+                    fec_protocol_version,
+                    fec_epoch,
                 })]
             }
             StreamServerMessage::ConnectionTerminated { error_code } => {
@@ -207,10 +277,6 @@ impl SignalingFlow {
         ))
     }
 
-    /// Peer transitioned to connected. Pure state notification — the
-    /// StartStream message is already out (sent with Setup handling).
-    pub fn on_peer_connected(&mut self) {}
-
     pub fn is_terminated(&self) -> bool {
         self.phase == Phase::Terminated
     }
@@ -237,6 +303,32 @@ mod tests {
     fn setup_msg() -> StreamServerMessage {
         StreamServerMessage::Setup {
             ice_servers: vec![],
+        }
+    }
+    fn complete_msg(capabilities: StreamCapabilities) -> StreamServerMessage {
+        StreamServerMessage::ConnectionComplete {
+            capabilities,
+            format: 0x1,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            audio_sample_rate: 48000,
+            audio_channel_count: 2,
+            audio_streams: 1,
+            audio_coupled_streams: 1,
+            audio_samples_per_frame: 240,
+            audio_mapping: [0, 1, 0, 0, 0, 0, 0, 0],
+        }
+    }
+
+    fn capabilities(
+        selected_fec_protocol_version: Option<u8>,
+        fec_epoch: Option<u32>,
+    ) -> StreamCapabilities {
+        StreamCapabilities {
+            touch: false,
+            selected_fec_protocol_version,
+            fec_epoch,
         }
     }
 
@@ -277,6 +369,7 @@ mod tests {
         };
         assert_eq!(settings.bitrate_kbps, 8000);
         assert_eq!(settings.supported_codecs, 0x1);
+        assert_eq!(settings.requested_fec_protocol_version, Some(2));
 
         // Duplicate Setup is ignored (no second peer/transport/stream).
         assert!(flow.on_server_message(setup_msg()).is_empty());
@@ -286,26 +379,15 @@ mod tests {
     fn complete_and_terminated_reach_terminal_phases() {
         let mut flow = SignalingFlow::new(config());
         flow.on_server_message(setup_msg());
-        flow.on_peer_connected();
 
-        let actions = flow.on_server_message(StreamServerMessage::ConnectionComplete {
-            capabilities: common::api_bindings::StreamCapabilities { touch: false },
-            format: 0x1,
-            width: 1920,
-            height: 1080,
-            fps: 60,
-            audio_sample_rate: 48000,
-            audio_channel_count: 2,
-            audio_streams: 1,
-            audio_coupled_streams: 1,
-            audio_samples_per_frame: 240,
-            audio_mapping: [0, 1, 0, 0, 0, 0, 0, 0],
-        });
+        let actions = flow.on_server_message(complete_msg(capabilities(None, None)));
         let FlowAction::Complete(params) = &actions[0] else {
             panic!("expected Complete, got {actions:?}");
         };
         assert_eq!(params.width, 1920);
         assert_eq!(params.audio_samples_per_frame, 240);
+        assert_eq!(params.fec_protocol_version, 1);
+        assert_eq!(params.fec_epoch, None);
         assert!(!flow.is_terminated());
 
         let actions =
@@ -313,6 +395,91 @@ mod tests {
         assert!(matches!(
             actions[0],
             FlowAction::Terminated { error_code: 7 }
+        ));
+        assert!(flow.is_terminated());
+    }
+
+    #[test]
+    fn fec_capability_tuples_are_validated_exactly() {
+        for selected_fec_protocol_version in [None, Some(1), Some(2), Some(3)] {
+            for fec_epoch in [None, Some(0), Some(42)] {
+                let result = negotiated_fec_parameters(&capabilities(
+                    selected_fec_protocol_version,
+                    fec_epoch,
+                ));
+                match (selected_fec_protocol_version, fec_epoch) {
+                    (None, None) | (Some(1), None) => assert_eq!(result, Ok((1, None))),
+                    (Some(2), Some(42)) => {
+                        assert_eq!(result, Ok((2, NonZeroU32::new(42))))
+                    }
+                    _ => assert_eq!(
+                        result,
+                        Err(FlowProtocolError::InvalidFecCapabilityTuple {
+                            selected_fec_protocol_version,
+                            fec_epoch,
+                        })
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn complete_is_accepted_once_only_while_negotiating() {
+        let mut before_setup = SignalingFlow::new(config());
+        assert!(matches!(
+            before_setup
+                .on_server_message(complete_msg(capabilities(None, None)))
+                .as_slice(),
+            [FlowAction::ProtocolError(
+                FlowProtocolError::ConnectionCompleteBeforeSetup
+            )]
+        ));
+        assert!(before_setup.is_terminated());
+
+        let mut flow = SignalingFlow::new(config());
+        flow.on_server_message(setup_msg());
+        assert!(matches!(
+            flow.on_server_message(complete_msg(capabilities(Some(2), Some(42))))
+                .as_slice(),
+            [FlowAction::Complete(_)]
+        ));
+        assert!(matches!(
+            flow.on_server_message(complete_msg(capabilities(Some(2), Some(42))))
+                .as_slice(),
+            [FlowAction::ProtocolError(
+                FlowProtocolError::DuplicateConnectionComplete
+            )]
+        ));
+        assert!(flow.is_terminated());
+
+        let mut after_termination = SignalingFlow::new(config());
+        after_termination
+            .on_server_message(StreamServerMessage::ConnectionTerminated { error_code: 7 });
+        assert!(matches!(
+            after_termination
+                .on_server_message(complete_msg(capabilities(None, None)))
+                .as_slice(),
+            [FlowAction::ProtocolError(
+                FlowProtocolError::ConnectionCompleteAfterTermination
+            )]
+        ));
+    }
+
+    #[test]
+    fn malformed_capabilities_produce_typed_local_protocol_errors() {
+        let mut flow = SignalingFlow::new(config());
+        flow.on_server_message(setup_msg());
+
+        assert!(matches!(
+            flow.on_server_message(complete_msg(capabilities(Some(2), None)))
+                .as_slice(),
+            [FlowAction::ProtocolError(
+                FlowProtocolError::InvalidFecCapabilityTuple {
+                    selected_fec_protocol_version: Some(2),
+                    fec_epoch: None,
+                }
+            )]
         ));
         assert!(flow.is_terminated());
     }

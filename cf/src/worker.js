@@ -6,6 +6,11 @@
 //
 // The download password lives in the DOWNLOAD_PASSWORD secret
 // (`wrangler secret put DOWNLOAD_PASSWORD`).
+//
+// G006: a host-bundle download/distribution route is intentionally
+// absent here until P0 live closure (G007) -- this worker stays
+// client-zip-only until then; see tools/package-portable.ps1 -HostBundle
+// for the (unpublished, build-only) host complete-set staging path.
 
 const DIST_OBJECT = "betterparsec-portable.zip";
 

@@ -15,9 +15,11 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// How to launch the staged Foundation Sunshine.
+#[derive(Debug, Clone)]
 pub struct SunshineConfig {
     /// Directory containing the staged Foundation `sunshine(.exe)`.
     pub stage_root: PathBuf,
@@ -28,6 +30,14 @@ pub struct SunshineConfig {
     /// Moonlight HTTP port — must equal the embedded web-server's
     /// `moonlight.default_http_port` so pairing finds the host.
     pub port: u16,
+    /// Additional `key=value` launch overrides appended after the
+    /// fixed contract args above (`launch_args`) — the settings-derived
+    /// child-config values (`settings::generate_child_config`, parsed by
+    /// `host.rs`'s `extra_launch_args_from_child_config`) so the
+    /// generated child config file actually drives the launched process
+    /// instead of sitting unread on disk. Empty in callers/tests that
+    /// don't care (e.g. the stub-exe tests below).
+    pub extra_args: Vec<String>,
 }
 
 /// Everything path-shaped about one live run (pure derivation — tested).
@@ -41,6 +51,10 @@ pub struct LivePaths {
     pub state_file: PathBuf,
     pub apps_file: PathBuf,
     pub sunshine_log: PathBuf,
+    /// Retained for the launch-contract's live-dir layout; no longer
+    /// file-backed — stdout is consolidated into the host log via
+    /// `supervisor::spawn_log_pump`'s redaction pass instead (see
+    /// `SunshineProcess::spawn`).
     pub stdout_log: PathBuf,
     pub stderr_log: PathBuf,
 }
@@ -64,8 +78,8 @@ fn live_paths(stage_root: &Path, stamp: &str) -> LivePaths {
 
 /// The exact argument contract Start-FoundationPaired.ps1 passes (order
 /// included): positional config file, then `key=value` overrides.
-fn launch_args(paths: &LivePaths, port: u16) -> Vec<String> {
-    vec![
+fn launch_args(paths: &LivePaths, port: u16, extra: &[String]) -> Vec<String> {
+    let mut args = vec![
         paths.config_file.to_string_lossy().into_owned(),
         format!("port={port}"),
         "upnp=disabled".into(),
@@ -75,7 +89,9 @@ fn launch_args(paths: &LivePaths, port: u16) -> Vec<String> {
         format!("credentials_file={}", paths.state_file.to_string_lossy()),
         format!("file_apps={}", paths.apps_file.to_string_lossy()),
         format!("log_path={}", paths.sunshine_log.to_string_lossy()),
-    ]
+    ];
+    args.extend(extra.iter().cloned());
+    args
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -107,6 +123,12 @@ pub struct SunshineProcess {
     child: std::process::Child,
     pub paths: LivePaths,
     pub port: u16,
+    /// Join handle for the redacting stderr tee thread (see
+    /// `supervisor::spawn_redacting_tee`) — joined by `wait_ready`'s
+    /// startup-death path before it reads `tail_of(&paths.stderr_log)`,
+    /// so the on-disk tail it reports has actually been fully drained
+    /// and redacted (no partial-write race against the tee thread).
+    stderr_pump: Option<std::thread::JoinHandle<()>>,
 }
 
 impl SunshineProcess {
@@ -150,23 +172,35 @@ impl SunshineProcess {
         copy_dir_recursive(&cfg.identity_source, &paths.config_dir)
             .map_err(|e| format!("copy identity into live config: {e}"))?;
 
-        let stdout = std::fs::File::create(&paths.stdout_log)
-            .map_err(|e| format!("create stdout log: {e}"))?;
-        let stderr = std::fs::File::create(&paths.stderr_log)
-            .map_err(|e| format!("create stderr log: {e}"))?;
-        let child = std::process::Command::new(&exe)
-            .args(launch_args(&paths, cfg.port))
+        // stdout and stderr are both piped and consolidated into the
+        // host log via the G005 supervision lane's redaction pass
+        // (`supervisor::spawn_log_pump` / `supervisor::
+        // spawn_redacting_tee`) instead of a raw file redirect — the
+        // stderr tee additionally re-writes the redacted lines to
+        // `paths.stderr_log` so `wait_ready`'s startup-failure
+        // diagnostic (`tail_of`) never surfaces a raw secret either on
+        // disk or in the returned error string (the latter is also
+        // explicitly `redact`ed as belt-and-braces — see `wait_ready`).
+        let mut child = std::process::Command::new(&exe)
+            .args(launch_args(&paths, cfg.port, &cfg.extra_args))
             .current_dir(&cfg.stage_root)
-            .stdout(stdout)
-            .stderr(stderr)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("launch {}: {e}", exe.display()))?;
+        if let Some(stdout) = child.stdout.take() {
+            crate::supervisor::spawn_log_pump(stdout, "foundation-stdout");
+        }
+        let stderr_pump = child.stderr.take().and_then(|stderr| {
+            crate::supervisor::spawn_redacting_tee(stderr, paths.stderr_log.clone())
+        });
         tracing::info!(pid = child.id(), port = cfg.port, live = %paths.root.display(),
             "foundation sunshine launched");
         Ok(Self {
             child,
             paths,
             port: cfg.port,
+            stderr_pump,
         })
     }
 
@@ -181,9 +215,20 @@ impl SunshineProcess {
         let deadline = Instant::now() + timeout;
         loop {
             if let Ok(Some(status)) = self.child.try_wait() {
+                // Join the stderr tee so the file it writes to is fully
+                // drained/redacted before we read it — otherwise this
+                // could race the tee thread and read a partial tail.
+                // `redact` is also applied to the joined result directly
+                // (belt-and-braces: it's already redacted on write, but
+                // this keeps the invariant "no raw stderr byte reaches
+                // `last_error`/the log/the UI" true even if the on-disk
+                // write path ever changes).
+                if let Some(handle) = self.stderr_pump.take() {
+                    let _ = handle.join();
+                }
                 return Err(format!(
                     "sunshine exited during startup ({status}); stderr: {}",
-                    tail_of(&self.paths.stderr_log, 512)
+                    crate::supervisor::redact(&tail_of(&self.paths.stderr_log, 512))
                 ));
             }
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], self.port));
@@ -202,6 +247,23 @@ impl SunshineProcess {
 
     pub fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// The raw child handle — used by the G005 supervisor to assign
+    /// this process into the app-wide Job Object (containment) without
+    /// `sunshine.rs` knowing about job objects.
+    pub fn raw_child(&self) -> &std::process::Child {
+        &self.child
+    }
+
+    /// Best-effort exit code once the process has actually exited;
+    /// `None` while still running or if the platform can't report a
+    /// code. Never blocks (`try_wait`, not `wait`).
+    pub fn try_exit_code(&mut self) -> Option<i32> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => Some(status.code().unwrap_or(-1)),
+            _ => None,
+        }
     }
 
     /// Kill (if still alive) and reap. Killing an exited process is not
@@ -262,7 +324,7 @@ mod tests {
     #[test]
     fn launch_args_match_the_script_contract() {
         let paths = live_paths(Path::new("stage"), "S");
-        let args = launch_args(&paths, 49_000);
+        let args = launch_args(&paths, 49_000, &[]);
         let cfg = Path::new("stage").join("paired-live-S").join("config");
         assert_eq!(args[0], cfg.join("sunshine.conf").to_string_lossy());
         assert_eq!(args[1], "port=49000");
@@ -293,6 +355,16 @@ mod tests {
     }
 
     #[test]
+    fn launch_args_append_extra_overrides_after_the_contract_args() {
+        let paths = live_paths(Path::new("stage"), "S");
+        let extra = vec!["bitrate_kbps=6000".to_string(), "fps=60".to_string()];
+        let args = launch_args(&paths, 49_000, &extra);
+        assert_eq!(args.len(), 11, "9 contract args + 2 extra overrides");
+        assert_eq!(args[9], "bitrate_kbps=6000");
+        assert_eq!(args[10], "fps=60");
+    }
+
+    #[test]
     fn spawn_copies_identity_into_a_fresh_live_dir() {
         let stage = stub_stage("live");
         let identity = temp_dir("identity");
@@ -302,6 +374,7 @@ mod tests {
             stage_root: stage.clone(),
             identity_source: identity.clone(),
             port: 0, // bind pre-check: port 0 always bindable
+            extra_args: Vec::new(),
         })
         .expect("spawn stub");
         assert!(proc.paths.config_file.is_file(), "conf copied");
@@ -324,6 +397,7 @@ mod tests {
             stage_root: stage.clone(),
             identity_source: identity.clone(),
             port: 0,
+            extra_args: Vec::new(),
         })
         .expect("spawn stub");
         let err = proc
@@ -348,6 +422,7 @@ mod tests {
             stage_root: empty.clone(),
             identity_source: identity.clone(),
             port: 0,
+            extra_args: Vec::new(),
         })
         .expect_err("no exe");
         assert!(err.contains("staged sunshine not found"), "{err}");
@@ -360,6 +435,7 @@ mod tests {
             stage_root: stage.clone(),
             identity_source: identity.clone(),
             port,
+            extra_args: Vec::new(),
         })
         .expect_err("port busy");
         assert!(err.contains("already in use"), "{err}");
@@ -367,5 +443,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&empty);
         let _ = std::fs::remove_dir_all(&stage);
         let _ = std::fs::remove_dir_all(&identity);
+    }
+
+    /// End-to-end proof of the G005 redaction invariant across the
+    /// real `spawn`→pipe→tee→`wait_ready` path: a secret a child prints
+    /// to stderr during startup must never reach `last_error` (which
+    /// flows into `host.rs`'s log line and the UI) nor the on-disk
+    /// stderr diagnostic file.
+    #[test]
+    fn stderr_tail_never_leaks_a_secret_to_last_error_or_disk() {
+        let dir = temp_dir("redact-e2e");
+        let stderr_log = dir.join("foundation.stderr.log");
+        const SECRET: &str = "hunter2secretvalue";
+
+        let mut child = if cfg!(windows) {
+            let comspec = std::env::var_os("ComSpec").expect("ComSpec");
+            std::process::Command::new(comspec)
+                .args(["/C", &format!("echo password={SECRET} 1>&2 & exit /B 1")])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn stub")
+        } else {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &format!("echo password={SECRET} 1>&2; exit 1")])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn stub")
+        };
+        let stderr = child.stderr.take().expect("stderr piped");
+        let stderr_pump = crate::supervisor::spawn_redacting_tee(stderr, stderr_log.clone());
+
+        let mut proc = SunshineProcess {
+            child,
+            paths: LivePaths {
+                stderr_log: stderr_log.clone(),
+                ..live_paths(&dir, "redact-e2e")
+            },
+            port: 0,
+            stderr_pump,
+        };
+
+        let err = proc
+            .wait_ready(Duration::from_secs(10))
+            .expect_err("stub exits nonzero during startup");
+        assert!(
+            !err.contains(SECRET),
+            "last_error must never contain the raw secret: {err}"
+        );
+        assert!(
+            err.contains("<redacted>"),
+            "redacted marker expected in last_error: {err}"
+        );
+
+        let disk = std::fs::read_to_string(&stderr_log).unwrap_or_default();
+        assert!(
+            !disk.contains(SECRET),
+            "on-disk stderr log must never contain the raw secret: {disk}"
+        );
+        assert!(
+            disk.contains("<redacted>"),
+            "on-disk stderr log must show the redacted marker: {disk}"
+        );
+
+        proc.stop();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

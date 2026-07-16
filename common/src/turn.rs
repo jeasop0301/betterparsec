@@ -59,54 +59,63 @@ mod tests {
     /// actually compute HMAC-SHA1 (not some other/truncated MAC).
     #[test]
     fn hmac_sha1_matches_rfc2202() {
-        let mac = hmac_sha1(b"Jefe", b"what do ya want for nothing?").unwrap();
+        let mac = hmac_sha1(b"Jefe", b"what do ya want for nothing?").expect("hmac");
         let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex, "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79");
     }
 
     #[test]
     fn username_encodes_expiry_and_name() {
-        let c = generate("s", "alice", 600, 1_700_000_000).unwrap();
+        let c = generate("s", "alice", 600, 1_700_000_000).expect("generate");
         assert_eq!(c.username, "1700000600:alice");
     }
 
     #[test]
     fn empty_name_omits_separator() {
-        let c = generate("s", "", 600, 1_700_000_000).unwrap();
+        let c = generate("s", "", 600, 1_700_000_000).expect("generate");
         assert_eq!(c.username, "1700000600");
     }
 
     #[test]
     fn credential_is_base64_of_hmac_over_username() {
-        let c = generate("secret", "user", 3600, 1_000_000).unwrap();
-        let decoded = base64::decode_block(&c.credential).unwrap();
+        let c = generate("secret", "user", 3600, 1_000_000).expect("generate");
+        let decoded = base64::decode_block(&c.credential).expect("base64");
         assert_eq!(decoded.len(), 20, "SHA1 digest is 20 bytes");
         assert_eq!(
             decoded,
-            hmac_sha1(b"secret", c.username.as_bytes()).unwrap()
+            hmac_sha1(b"secret", c.username.as_bytes()).expect("hmac")
         );
     }
 
     #[test]
     fn deterministic_for_same_inputs() {
-        let a = generate("s", "u", 60, 1000).unwrap();
-        let b = generate("s", "u", 60, 1000).unwrap();
+        let a = generate("s", "u", 60, 1000).expect("generate");
+        let b = generate("s", "u", 60, 1000).expect("generate");
         assert_eq!(a.credential, b.credential);
         assert_eq!(a.username, b.username);
     }
 
     #[test]
     fn sensitive_to_secret_name_and_expiry() {
-        let base = generate("s", "u", 60, 1000).unwrap().credential;
-        assert_ne!(base, generate("s2", "u", 60, 1000).unwrap().credential);
-        assert_ne!(base, generate("s", "u2", 60, 1000).unwrap().credential);
+        let base = generate("s", "u", 60, 1000).expect("generate").credential;
+        assert_ne!(
+            base,
+            generate("s2", "u", 60, 1000).expect("generate").credential
+        );
+        assert_ne!(
+            base,
+            generate("s", "u2", 60, 1000).expect("generate").credential
+        );
         // expiry is embedded in the signed username, so a different time changes it.
-        assert_ne!(base, generate("s", "u", 60, 1001).unwrap().credential);
+        assert_ne!(
+            base,
+            generate("s", "u", 60, 1001).expect("generate").credential
+        );
     }
 
     #[test]
     fn ttl_saturates_without_panic() {
-        let c = generate("s", "u", u64::MAX, u64::MAX).unwrap();
+        let c = generate("s", "u", u64::MAX, u64::MAX).expect("generate");
         assert!(c.username.starts_with(&u64::MAX.to_string()));
     }
 }

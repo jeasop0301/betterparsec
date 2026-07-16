@@ -2,7 +2,7 @@ cargo-features = ["profile-rustflags"]
 
 [workspace]
 resolver = "3"
-members = ["common", "streamer", "transport-core", "client-transport", "app-native", "./"]
+members = ["common", "streamer", "transport-core", "client-transport", "app-native", "tools/updater", "./"]
 default-members = ["streamer", "transport-core", "./"]
 
 [profile.release]
@@ -74,6 +74,9 @@ num = "0.4"
 num-derive = "0.4"
 num-traits = "0.2"
 
+# Crypto (G006 complete-set manifest signing / verify-only in-app check)
+ed25519-dalek = { version = "3.0.0" }
+sha2 = "0.10.9"
 [workspace.lints.clippy]
 too_many_arguments = "allow"
 unwrap_used = "warn"

@@ -7,29 +7,124 @@ use crate::fec;
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
-/// Maximum on-wire size for a single `video_fec` message (source symbol).
-/// Repair symbols may slightly exceed this; that is accepted and documented.
-// Wire-spec constant: production budget lives in CHUNK_FRAGMENT_MAX; this is
-// referenced by tests and the M6 native client (fec-framing.md §8).
-#[allow(dead_code)]
+/// Maximum on-wire size for a v2 source-symbol message.
 pub const FEC_MSG_MAX: usize = 1200;
+/// Maximum v2 source payload (including the v2 chunk header).
+pub const V2_SOURCE_PAYLOAD_MAX: usize = 1185;
+/// Maximum v2 repair payload.
+pub const V2_REPAIR_PAYLOAD_MAX: usize = 1200;
+/// Maximum on-wire size for a v2 repair-symbol message.
+pub const V2_REPAIR_MSG_MAX: usize = 1221;
+/// Maximum encoded frame size accepted by the v2 chunk layer.
+pub const ENCODED_FRAME_MAX: usize = 4 * 1024 * 1024;
+/// Maximum number of chunks in a v2 frame.
+pub const V2_CHUNK_COUNT_MAX: u16 = 4096;
 
-/// Byte length of the chunk header (frame_id u32 + chunk_index u16 +
-/// chunk_count u16 + frame_type u8 + timestamp_us u32 = 13).
+/// v1 chunk header length. Kept unchanged for degraded v1 compatibility.
 pub const CHUNK_HEADER_LEN: usize = 13;
-
-/// Maximum Annex-B fragment that fits in one source symbol message:
-/// FEC_MSG_MAX(1200) − source-symbol-hdr(5) − chunk-header(13) = 1182.
+/// v1 fragment limit. Kept unchanged for degraded v1 compatibility.
 pub const CHUNK_FRAGMENT_MAX: usize = 1182;
+/// v2 chunk header length.
+pub const CHUNK_V2_HEADER_LEN: usize = 21;
+/// Maximum v2 frame fragment carried by one source symbol.
+pub const CHUNK_V2_FRAGMENT_MAX: usize = 1164;
 
-// ── Chunk layer ───────────────────────────────────────────────────────────
+const V2_SOURCE_HEADER_LEN: usize = 15;
+const V2_REPAIR_HEADER_LEN: usize = 21;
 
-/// Parsed chunk header fields.
-// Receive-side wire API: the production consumer is the TS client
-// (web/stream/video/fec_wire.ts); the Rust parse half is exercised by the
-// in-module + cross-vector tests and is the contract for the M6 native
-// client's cdylib receiver (m6-native-spike.md Option-3).
-#[allow(dead_code)]
+/// Sender-owned, nonzero stream epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Epoch(u32);
+
+impl Epoch {
+    pub fn new(value: u32) -> Option<Self> {
+        (value != 0).then_some(Self(value))
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireVersion {
+    V1,
+    V2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FecWireError {
+    Empty,
+    UnknownKind(u8),
+    Truncated,
+    Oversize,
+    InvalidEpoch,
+    InvalidLength,
+    CrcMismatch,
+    InvalidChunkCount,
+    InvalidChunkIndex,
+    InvalidFrameType,
+    InvalidEncodedFrameLength,
+}
+
+/// v2 symbols contain an epoch, making stream discontinuities explicit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum V2Symbol {
+    Source {
+        epoch: Epoch,
+        seq: u32,
+        payload: Vec<u8>,
+    },
+    Repair {
+        epoch: Epoch,
+        repair_seq: u16,
+        window_base: u32,
+        window_end: u32,
+        payload: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedSymbolMsg {
+    V1(fec::Symbol),
+    V2(V2Symbol),
+}
+
+impl ParsedSymbolMsg {
+    pub const fn version(&self) -> WireVersion {
+        match self {
+            Self::V1(_) => WireVersion::V1,
+            Self::V2(_) => WireVersion::V2,
+        }
+    }
+}
+
+/// Parsed v2 chunk header. `encoded_frame_len` and `encoded_frame_crc32` apply
+/// to the complete frame, not merely this fragment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkV2Header {
+    pub frame_id: u32,
+    pub chunk_index: u16,
+    pub chunk_count: u16,
+    pub frame_type_key: bool,
+    pub timestamp_us: u32,
+    pub encoded_frame_len: u32,
+    pub encoded_frame_crc32: u32,
+}
+
+fn ieee_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
+// ── v1 chunk layer (unchanged) ─────────────────────────────────────────────
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkHeader {
     pub frame_id: u32,
@@ -39,10 +134,6 @@ pub struct ChunkHeader {
     pub timestamp_us: u32,
 }
 
-/// Split `data` into chunk payloads (13-byte header + ≤ 1182-byte fragment).
-///
-/// Empty `data` produces exactly one chunk with an empty fragment.
-/// Panics (debug-assert) if `chunk_count` would exceed `u16::MAX`.
 pub fn chunk_frame(
     frame_id: u32,
     frame_type_key: bool,
@@ -50,7 +141,6 @@ pub fn chunk_frame(
     data: &[u8],
 ) -> Vec<Vec<u8>> {
     if data.is_empty() {
-        // Spec: "Empty frame data -> exactly one chunk with empty fragment."
         return vec![encode_chunk(
             frame_id,
             0,
@@ -64,17 +154,15 @@ pub fn chunk_frame(
     let chunk_count = data.len().div_ceil(CHUNK_FRAGMENT_MAX);
     debug_assert!(
         chunk_count <= u16::MAX as usize,
-        "chunk_count {chunk_count} overflows u16"
+        "chunk_count overflows u16"
     );
-    let chunk_count_u16 = chunk_count as u16;
-
     data.chunks(CHUNK_FRAGMENT_MAX)
         .enumerate()
         .map(|(i, fragment)| {
             encode_chunk(
                 frame_id,
                 i as u16,
-                chunk_count_u16,
+                chunk_count as u16,
                 frame_type_key,
                 timestamp_us,
                 fragment,
@@ -83,17 +171,6 @@ pub fn chunk_frame(
         .collect()
 }
 
-/// Serialise a chunk header + fragment into a single allocation.
-///
-/// Wire layout (all LE):
-/// ```text
-/// [0..4]  frame_id      u32
-/// [4..6]  chunk_index   u16
-/// [6..8]  chunk_count   u16
-/// [8]     frame_type    u8  (0=delta, 1=key)
-/// [9..13] timestamp_us  u32
-/// [13..]  fragment      bytes
-/// ```
 fn encode_chunk(
     frame_id: u32,
     chunk_index: u16,
@@ -103,50 +180,161 @@ fn encode_chunk(
     fragment: &[u8],
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(CHUNK_HEADER_LEN + fragment.len());
-    buf.extend_from_slice(&frame_id.to_le_bytes()); // [0..4]
-    buf.extend_from_slice(&chunk_index.to_le_bytes()); // [4..6]
-    buf.extend_from_slice(&chunk_count.to_le_bytes()); // [6..8]
-    buf.push(if frame_type_key { 1u8 } else { 0u8 }); // [8]
-    buf.extend_from_slice(&timestamp_us.to_le_bytes()); // [9..13]
-    buf.extend_from_slice(fragment); // [13..]
+    buf.extend_from_slice(&frame_id.to_le_bytes());
+    buf.extend_from_slice(&chunk_index.to_le_bytes());
+    buf.extend_from_slice(&chunk_count.to_le_bytes());
+    buf.push(u8::from(frame_type_key));
+    buf.extend_from_slice(&timestamp_us.to_le_bytes());
+    buf.extend_from_slice(fragment);
     buf
 }
 
-/// Parse the first 13 bytes as a [`ChunkHeader`] and return the remaining
-/// bytes as the fragment.  Returns `None` if the slice is shorter than 13.
-#[allow(dead_code)] // receive-side wire API: tests + M6 native client (fec-framing.md §8)
 pub fn parse_chunk_header(buf: &[u8]) -> Option<(ChunkHeader, &[u8])> {
     if buf.len() < CHUNK_HEADER_LEN {
         return None;
     }
-    let frame_id = u32::from_le_bytes(buf[0..4].try_into().ok()?);
-    let chunk_index = u16::from_le_bytes(buf[4..6].try_into().ok()?);
-    let chunk_count = u16::from_le_bytes(buf[6..8].try_into().ok()?);
-    let frame_type_key = buf[8] != 0;
-    let timestamp_us = u32::from_le_bytes(buf[9..13].try_into().ok()?);
-    let header = ChunkHeader {
-        frame_id,
-        chunk_index,
-        chunk_count,
-        frame_type_key,
-        timestamp_us,
+    Some((
+        ChunkHeader {
+            frame_id: u32::from_le_bytes(buf[0..4].try_into().ok()?),
+            chunk_index: u16::from_le_bytes(buf[4..6].try_into().ok()?),
+            chunk_count: u16::from_le_bytes(buf[6..8].try_into().ok()?),
+            frame_type_key: buf[8] != 0,
+            timestamp_us: u32::from_le_bytes(buf[9..13].try_into().ok()?),
+        },
+        &buf[CHUNK_HEADER_LEN..],
+    ))
+}
+
+// ── v2 chunk layer ─────────────────────────────────────────────────────────
+
+/// Chunk an encoded frame using the v2, integrity-checked header.
+pub fn chunk_frame_v2(
+    frame_id: u32,
+    frame_type_key: bool,
+    timestamp_us: u32,
+    data: &[u8],
+) -> Result<Vec<Vec<u8>>, FecWireError> {
+    if data.len() > ENCODED_FRAME_MAX {
+        return Err(FecWireError::InvalidEncodedFrameLength);
+    }
+    let chunk_count = data.len().max(1).div_ceil(CHUNK_V2_FRAGMENT_MAX);
+    if chunk_count > usize::from(V2_CHUNK_COUNT_MAX) {
+        return Err(FecWireError::InvalidChunkCount);
+    }
+    let crc = ieee_crc32(data);
+    let fragments: Vec<&[u8]> = if data.is_empty() {
+        vec![&[]]
+    } else {
+        data.chunks(CHUNK_V2_FRAGMENT_MAX).collect()
     };
-    Some((header, &buf[CHUNK_HEADER_LEN..]))
+    Ok(fragments
+        .into_iter()
+        .enumerate()
+        .map(|(index, fragment)| {
+            encode_chunk_v2(
+                &ChunkV2Header {
+                    frame_id,
+                    chunk_index: index as u16,
+                    chunk_count: chunk_count as u16,
+                    frame_type_key,
+                    timestamp_us,
+                    encoded_frame_len: data.len() as u32,
+                    encoded_frame_crc32: crc,
+                },
+                fragment,
+            )
+            .expect("chunk_frame_v2 generated a valid chunk")
+        })
+        .collect())
+}
+
+/// Encode one already-validated v2 chunk.
+pub fn encode_chunk_v2(header: &ChunkV2Header, fragment: &[u8]) -> Result<Vec<u8>, FecWireError> {
+    validate_chunk_v2(header, fragment)?;
+    let mut buf = Vec::with_capacity(CHUNK_V2_HEADER_LEN + fragment.len());
+    buf.extend_from_slice(&header.frame_id.to_le_bytes());
+    buf.extend_from_slice(&header.chunk_index.to_le_bytes());
+    buf.extend_from_slice(&header.chunk_count.to_le_bytes());
+    buf.push(u8::from(header.frame_type_key));
+    buf.extend_from_slice(&header.timestamp_us.to_le_bytes());
+    buf.extend_from_slice(&header.encoded_frame_len.to_le_bytes());
+    buf.extend_from_slice(&header.encoded_frame_crc32.to_le_bytes());
+    buf.extend_from_slice(fragment);
+    Ok(buf)
+}
+
+/// Parse a v2 chunk without allocating. Complete-frame CRC validation happens
+/// after reassembly, using [`validate_encoded_frame_v2`].
+pub fn parse_chunk_v2(buf: &[u8]) -> Result<(ChunkV2Header, &[u8]), FecWireError> {
+    if buf.len() < CHUNK_V2_HEADER_LEN {
+        return Err(FecWireError::Truncated);
+    }
+    let frame_type = buf[8];
+    let header = ChunkV2Header {
+        frame_id: u32::from_le_bytes(buf[0..4].try_into().map_err(|_| FecWireError::Truncated)?),
+        chunk_index: u16::from_le_bytes(buf[4..6].try_into().map_err(|_| FecWireError::Truncated)?),
+        chunk_count: u16::from_le_bytes(buf[6..8].try_into().map_err(|_| FecWireError::Truncated)?),
+        frame_type_key: frame_type == 1,
+        timestamp_us: u32::from_le_bytes(
+            buf[9..13].try_into().map_err(|_| FecWireError::Truncated)?,
+        ),
+        encoded_frame_len: u32::from_le_bytes(
+            buf[13..17]
+                .try_into()
+                .map_err(|_| FecWireError::Truncated)?,
+        ),
+        encoded_frame_crc32: u32::from_le_bytes(
+            buf[17..21]
+                .try_into()
+                .map_err(|_| FecWireError::Truncated)?,
+        ),
+    };
+    if frame_type > 1 {
+        return Err(FecWireError::InvalidFrameType);
+    }
+    validate_chunk_v2(&header, &buf[CHUNK_V2_HEADER_LEN..])?;
+    Ok((header, &buf[CHUNK_V2_HEADER_LEN..]))
+}
+
+fn validate_chunk_v2(header: &ChunkV2Header, fragment: &[u8]) -> Result<(), FecWireError> {
+    if header.chunk_count == 0 || header.chunk_count > V2_CHUNK_COUNT_MAX {
+        return Err(FecWireError::InvalidChunkCount);
+    }
+    if header.chunk_index >= header.chunk_count {
+        return Err(FecWireError::InvalidChunkIndex);
+    }
+    if usize::try_from(header.encoded_frame_len).unwrap_or(usize::MAX) > ENCODED_FRAME_MAX {
+        return Err(FecWireError::InvalidEncodedFrameLength);
+    }
+    if fragment.len() > CHUNK_V2_FRAGMENT_MAX {
+        return Err(FecWireError::Oversize);
+    }
+    Ok(())
+}
+
+pub fn validate_encoded_frame_v2(
+    header: &ChunkV2Header,
+    encoded_frame: &[u8],
+) -> Result<(), FecWireError> {
+    if encoded_frame.len() != header.encoded_frame_len as usize {
+        return Err(FecWireError::InvalidLength);
+    }
+    if ieee_crc32(encoded_frame) != header.encoded_frame_crc32 {
+        return Err(FecWireError::CrcMismatch);
+    }
+    Ok(())
 }
 
 // ── Symbol messages ───────────────────────────────────────────────────────
 
-/// Serialise a [`fec::Symbol`] to its `video_fec` wire bytes.
-///
-/// Source:  `[0x00] ++ seq(4 LE) ++ chunk_payload`
-/// Repair:  `[0x01] ++ repair_seq(2 LE) ++ window_base(4 LE) ++ window_end(4 LE) ++ payload`
+/// Serialise a v1 [`fec::Symbol`] unchanged.
 pub fn encode_symbol_msg(sym: &fec::Symbol) -> Vec<u8> {
     match sym {
         fec::Symbol::Source { seq, payload } => {
-            let mut buf = Vec::with_capacity(1 + 4 + payload.len());
-            buf.push(0u8); // kind = 0
-            buf.extend_from_slice(&seq.to_le_bytes()); // seq (4 LE)
-            buf.extend_from_slice(payload); // chunk payload
+            let mut buf = Vec::with_capacity(5 + payload.len());
+            buf.push(0);
+            buf.extend_from_slice(&seq.to_le_bytes());
+            buf.extend_from_slice(payload);
             buf
         }
         fec::Symbol::Repair {
@@ -155,98 +343,320 @@ pub fn encode_symbol_msg(sym: &fec::Symbol) -> Vec<u8> {
             window_end,
             payload,
         } => {
-            let mut buf = Vec::with_capacity(1 + 2 + 4 + 4 + payload.len());
-            buf.push(1u8); // kind = 1
-            buf.extend_from_slice(&repair_seq.to_le_bytes()); // repair_seq (2 LE)
-            buf.extend_from_slice(&window_base.to_le_bytes()); // window_base (4 LE)
-            buf.extend_from_slice(&window_end.to_le_bytes()); // window_end (4 LE)
-            buf.extend_from_slice(payload); // combination payload
+            let mut buf = Vec::with_capacity(11 + payload.len());
+            buf.push(1);
+            buf.extend_from_slice(&repair_seq.to_le_bytes());
+            buf.extend_from_slice(&window_base.to_le_bytes());
+            buf.extend_from_slice(&window_end.to_le_bytes());
+            buf.extend_from_slice(payload);
             buf
         }
     }
 }
 
-/// Deserialise a `video_fec` wire message into a [`fec::Symbol`].
-/// Returns `None` on truncated or unknown-kind input.
-#[allow(dead_code)] // receive-side wire API: tests + M6 native client (fec-framing.md §8)
+/// Parse v1 messages only; v2 is deliberately not reinterpreted as v1.
 pub fn parse_symbol_msg(buf: &[u8]) -> Option<fec::Symbol> {
-    let kind = *buf.first()?;
-    match kind {
-        0 => {
-            // Source: need at least 5 bytes (kind + seq)
-            if buf.len() < 5 {
-                return None;
-            }
-            let seq = u32::from_le_bytes(buf[1..5].try_into().ok()?);
-            let payload = buf[5..].to_vec();
-            Some(fec::Symbol::Source { seq, payload })
-        }
-        1 => {
-            // Repair: need at least 11 bytes (kind + repair_seq + window_base + window_end)
-            if buf.len() < 11 {
-                return None;
-            }
-            let repair_seq = u16::from_le_bytes(buf[1..3].try_into().ok()?);
-            let window_base = u32::from_le_bytes(buf[3..7].try_into().ok()?);
-            let window_end = u32::from_le_bytes(buf[7..11].try_into().ok()?);
-            let payload = buf[11..].to_vec();
-            Some(fec::Symbol::Repair {
-                repair_seq,
-                window_base,
-                window_end,
-                payload,
-            })
-        }
-        _ => None,
+    match parse_symbol_msg_versioned(buf).ok()? {
+        ParsedSymbolMsg::V1(symbol) => Some(symbol),
+        ParsedSymbolMsg::V2(_) => None,
     }
 }
 
-// ── ACK messages ──────────────────────────────────────────────────────────
+pub fn encode_symbol_msg_v2(sym: &V2Symbol) -> Result<Vec<u8>, FecWireError> {
+    let (kind, epoch, repair_seq, window_base, window_end, seq, payload) = match sym {
+        V2Symbol::Source {
+            epoch,
+            seq,
+            payload,
+        } => (2, *epoch, 0, 0, 0, *seq, payload.as_slice()),
+        V2Symbol::Repair {
+            epoch,
+            repair_seq,
+            window_base,
+            window_end,
+            payload,
+        } => (
+            3,
+            *epoch,
+            *repair_seq,
+            *window_base,
+            *window_end,
+            0,
+            payload.as_slice(),
+        ),
+    };
+    let max = if kind == 2 {
+        V2_SOURCE_PAYLOAD_MAX
+    } else {
+        V2_REPAIR_PAYLOAD_MAX
+    };
+    if payload.len() > max {
+        return Err(FecWireError::Oversize);
+    }
+    let mut buf = Vec::with_capacity(
+        if kind == 2 {
+            V2_SOURCE_HEADER_LEN
+        } else {
+            V2_REPAIR_HEADER_LEN
+        } + payload.len(),
+    );
+    buf.push(kind);
+    buf.extend_from_slice(&epoch.get().to_le_bytes());
+    if kind == 2 {
+        buf.extend_from_slice(&seq.to_le_bytes());
+    } else {
+        buf.extend_from_slice(&repair_seq.to_le_bytes());
+        buf.extend_from_slice(&window_base.to_le_bytes());
+        buf.extend_from_slice(&window_end.to_le_bytes());
+    }
+    buf.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&ieee_crc32(payload).to_le_bytes());
+    buf.extend_from_slice(payload);
+    Ok(buf)
+}
 
-/// Messages sent from client → host on the `video_fec_ack` channel.
+/// Parse a v1 or v2 symbol. Selected v2 bytes always produce a v2 result or
+/// error; malformed v2 data never falls back to the v1 parser.
+pub fn parse_symbol_msg_versioned(buf: &[u8]) -> Result<ParsedSymbolMsg, FecWireError> {
+    let kind = *buf.first().ok_or(FecWireError::Empty)?;
+    match kind {
+        0 => {
+            if buf.len() < 5 {
+                return Err(FecWireError::Truncated);
+            }
+            Ok(ParsedSymbolMsg::V1(fec::Symbol::Source {
+                seq: u32::from_le_bytes(buf[1..5].try_into().map_err(|_| FecWireError::Truncated)?),
+                payload: buf[5..].to_vec(),
+            }))
+        }
+        1 => {
+            if buf.len() < 11 {
+                return Err(FecWireError::Truncated);
+            }
+            Ok(ParsedSymbolMsg::V1(fec::Symbol::Repair {
+                repair_seq: u16::from_le_bytes(
+                    buf[1..3].try_into().map_err(|_| FecWireError::Truncated)?,
+                ),
+                window_base: u32::from_le_bytes(
+                    buf[3..7].try_into().map_err(|_| FecWireError::Truncated)?,
+                ),
+                window_end: u32::from_le_bytes(
+                    buf[7..11].try_into().map_err(|_| FecWireError::Truncated)?,
+                ),
+                payload: buf[11..].to_vec(),
+            }))
+        }
+        2 => parse_v2_source(buf).map(ParsedSymbolMsg::V2),
+        3 => parse_v2_repair(buf).map(ParsedSymbolMsg::V2),
+        other => Err(FecWireError::UnknownKind(other)),
+    }
+}
+
+fn parse_v2_source(buf: &[u8]) -> Result<V2Symbol, FecWireError> {
+    if buf.len() < V2_SOURCE_HEADER_LEN {
+        return Err(FecWireError::Truncated);
+    }
+    if buf.len() > FEC_MSG_MAX {
+        return Err(FecWireError::Oversize);
+    }
+    let epoch = Epoch::new(u32::from_le_bytes(
+        buf[1..5].try_into().map_err(|_| FecWireError::Truncated)?,
+    ))
+    .ok_or(FecWireError::InvalidEpoch)?;
+    let seq = u32::from_le_bytes(buf[5..9].try_into().map_err(|_| FecWireError::Truncated)?);
+    let len =
+        u16::from_le_bytes(buf[9..11].try_into().map_err(|_| FecWireError::Truncated)?) as usize;
+    if len > V2_SOURCE_PAYLOAD_MAX || buf.len() != V2_SOURCE_HEADER_LEN + len {
+        return Err(FecWireError::InvalidLength);
+    }
+    let payload = &buf[V2_SOURCE_HEADER_LEN..];
+    if ieee_crc32(payload)
+        != u32::from_le_bytes(
+            buf[11..15]
+                .try_into()
+                .map_err(|_| FecWireError::Truncated)?,
+        )
+    {
+        return Err(FecWireError::CrcMismatch);
+    }
+    Ok(V2Symbol::Source {
+        epoch,
+        seq,
+        payload: payload.to_vec(),
+    })
+}
+
+fn parse_v2_repair(buf: &[u8]) -> Result<V2Symbol, FecWireError> {
+    if buf.len() < V2_REPAIR_HEADER_LEN {
+        return Err(FecWireError::Truncated);
+    }
+    if buf.len() > V2_REPAIR_MSG_MAX {
+        return Err(FecWireError::Oversize);
+    }
+    let epoch = Epoch::new(u32::from_le_bytes(
+        buf[1..5].try_into().map_err(|_| FecWireError::Truncated)?,
+    ))
+    .ok_or(FecWireError::InvalidEpoch)?;
+    let repair_seq = u16::from_le_bytes(buf[5..7].try_into().map_err(|_| FecWireError::Truncated)?);
+    let window_base =
+        u32::from_le_bytes(buf[7..11].try_into().map_err(|_| FecWireError::Truncated)?);
+    let window_end = u32::from_le_bytes(
+        buf[11..15]
+            .try_into()
+            .map_err(|_| FecWireError::Truncated)?,
+    );
+    let len = u16::from_le_bytes(
+        buf[15..17]
+            .try_into()
+            .map_err(|_| FecWireError::Truncated)?,
+    ) as usize;
+    if len > V2_REPAIR_PAYLOAD_MAX || buf.len() != V2_REPAIR_HEADER_LEN + len {
+        return Err(FecWireError::InvalidLength);
+    }
+    let payload = &buf[V2_REPAIR_HEADER_LEN..];
+    if ieee_crc32(payload)
+        != u32::from_le_bytes(
+            buf[17..21]
+                .try_into()
+                .map_err(|_| FecWireError::Truncated)?,
+        )
+    {
+        return Err(FecWireError::CrcMismatch);
+    }
+    Ok(V2Symbol::Repair {
+        epoch,
+        repair_seq,
+        window_base,
+        window_end,
+        payload: payload.to_vec(),
+    })
+}
+
+// ── Control messages ───────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AckMsg {
-    /// Length-1 message 0x01: client subscribes / activates host FEC sender.
     Subscribe,
-    /// Length-1 message 0x00: unrecoverable loss — request a keyframe.
     NeedsIdr,
-    /// Length-4 message: highest fully decoded source seq (u32 LE).
     Ack(u32),
 }
 
-/// Parse a raw `video_fec_ack` message.
-///
-/// | Wire bytes | Meaning |
-/// |---|---|
-/// | `[0x01]` | Subscribe — client activates host FEC sender |
-/// | `[0x00]` | NeedsIdr — unrecoverable loss, request keyframe |
-/// | 4 bytes   | Ack(u32 LE) — highest fully decoded source seq |
-///
-/// Returns `None` for empty, ambiguous length (2, 3, ≥5), or an
-/// unknown single-byte value (anything other than 0x00 / 0x01).
-pub fn parse_ack_msg(buf: &[u8]) -> Option<AckMsg> {
-    match buf.len() {
-        0 => None,
-        1 => match buf[0] {
-            0x00 => Some(AckMsg::NeedsIdr),
-            0x01 => Some(AckMsg::Subscribe),
-            _ => None,
-        },
-        4 => {
-            let seq = u32::from_le_bytes(buf[0..4].try_into().ok()?);
-            Some(AckMsg::Ack(seq))
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum V2ControlMsg {
+    Subscribe { epoch: Epoch },
+    Ack { epoch: Epoch, highest_seq: u32 },
+    NeedsIdr { epoch: Epoch, reason: u8 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedControlMsg {
+    V1(AckMsg),
+    V2(V2ControlMsg),
+}
+
+impl ParsedControlMsg {
+    pub const fn version(&self) -> WireVersion {
+        match self {
+            Self::V1(_) => WireVersion::V1,
+            Self::V2(_) => WireVersion::V2,
         }
-        _ => None,
     }
 }
 
-/// Encode an [`AckMsg`] to its wire bytes.
-#[allow(dead_code)] // receive-side wire API: tests + M6 native client (fec-framing.md §8)
+pub fn parse_ack_msg(buf: &[u8]) -> Option<AckMsg> {
+    match parse_control_msg(buf).ok()? {
+        ParsedControlMsg::V1(msg) => Some(msg),
+        ParsedControlMsg::V2(_) => None,
+    }
+}
+
 pub fn encode_ack_msg(msg: &AckMsg) -> Vec<u8> {
     match msg {
         AckMsg::Subscribe => vec![0x01],
         AckMsg::NeedsIdr => vec![0x00],
         AckMsg::Ack(seq) => seq.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn encode_control_msg_v2(msg: &V2ControlMsg) -> Vec<u8> {
+    match msg {
+        V2ControlMsg::Subscribe { epoch } => {
+            let mut out = vec![0x82];
+            out.extend_from_slice(&epoch.get().to_le_bytes());
+            out
+        }
+        V2ControlMsg::Ack { epoch, highest_seq } => {
+            let mut out = vec![0x81];
+            out.extend_from_slice(&epoch.get().to_le_bytes());
+            out.extend_from_slice(&highest_seq.to_le_bytes());
+            out
+        }
+        V2ControlMsg::NeedsIdr { epoch, reason } => {
+            let mut out = vec![0x80];
+            out.extend_from_slice(&epoch.get().to_le_bytes());
+            out.push(*reason);
+            out
+        }
+    }
+}
+
+/// Parse a v1 or selected-v2 control. Reserved selected-v2 kinds never fall
+/// back to the v1 ACK parser, even when their malformed shape is four bytes.
+pub fn parse_control_msg(buf: &[u8]) -> Result<ParsedControlMsg, FecWireError> {
+    match buf {
+        [] => Err(FecWireError::Empty),
+        [0x80, epoch @ ..] => {
+            if epoch.len() < 5 {
+                return Err(FecWireError::Truncated);
+            }
+            if epoch.len() > 5 {
+                return Err(FecWireError::InvalidLength);
+            }
+            Ok(ParsedControlMsg::V2(V2ControlMsg::NeedsIdr {
+                epoch: Epoch::new(u32::from_le_bytes(
+                    epoch[..4].try_into().map_err(|_| FecWireError::Truncated)?,
+                ))
+                .ok_or(FecWireError::InvalidEpoch)?,
+                reason: epoch[4],
+            }))
+        }
+        [0x81, epoch @ ..] => {
+            if epoch.len() < 8 {
+                return Err(FecWireError::Truncated);
+            }
+            if epoch.len() > 8 {
+                return Err(FecWireError::InvalidLength);
+            }
+            Ok(ParsedControlMsg::V2(V2ControlMsg::Ack {
+                epoch: Epoch::new(u32::from_le_bytes(
+                    epoch[..4].try_into().map_err(|_| FecWireError::Truncated)?,
+                ))
+                .ok_or(FecWireError::InvalidEpoch)?,
+                highest_seq: u32::from_le_bytes(
+                    epoch[4..].try_into().map_err(|_| FecWireError::Truncated)?,
+                ),
+            }))
+        }
+        [0x82, epoch @ ..] => {
+            if epoch.len() < 4 {
+                return Err(FecWireError::Truncated);
+            }
+            if epoch.len() > 4 {
+                return Err(FecWireError::InvalidLength);
+            }
+            Ok(ParsedControlMsg::V2(V2ControlMsg::Subscribe {
+                epoch: Epoch::new(u32::from_le_bytes(
+                    epoch.try_into().map_err(|_| FecWireError::Truncated)?,
+                ))
+                .ok_or(FecWireError::InvalidEpoch)?,
+            }))
+        }
+        [0x00] => Ok(ParsedControlMsg::V1(AckMsg::NeedsIdr)),
+        [0x01] => Ok(ParsedControlMsg::V1(AckMsg::Subscribe)),
+        [a, b, c, d] => Ok(ParsedControlMsg::V1(AckMsg::Ack(u32::from_le_bytes([
+            *a, *b, *c, *d,
+        ])))),
+        [kind, ..] => Err(FecWireError::UnknownKind(*kind)),
     }
 }
 
@@ -538,6 +948,59 @@ mod tests {
     fn ack_parse_3_bytes_is_none() {
         assert!(parse_ack_msg(&[0x00, 0x00, 0x00]).is_none());
     }
+    #[test]
+    fn reserved_v2_control_4_byte_shapes_never_parse_as_v1_acks() {
+        for kind in [0x80, 0x81, 0x82] {
+            let wire = [kind, 0x11, 0x22, 0x33];
+            assert_eq!(parse_control_msg(&wire), Err(FecWireError::Truncated));
+            assert_eq!(parse_ack_msg(&wire), None);
+        }
+    }
+
+    #[test]
+    fn v2_controls_require_exact_lengths() {
+        for (wire, message) in [
+            (
+                vec![0x80, 1, 0, 0, 0, 7],
+                V2ControlMsg::NeedsIdr {
+                    epoch: Epoch::new(1).expect("nonzero epoch must be valid"),
+                    reason: 7,
+                },
+            ),
+            (
+                vec![0x81, 2, 0, 0, 0, 9, 0, 0, 0],
+                V2ControlMsg::Ack {
+                    epoch: Epoch::new(2).expect("nonzero epoch must be valid"),
+                    highest_seq: 9,
+                },
+            ),
+            (
+                vec![0x82, 3, 0, 0, 0],
+                V2ControlMsg::Subscribe {
+                    epoch: Epoch::new(3).expect("nonzero epoch must be valid"),
+                },
+            ),
+        ] {
+            assert_eq!(parse_control_msg(&wire), Ok(ParsedControlMsg::V2(message)));
+            assert_eq!(
+                parse_control_msg(&wire[..wire.len() - 1]),
+                Err(FecWireError::Truncated)
+            );
+
+            let mut long = wire;
+            long.push(0);
+            assert_eq!(parse_control_msg(&long), Err(FecWireError::InvalidLength));
+        }
+    }
+
+    #[test]
+    fn ordinary_v1_ack_with_nonreserved_first_byte_still_parses() {
+        let wire = 0x1020_30efu32.to_le_bytes();
+        assert_eq!(
+            parse_control_msg(&wire),
+            Ok(ParsedControlMsg::V1(AckMsg::Ack(0x1020_30ef)))
+        );
+    }
 
     // ── AckMsg encode roundtrip ───────────────────────────────────────────
 
@@ -561,6 +1024,122 @@ mod tests {
         let wire = encode_ack_msg(&msg);
         assert_eq!(parse_ack_msg(&wire), Some(msg));
     }
+    #[test]
+    fn v2_source_golden_roundtrip() {
+        let symbol = V2Symbol::Source {
+            epoch: Epoch::new(0x1122_3344).expect("nonzero epoch must be valid"),
+            seq: 0x5566_7788,
+            payload: vec![0xaa, 0xbb],
+        };
+        let wire = encode_symbol_msg_v2(&symbol).expect("source symbol must encode");
+        assert_eq!(
+            wire,
+            vec![
+                0x02, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0x02, 0x00, 0x98, 0x2c, 0x82,
+                0x49, 0xaa, 0xbb,
+            ]
+        );
+        assert_eq!(
+            parse_symbol_msg_versioned(&wire),
+            Ok(ParsedSymbolMsg::V2(symbol))
+        );
+    }
+
+    #[test]
+    fn v2_repair_golden_roundtrip() {
+        let symbol = V2Symbol::Repair {
+            epoch: Epoch::new(1).expect("nonzero epoch must be valid"),
+            repair_seq: 2,
+            window_base: 3,
+            window_end: 4,
+            payload: vec![0x42],
+        };
+        let wire = encode_symbol_msg_v2(&symbol).expect("repair symbol must encode");
+        assert_eq!(
+            wire,
+            vec![
+                0x03, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00,
+                0x00, 0x01, 0x00, 0x31, 0xcf, 0xd0, 0x4a, 0x42,
+            ]
+        );
+        assert_eq!(
+            parse_symbol_msg_versioned(&wire),
+            Ok(ParsedSymbolMsg::V2(symbol))
+        );
+    }
+
+    #[test]
+    fn v2_source_rejects_corruption_truncation_and_oversize() {
+        let symbol = V2Symbol::Source {
+            epoch: Epoch::new(1).expect("nonzero epoch must be valid"),
+            seq: 0,
+            payload: vec![7; 2],
+        };
+        let mut corrupted = encode_symbol_msg_v2(&symbol).expect("source symbol must encode");
+        *corrupted
+            .last_mut()
+            .expect("encoded source symbol must contain a payload byte") ^= 1;
+        assert_eq!(
+            parse_symbol_msg_versioned(&corrupted),
+            Err(FecWireError::CrcMismatch)
+        );
+        assert_eq!(
+            parse_symbol_msg_versioned(&corrupted[..14]),
+            Err(FecWireError::Truncated)
+        );
+        assert_eq!(
+            encode_symbol_msg_v2(&V2Symbol::Source {
+                epoch: Epoch::new(1).expect("nonzero epoch must be valid"),
+                seq: 0,
+                payload: vec![0; V2_SOURCE_PAYLOAD_MAX + 1],
+            }),
+            Err(FecWireError::Oversize)
+        );
+    }
+
+    #[test]
+    fn v2_chunk_golden_crc_and_bounds() {
+        let chunks = chunk_frame_v2(1, true, 0x1122_3344, &[0xaa, 0xbb]).expect("frame must chunk");
+        assert_eq!(
+            chunks[0],
+            vec![
+                1, 0, 0, 0, 0, 0, 1, 0, 1, 0x44, 0x33, 0x22, 0x11, 2, 0, 0, 0, 0x98, 0x2c, 0x82,
+                0x49, 0xaa, 0xbb,
+            ]
+        );
+        let (header, fragment) = parse_chunk_v2(&chunks[0]).expect("encoded chunk must parse");
+        assert_eq!(fragment, [0xaa, 0xbb]);
+        assert_eq!(validate_encoded_frame_v2(&header, fragment), Ok(()));
+        assert_eq!(
+            parse_chunk_v2(&chunks[0][..20]),
+            Err(FecWireError::Truncated)
+        );
+        assert_eq!(
+            chunk_frame_v2(0, false, 0, &vec![0; ENCODED_FRAME_MAX + 1]),
+            Err(FecWireError::InvalidEncodedFrameLength)
+        );
+    }
+
+    #[test]
+    fn v2_controls_are_versioned_and_validate_epoch() {
+        let epoch = Epoch::new(9).expect("nonzero epoch must be valid");
+        for message in [
+            V2ControlMsg::Subscribe { epoch },
+            V2ControlMsg::Ack {
+                epoch,
+                highest_seq: 7,
+            },
+            V2ControlMsg::NeedsIdr { epoch, reason: 3 },
+        ] {
+            let wire = encode_control_msg_v2(&message);
+            assert_eq!(parse_control_msg(&wire), Ok(ParsedControlMsg::V2(message)));
+            assert_eq!(parse_ack_msg(&wire), None);
+        }
+        assert_eq!(
+            parse_control_msg(&[0x82, 0, 0, 0, 0]),
+            Err(FecWireError::InvalidEpoch)
+        );
+    }
 }
 
 // ── Cross-language vector tests ────────────────────────────────────────────
@@ -571,7 +1150,10 @@ mod tests {
 
 #[cfg(test)]
 mod cross_vector_tests {
-    use super::{chunk_frame, encode_symbol_msg, parse_chunk_header, parse_symbol_msg};
+    use super::{
+        Epoch, V2Symbol, chunk_frame, encode_symbol_msg, encode_symbol_msg_v2, ieee_crc32,
+        parse_chunk_header, parse_symbol_msg,
+    };
     use crate::fec::{DecoderEvent, FecConfig, FecDecoder, FecEncoder};
 
     /// Dropped message indices: source seq 3 (frame 1 last chunk).
@@ -730,6 +1312,62 @@ mod cross_vector_tests {
             })
             .collect()
     }
+    fn v2_fixture_records() -> Vec<serde_json::Value> {
+        let symbols = vec![
+            V2Symbol::Source {
+                epoch: Epoch::new(0x0102_0304).expect("canonical epoch is nonzero"),
+                seq: 0xa0b0_c0d0,
+                payload: vec![
+                    0x04, 0x03, 0x02, 0x01, 0, 0, 1, 0, 1, 8, 7, 6, 5, 1, 0, 0, 0, 0x7b, 0xa5, 1,
+                    0xe4, 0xaa,
+                ],
+            },
+            V2Symbol::Repair {
+                epoch: Epoch::new(0x1122_3344).expect("canonical epoch is nonzero"),
+                repair_seq: 0x5566,
+                window_base: 0x7788_99aa,
+                window_end: 0xddee_ff00,
+                payload: vec![1, 2, 3],
+            },
+        ];
+
+        symbols
+            .into_iter()
+            .map(|symbol| {
+                let encoded = encode_symbol_msg_v2(&symbol).expect("canonical v2 symbol is valid");
+                match symbol {
+                    V2Symbol::Source {
+                        epoch,
+                        seq,
+                        payload,
+                    } => serde_json::json!({
+                        "encoded_hex": to_hex(&encoded),
+                        "epoch": epoch.get(),
+                        "kind": "source",
+                        "payload_crc32": ieee_crc32(&payload),
+                        "payload_hex": to_hex(&payload),
+                        "seq": seq,
+                    }),
+                    V2Symbol::Repair {
+                        epoch,
+                        repair_seq,
+                        window_base,
+                        window_end,
+                        payload,
+                    } => serde_json::json!({
+                        "encoded_hex": to_hex(&encoded),
+                        "epoch": epoch.get(),
+                        "kind": "repair",
+                        "payload_crc32": ieee_crc32(&payload),
+                        "payload_hex": to_hex(&payload),
+                        "repair_seq": repair_seq,
+                        "window_base": window_base,
+                        "window_end": window_end,
+                    }),
+                }
+            })
+            .collect()
+    }
 
     // ── Fixture builder ───────────────────────────────────────────────────
 
@@ -763,6 +1401,7 @@ mod cross_vector_tests {
                     "state_bits":  32u32,
                 },
             },
+            "v2_symbols": v2_fixture_records(),
         });
 
         serde_json::to_string_pretty(&v).expect("fixture serialisation must not fail")
@@ -804,6 +1443,13 @@ mod cross_vector_tests {
     fn cross_vectors_match_committed_fixture() {
         let generated = build_fixture_json();
         let committed = include_str!("../../tests/fixtures/fec_vectors.json");
+        let committed_value: serde_json::Value =
+            serde_json::from_str(committed).expect("committed fixture must be valid JSON");
+        assert_eq!(
+            committed_value["v2_symbols"],
+            serde_json::Value::Array(v2_fixture_records()),
+            "committed v2 symbols do not match the canonical Rust inputs"
+        );
         assert_eq!(
             generated, committed,
             "regenerated fixture does not match committed tests/fixtures/fec_vectors.json; \

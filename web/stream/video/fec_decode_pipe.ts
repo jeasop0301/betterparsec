@@ -9,22 +9,58 @@ import { addPipePassthrough, DataPipe } from "../pipeline/pipes.js"
 import { allVideoCodecs } from "../video.js"
 import { DataVideoRenderer, VideoDecodeUnit, VideoRendererSetup } from "./index.js"
 import { FecDecoder, FecDecoderStats } from "./fec.js"
-import { parseSymbolMessage, parseChunkHeader, CHUNK_HEADER_SIZE } from "./fec_wire.js"
+import {
+    CHUNK_COUNT_MAX,
+    CHUNK_HEADER_SIZE,
+    CHUNK_V2_FRAGMENT_MAX,
+    CHUNK_V2_HEADER_SIZE,
+    FRAME_MAX_BYTES,
+    parseChunkHeader,
+    parseChunkHeaderV2,
+    parseSymbolMessage,
+    verifyEncodedFrameV2,
+} from "./fec_wire.js"
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
 interface PendingFrame {
-    /** 13-byte chunk header fields from the first chunk seen. */
+    epoch: number
+    version: 1 | 2
     frameType: 0 | 1
     timestampUs: number
     chunkCount: number
-    /** Sparse array; index = chunkIndex, value = fragment bytes. */
+    encodedFrameLen: number
+    encodedFrameCrc32: number | null
     parts: (Uint8Array | undefined)[]
     receivedCount: number
-    /** Set once any delivered chunk arrived via FEC recovery rather than
-     * direct receipt. Feeds stats.framesRecovered on completion. */
+    bytes: number
     usedRecovery: boolean
 }
+
+interface CompletedFrame {
+    epoch: number
+    frameId: number
+    frame: PendingFrame
+    completedAt: number
+}
+
+export type DiscontinuityReason =
+    | "epoch-transition"
+    | "reorder-gap"
+    | "reassembly-eviction"
+    | "metadata-mismatch"
+    | "frame-crc"
+    | "memory-cap"
+    | "fec-eviction"
+
+export interface Discontinuity {
+    epoch: number
+    reason: DiscontinuityReason
+}
+
+export type FecPipeConfig =
+    | { version: 1 }
+    | { version: 2, epoch: number }
 
 export interface FecDecodePipeOptions {
     /**
@@ -34,6 +70,8 @@ export interface FecDecodePipeOptions {
     onAck?: (highest: number) => void
     /** Injectable clock for tests. Default: () => Date.now() */
     now?: () => number
+    /** Observable transport discontinuity; decoder acknowledgement is separate. */
+    onDiscontinuity?: (discontinuity: Discontinuity) => void
 }
 
 // Recovery/loss-span counters for one FecDecodePipe (U2 P2 groundwork).
@@ -47,8 +85,11 @@ export interface FecDecodePipeStats extends FecDecoderStats {
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
-/** Maximum pending frame_ids before evicting the oldest (sets needsIdr). */
+/** Bounded incomplete frames and completed reorder records. */
 const MAX_PENDING_FRAMES = 8
+const MAX_COMPLETED_FRAMES = 4
+const REORDER_MAX_WAIT_MS = 100
+const MAX_REASSEMBLY_REORDER_BYTES = 16 * 1024 * 1024
 
 /** ACK after this many delivered source symbols since last ack. */
 const ACK_SYMBOL_INTERVAL = 32
@@ -78,9 +119,13 @@ export class FecDecodePipe implements DataPipe {
     private framesRecovered = 0
     private framesDroppedAwaitingIdr = 0
     // Reassembly state
-    private pending = new Map<number, PendingFrame>()
-    // Eviction order — insertion-ordered frame_ids
-    private pendingOrder: number[] = []
+    private pending = new Map<string, PendingFrame>()
+    private completed = new Map<string, CompletedFrame>()
+    private completedOrder: string[] = []
+    private bytesBuffered = 0
+    private config: FecPipeConfig = { version: 1 }
+    private hasExplicitConfig = false
+    private nextFrameId: number | null = null
 
     // needsIdr flag
     private needsIdr = false
@@ -93,12 +138,11 @@ export class FecDecodePipe implements DataPipe {
 
     // ACK state
     private onAck: ((highest: number) => void) | undefined
+    private onDiscontinuity: ((discontinuity: Discontinuity) => void) | undefined
     private now: () => number
     private symbolsSinceAck = 0
     private lastAckTime = 0
     private lastAckedHighest: number | null = null
-    // Independent 50ms timer: fires tickAck() even when no symbols arrive
-    // (e.g. idle stream, reorder stall). Without this the encoder window stalls.
     private ackTimerId: ReturnType<typeof setInterval> | null = null
 
     constructor(base: DataVideoRenderer, logger?: Logger, options?: FecDecodePipeOptions) {
@@ -108,6 +152,7 @@ export class FecDecodePipe implements DataPipe {
         this.decoder = new FecDecoder(128, 16 * 1024 * 1024)
 
         this.onAck = options?.onAck
+        this.onDiscontinuity = options?.onDiscontinuity
         this.now = options?.now ?? (() => Date.now())
         this.lastAckTime = this.now()
 
@@ -115,7 +160,7 @@ export class FecDecodePipe implements DataPipe {
         // Test paths exercise the elapsed-time branch via symbol delivery with
         // an advanced fake clock; they do not need a live interval.
         if (!options?.now) {
-            const t = setInterval(() => { this.tickAck() }, ACK_TIME_INTERVAL_MS)
+            const t = setInterval(() => this.tickTimer(), ACK_TIME_INTERVAL_MS)
             // In Node.js environments (tests), calling unref() prevents the timer
             // from keeping the process alive after all tests have finished.
             // In browsers, the returned value is a number and has no unref().
@@ -136,48 +181,95 @@ export class FecDecodePipe implements DataPipe {
         }
     }
 
+    private cleanedUp = false
+
+    /**
+     * Idempotent teardown for this pipe's own resources (ACK timer/decoder
+     * state), then forwards to the wrapped pipe's cleanup exactly once.
+     * addPipePassthrough() only installs a generic forwarding "cleanup" when
+     * the pipe doesn't already own one — declaring this method here means
+     * production renderer teardown (Stream.createVideoRenderer ->
+     * videoRenderer.cleanup()) actually disposes the timer instead of
+     * silently skipping straight to base.cleanup().
+     */
+    cleanup(): void {
+        if (this.cleanedUp) return
+        this.cleanedUp = true
+        this.dispose()
+        const base = this.base as any
+        if (base && typeof base.cleanup === "function") {
+            base.cleanup()
+        }
+    }
+
     /**
      * Public entry point for tests: simulate a timer tick without requiring
      * a real setInterval to fire.  Also called by the internal timer.
      */
     tickTimer(): void {
-        this.tickAck()
+        this.flushReorder(this.now())
+        this.tickAck(false)
     }
 
     /** Wire the ACK callback after construction (used by the pipeline builder). */
     setOnAck(fn: (highest: number) => void): void {
         this.onAck = fn
     }
+    /** Latch the FEC codec negotiated in ConnectionComplete before admitting media. */
+    configure(config: FecPipeConfig): boolean {
+        if (config.version === 2 &&
+            (!Number.isInteger(config.epoch) || config.epoch <= 0 || config.epoch > 0xFFFF_FFFF)) {
+            return false
+        }
+        const firstExplicitConfig = !this.hasExplicitConfig
+        const changed = !firstExplicitConfig && (this.config.version !== config.version ||
+            (config.version === 2 && this.config.version === 2 && this.config.epoch !== config.epoch))
+        this.config = config
+        this.hasExplicitConfig = true
+        if (firstExplicitConfig && config.version === 2) {
+            this.decoder = new FecDecoder(128, 16 * 1024 * 1024)
+            this.resetEpochState()
+            this.pending.clear()
+            this.completed.clear()
+            this.completedOrder.length = 0
+            this.bytesBuffered = 0
+            this.nextFrameId = null
+            this.needsIdr = false
+            this.awaitingIdr = true
+        } else if (changed) {
+            this.decoder = new FecDecoder(128, 16 * 1024 * 1024)
+            this.resetEpochState()
+            this.discontinue(config.version === 2 ? config.epoch : 0, "epoch-transition")
+        }
+        return true
+    }
 
     // ── DataPipe ──────────────────────────────────────────────────────────
 
-    submitPacket(buffer: ArrayBuffer): void {
+    submitPacket(buffer: ArrayBuffer): boolean {
         const sym = parseSymbolMessage(buffer)
-        if (!sym) return
-
-        // Push through FEC decoder for both source and repair symbols.
-        // For source symbols the decoder returns a Recovered event for the
-        // symbol itself plus any additional symbols it can now recover; for
-        // repair symbols it may recover previously missing source symbols.
+        if (!sym || !this.config) return false
+        if (sym.version !== this.config.version) return false
+        const epoch = sym.version === 2 ? sym.epoch! : 0
+        if (this.config.version === 2 && epoch !== this.config.epoch) return false
         const events = this.decoder.pushSymbol(sym)
         for (const ev of events) {
-            if (ev.kind === 'recovered') {
-                this.deliverChunk(ev.payload, ev.viaFec)
-                this.tickAck()
-            } else if (ev.kind === 'lossSpan') {
-                this.handleLossSpan(ev.fromSeq, ev.toSeqExclusive)
+            if (ev.kind === "recovered") {
+                this.deliverChunk(epoch, sym.version, ev.payload, ev.viaFec)
+                this.tickAck(true)
+            } else if (ev.kind === "lossSpan" || ev.kind === "evicted") {
+                this.discontinue(epoch, "fec-eviction")
             }
         }
+        this.flushReorder(this.now())
+        return true
     }
 
     pollRequestIdr(): boolean {
         const v = this.needsIdr
         this.needsIdr = false
-        // OR with base passthrough (e.g. decoder's own IDR request)
         const base = this.base as any
-        if (typeof base.pollRequestIdr === 'function') {
-            return v || base.pollRequestIdr()
-        }
+        if (typeof base.pollRequestIdr === "function") return v || base.pollRequestIdr()
         return v
     }
 
@@ -191,8 +283,6 @@ export class FecDecodePipe implements DataPipe {
         return this.base
     }
 
-    /** Snapshot of recovery/loss-span counters accumulated so far. Returns a
-     * fresh copy; safe to call at any time. */
     getStats(): FecDecodePipeStats {
         return {
             ...this.decoder.getStats(),
@@ -201,109 +291,176 @@ export class FecDecodePipe implements DataPipe {
         }
     }
 
-    // ── Private helpers ───────────────────────────────────────────────────
+    private key(epoch: number, frameId: number): string {
+        return `${epoch}:${frameId >>> 0}`
+    }
 
-    /** Deliver one chunk (source-symbol payload) into the reassembly map. */
-    private deliverChunk(payload: Uint8Array, viaFec: boolean): void {
-        // payload = chunk layer: 13-byte header + Annex-B fragment
-        if (payload.byteLength < CHUNK_HEADER_SIZE) return
+    private resetEpochState(): void {
+        this.lastTimestampUs = 0
+        this.symbolsSinceAck = 0
+        this.lastAckedHighest = null
+        this.lastAckTime = this.now()
+    }
 
-        const hdr = parseChunkHeader(payload.buffer.slice(
-            payload.byteOffset,
-            payload.byteOffset + payload.byteLength,
-        ) as ArrayBuffer)
-        if (!hdr) return
+    private u32Newer(candidate: number, current: number): boolean {
+        const distance = (candidate - current) >>> 0
+        return distance !== 0 && distance < 0x80000000
+    }
 
-        const { frameId, chunkIndex, chunkCount, frameType, timestampUs } = hdr
-        const fragment = payload.slice(CHUNK_HEADER_SIZE)
+    private discontinue(epoch: number, reason: DiscontinuityReason): void {
+        this.pending.clear()
+        this.completed.clear()
+        this.completedOrder.length = 0
+        this.bytesBuffered = 0
+        this.nextFrameId = null
+        this.needsIdr = true
+        this.awaitingIdr = true
+        this.onDiscontinuity?.({ epoch, reason })
+    }
 
-        let frame = this.pending.get(frameId)
+    private deliverChunk(epoch: number, version: 1 | 2, payload: Uint8Array, viaFec: boolean): void {
+        const wire = payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength) as ArrayBuffer
+        const hdr = version === 2 ? parseChunkHeaderV2(wire) : parseChunkHeader(wire)
+        if (!hdr || hdr.frameType > 1 || hdr.chunkCount === 0 || hdr.chunkCount > CHUNK_COUNT_MAX ||
+            hdr.chunkIndex >= hdr.chunkCount) return
+        const headerBytes = version === 2 ? CHUNK_V2_HEADER_SIZE : CHUNK_HEADER_SIZE
+        const fragment = payload.slice(headerBytes)
+        const v2Hdr = version === 2 ? hdr as typeof hdr & {
+            encodedFrameLen: number
+            encodedFrameCrc32: number
+        } : null
+        const encodedFrameLen = v2Hdr?.encodedFrameLen ?? 0
+        const encodedFrameCrc32 = v2Hdr?.encodedFrameCrc32 ?? null
+        if (v2Hdr && (
+            encodedFrameLen > FRAME_MAX_BYTES ||
+            hdr.chunkCount !== Math.ceil(Math.max(encodedFrameLen, 1) / CHUNK_V2_FRAGMENT_MAX) ||
+            fragment.byteLength !== (hdr.chunkIndex + 1 === hdr.chunkCount
+                ? encodedFrameLen - CHUNK_V2_FRAGMENT_MAX * (hdr.chunkCount - 1)
+                : CHUNK_V2_FRAGMENT_MAX)
+        )) return
+
+        const key = this.key(epoch, hdr.frameId)
+        if (this.completed.has(key) ||
+            (this.nextFrameId !== null && hdr.frameId !== this.nextFrameId && !this.u32Newer(hdr.frameId, this.nextFrameId))) {
+            return
+        }
+        let frame = this.pending.get(key)
         if (!frame) {
-            // Evict oldest if at cap
-            if (this.pendingOrder.length >= MAX_PENDING_FRAMES) {
-                const evictId = this.pendingOrder.shift()!
-                this.pending.delete(evictId)
-                this.needsIdr = true
-                this.awaitingIdr = true
+            if (this.pending.size + this.completed.size >= MAX_PENDING_FRAMES) {
+                this.discontinue(epoch, "reassembly-eviction")
+                return
+            }
+            if (this.bytesBuffered + fragment.byteLength > MAX_REASSEMBLY_REORDER_BYTES) {
+                this.discontinue(epoch, "memory-cap")
+                return
             }
             frame = {
-                frameType,
-                timestampUs,
-                chunkCount,
-                parts: new Array(chunkCount),
+                epoch,
+                version,
+                frameType: hdr.frameType,
+                timestampUs: hdr.timestampUs,
+                chunkCount: hdr.chunkCount,
+                encodedFrameLen,
+                encodedFrameCrc32,
+                parts: new Array(hdr.chunkCount),
                 receivedCount: 0,
+                bytes: 0,
                 usedRecovery: false,
             }
-            this.pending.set(frameId, frame)
-            this.pendingOrder.push(frameId)
+            this.pending.set(key, frame)
+            // While awaitingIdr, an incomplete delta must never claim the
+            // post-reset ordering anchor: only the first pending key frame
+            // may become nextFrameId, so a stale/incomplete delta cannot
+            // stall a later complete key behind a reorder-gap wait.
+            if (this.nextFrameId === null && (!this.awaitingIdr || hdr.frameType === 1)) this.nextFrameId = hdr.frameId
+        } else if (
+            frame.version !== version ||
+            frame.frameType !== hdr.frameType ||
+            frame.timestampUs !== hdr.timestampUs ||
+            frame.chunkCount !== hdr.chunkCount ||
+            frame.encodedFrameLen !== encodedFrameLen ||
+            frame.encodedFrameCrc32 !== encodedFrameCrc32
+        ) {
+            this.discontinue(epoch, "metadata-mismatch")
+            return
         }
 
-        // Guard against duplicate delivery
-        if (frame.parts[chunkIndex] !== undefined) return
-        frame.usedRecovery = frame.usedRecovery || viaFec
-        frame.parts[chunkIndex] = fragment
+        if (frame.parts[hdr.chunkIndex] !== undefined) return
+        if (this.bytesBuffered + fragment.byteLength > MAX_REASSEMBLY_REORDER_BYTES) {
+            this.discontinue(epoch, "memory-cap")
+            return
+        }
+        frame.usedRecovery ||= viaFec
+        frame.parts[hdr.chunkIndex] = fragment
         frame.receivedCount++
+        frame.bytes += fragment.byteLength
+        this.bytesBuffered += fragment.byteLength
 
-        if (frame.receivedCount >= frame.chunkCount) {
-            this.assembleFrame(frameId, frame)
+        if (frame.receivedCount === frame.chunkCount) {
+            this.pending.delete(key)
+            if (this.awaitingIdr && frame.frameType !== 1) {
+                this.bytesBuffered -= frame.bytes
+                this.framesDroppedAwaitingIdr++
+                // A gated delta cannot anchor reordering: the next admitted
+                // keyframe establishes the recovered decode reference.
+                if (this.nextFrameId === hdr.frameId) this.nextFrameId = null
+                return
+            }
+            if (frame.frameType === 1) this.awaitingIdr = false
+            this.completed.set(key, { epoch, frameId: hdr.frameId, frame, completedAt: this.now() })
+            this.completedOrder.push(key)
         }
     }
 
-    /** Concatenate a complete frame and submit it when its references are safe. */
-    private assembleFrame(frameId: number, frame: PendingFrame): void {
-        // Remove first so a gated delta cannot leak pending state.
-        this.pending.delete(frameId)
-        const pendingIdx = this.pendingOrder.indexOf(frameId)
-        if (pendingIdx >= 0) this.pendingOrder.splice(pendingIdx, 1)
+    private flushReorder(now: number): void {
+        while (this.completedOrder.length > 0) {
+            const firstKey = this.completedOrder[0]
+            const first = this.completed.get(firstKey)!
+            const expectedKey = this.nextFrameId === null ? firstKey : this.key(first.epoch, this.nextFrameId)
+            let next = this.completed.get(expectedKey)
+            if (!next) {
+                if (this.completedOrder.length <= MAX_COMPLETED_FRAMES && now - first.completedAt < REORDER_MAX_WAIT_MS) return
+                this.discontinue(first.epoch, "reorder-gap")
+                return
+            }
+            this.completed.delete(expectedKey)
+            this.completedOrder.splice(this.completedOrder.indexOf(expectedKey), 1)
+            this.emitFrame(next)
+            this.nextFrameId = (next.frameId + 1) >>> 0
+        }
+    }
 
-        if (this.awaitingIdr && frame.frameType !== 1) {
-            this.framesDroppedAwaitingIdr++
+    private emitFrame(completed: CompletedFrame): void {
+        const { frame } = completed
+        const data = new Uint8Array(frame.bytes)
+        let offset = 0
+        for (const part of frame.parts) {
+            if (!part) return
+            data.set(part, offset)
+            offset += part.byteLength
+        }
+        this.bytesBuffered -= frame.bytes
+        if (frame.version === 2 && !verifyEncodedFrameV2({
+            frameId: completed.frameId,
+            chunkIndex: 0,
+            chunkCount: frame.chunkCount,
+            frameType: frame.frameType,
+            timestampUs: frame.timestampUs,
+            encodedFrameLen: frame.encodedFrameLen,
+            encodedFrameCrc32: frame.encodedFrameCrc32!,
+        }, data)) {
+            this.discontinue(completed.epoch, "frame-crc")
             return
         }
-        if (frame.frameType === 1) {
-            this.awaitingIdr = false
-        }
-        // Concatenate fragments
-        let totalLen = 0
-        for (let i = 0; i < frame.chunkCount; i++) {
-            totalLen += (frame.parts[i]?.byteLength ?? 0)
-        }
-        const data = new Uint8Array(totalLen)
-        let offset = 0
-        for (let i = 0; i < frame.chunkCount; i++) {
-            const part = frame.parts[i]
-            if (part) {
-                data.set(part, offset)
-                offset += part.byteLength
-            }
-        }
-        if (frame.usedRecovery) {
-            this.framesRecovered++
-        }
-
+        if (frame.usedRecovery) this.framesRecovered++
         const duration = frame.timestampUs - this.lastTimestampUs
         this.lastTimestampUs = frame.timestampUs
-
-        const unit: VideoDecodeUnit = {
+        this.base.submitDecodeUnit({
             type: frame.frameType === 1 ? "key" : "delta",
             timestampMicroseconds: frame.timestampUs,
             durationMicroseconds: duration,
             data: data.buffer,
-        }
-        this.base.submitDecodeUnit(unit)
-
-    }
-
-    /**
-     * A LossSpan means source seqs are unrecoverably gone. This invalidates
-     * predictive references even if the lost frame contributed no chunks and
-     * `pending` is empty. Request an IDR and gate deltas until it arrives.
-     */
-    private handleLossSpan(_from: number, _to: number): void {
-        this.pending.clear()
-        this.pendingOrder.length = 0
-        this.needsIdr = true
-        this.awaitingIdr = true
+        })
     }
 
     /**
@@ -311,17 +468,19 @@ export class FecDecodePipe implements DataPipe {
      * 50ms timer.  Fires onAck when ≥32 symbols have been delivered since the
      * last ACK OR ≥50ms have elapsed, whichever comes first (design §2).
      *
-     * The `seq` parameter is kept for compatibility with the old call-site but
-     * is not used; the ACK value is highestFullyDecoded from the decoder.
+     * `delivered` distinguishes the two call sites: only a delivered source
+     * symbol (submitPacket -> "recovered" event) advances symbolsSinceAck;
+     * the independent 50ms timer (tickTimer) must never bump the symbol
+     * counter, or the "32 delivered symbols" cadence drifts on idle links.
      */
-    private tickAck(): void {
+    private tickAck(delivered: boolean): void {
         if (!this.onAck) return
 
         const hfd = this.decoder.highestFullyDecoded()
         if (hfd === null) return
-        if (this.lastAckedHighest !== null && hfd <= this.lastAckedHighest) return
+        if (this.lastAckedHighest !== null && !this.u32Newer(hfd, this.lastAckedHighest)) return
 
-        this.symbolsSinceAck++
+        if (delivered) this.symbolsSinceAck++
         const now = this.now()
         const elapsed = now - this.lastAckTime
 

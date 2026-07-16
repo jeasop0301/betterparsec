@@ -516,6 +516,13 @@ impl WebRtcInner {
                     // FEC-primary client (native): skip the duplicate
                     // RTP-track send once FEC carries frames (video.rs).
                     video.set_video_over_fec_only(settings.video_over_fec_only);
+                    video.set_fec_wire_version(
+                        if settings.requested_fec_protocol_version.unwrap_or(1) >= 2 {
+                            fec_wire::WireVersion::V2
+                        } else {
+                            fec_wire::WireVersion::V1
+                        },
+                    );
                     // Feature #1: seed the ABR ceiling from the initial bitrate.
                     video.set_configured_bitrate_kbps(settings.bitrate_kbps);
                 }
@@ -675,14 +682,15 @@ impl WebRtcInner {
                 debug!("video_fec channel open (host-to-client FEC symbols)");
             }
             "video_fec_ack" => {
-                // Client → host ACK messages: Subscribe / NeedsIdr / Ack(seq).
+                // Client → host controls. A v2 control is never reinterpreted
+                // as v1; the sender validates its epoch before acting.
                 channel.on_message(create_event_handler(
                     inner,
                     async move |inner, msg: DataChannelMessage| {
-                        let Some(ack_msg) = fec_wire::parse_ack_msg(&msg.data) else {
+                        let Ok(control) = fec_wire::parse_control_msg(&msg.data) else {
                             return;
                         };
-                        inner.video.lock().await.handle_fec_ack(ack_msg);
+                        inner.video.lock().await.handle_fec_control(control);
                     },
                 ));
             }
@@ -791,7 +799,7 @@ impl TransportSender for WebRTCTransportSender {
         unit: VideoDecodeUnit<&'a [u8]>,
     ) -> Result<DecodeResult, TransportError> {
         let mut video = self.inner.video.lock().await;
-        Ok(video.send_decode_unit(&unit).await)
+        Ok(video.send_decode_unit(&self.inner, &unit).await)
     }
 
     fn take_video_transport_stats(&self) -> Option<VideoTransportStats> {
@@ -804,6 +812,9 @@ impl TransportSender for WebRTCTransportSender {
 
     fn runtime_cc_shared(&self) -> Option<Arc<CcShared>> {
         Some(self.inner.cc_shared.clone())
+    }
+    async fn fec_v2_epoch(&self) -> Option<std::num::NonZeroU32> {
+        self.inner.video.lock().await.fec_v2_epoch()
     }
 
     async fn setup_audio(

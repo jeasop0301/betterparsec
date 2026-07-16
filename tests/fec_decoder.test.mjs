@@ -223,22 +223,32 @@ test("duplicate repair: second identical repair push returns no events", () => {
     assert.equal(e2.length, 0, "duplicate repair must be completely ignored")
 })
 
-// ── Stale repair outside window: no crash ────────────────────────────────
+// ── Stale repair outside the committed horizon: zero mutation ──────────────
 
-test("stale repair pushed to decoder does not crash", () => {
-    const enc = makeEnc(1, 1)
+test("stale repair leaves decoder accounting and stats unchanged", () => {
     const dec = makeDec()
-    // Collect repairs for seqs 0..3
-    const staleRepairs = []
-    for (let i = 0; i < 4; i++) {
-        const out = enc.pushSource(i, new Uint8Array([i]))
-        staleRepairs.push(...out.repairs)
+    const newer = {
+        kind: "repair",
+        repairSeq: 110,
+        windowBase: 50,
+        windowEnd: 110,
+        payload: new Uint8Array([1]),
     }
-    enc.acknowledge(3) // slide encoder window past all these
-    // Push stale repairs to decoder — must not throw
-    for (const r of staleRepairs) {
-        assert.doesNotThrow(() => dec.pushSymbol(r))
-    }
+    dec.pushSymbol(newer)
+    const accountingBefore = dec.getAccounting()
+    const statsBefore = dec.getStats()
+
+    const events = dec.pushSymbol({
+        kind: "repair",
+        repairSeq: 60,
+        windowBase: 50,
+        windowEnd: 60,
+        payload: new Uint8Array([2]),
+    })
+
+    assert.deepEqual(events, [])
+    assert.deepEqual(dec.getAccounting(), accountingBefore)
+    assert.deepEqual(dec.getStats(), statsBefore)
 })
 
 // ── Encoder acknowledge slides the window ─────────────────────────────────
@@ -294,6 +304,78 @@ test("FecDecoder with small window bounds still recovers single loss", () => {
     }
     const seqs = new Set(collectRecovered(allEvents).map(e => e.seq))
     assert.ok(seqs.has(2), "seq 2 must be recovered with small window")
+})
+
+test("decoder accounting stays within algebra and byte caps on a long stream", () => {
+    const dec = new FecDecoder(128, 16 * 1024 * 1024)
+    for (let seq = 0; seq < 1024; seq++) {
+        dec.pushSymbol({ kind: "source", seq, payload: new Uint8Array(1024) })
+        const accounting = dec.getAccounting()
+        assert.ok(accounting.algebraSymbols <= 128, `symbol cap exceeded at ${seq}`)
+        assert.ok(accounting.retainedBytes <= 16 * 1024 * 1024, `byte cap exceeded at ${seq}`)
+    }
+})
+
+test("decoder accounting rejects retained state above its byte cap", () => {
+    const dec = new FecDecoder(128, 64)
+    dec.pushSymbol({ kind: "source", seq: 0, payload: new Uint8Array(128) })
+    const accounting = dec.getAccounting()
+    assert.equal(accounting.sourceSymbols, 0)
+    assert.ok(accounting.retainedBytes <= 64)
+})
+test("decoder aggregate 16 MiB accounting accepts exact cap and evicts at cap plus one", () => {
+    const cap = 16 * 1024 * 1024
+    const recordCount = 16
+    const payloadBytes = (cap / recordCount) - 8
+    const dec = new FecDecoder(128, cap)
+    for (let seq = 0; seq < recordCount; seq++) {
+        dec.pushSymbol({ kind: "source", seq, payload: new Uint8Array(payloadBytes).fill(seq) })
+    }
+    assert.deepEqual(dec.getAccounting(), {
+        sourceSymbols: recordCount, repairSymbols: 0, dedupKeys: 0,
+        algebraSymbols: recordCount, retainedBytes: cap,
+    })
+    dec.pushSymbol({ kind: "source", seq: recordCount, payload: new Uint8Array(1) })
+    assert.deepEqual(dec.getAccounting(), {
+        sourceSymbols: recordCount, repairSymbols: 0, dedupKeys: 0,
+        algebraSymbols: recordCount, retainedBytes: cap - payloadBytes + 1,
+    }, "the byte cap, rather than the 128-symbol cap, evicts exactly one source")
+})
+
+test("decoder reports typed eviction when an unresolved symbol is forced out", () => {
+    const dec = new FecDecoder(128, 16 * 1024 * 1024)
+    dec.pushSymbol({
+        kind: "repair",
+        repairSeq: 1,
+        windowBase: 0,
+        windowEnd: 128,
+        payload: new Uint8Array([0, 0]),
+    })
+    const events = dec.pushSymbol({
+        kind: "source",
+        seq: 128,
+        payload: new Uint8Array([1]),
+    })
+    assert.ok(events.some(e => e.kind === "evicted" && e.fromSeq === 0 && e.toSeqExclusive === 1))
+    assert.ok(dec.getAccounting().algebraSymbols <= 128)
+})
+
+test("decoder bounded eviction remains u32-wrap safe", () => {
+    const dec = new FecDecoder(4, 1024)
+    dec.pushSymbol({
+        kind: "repair",
+        repairSeq: 1,
+        windowBase: 0xFFFFFFFC,
+        windowEnd: 0,
+        payload: new Uint8Array([0, 0]),
+    })
+    const events = dec.pushSymbol({
+        kind: "source",
+        seq: 1,
+        payload: new Uint8Array([1]),
+    })
+    assert.ok(events.some(e => e.kind === "evicted" && e.fromSeq === 0xFFFFFFFC))
+    assert.ok(dec.getAccounting().algebraSymbols <= 4)
 })
 
 test("encoder window_max_symbols=1 always evicts previous entry", () => {
@@ -470,54 +552,43 @@ test("pushRepair: window larger than 128 symbols is rejected without crash", () 
 
 // ── Finding 3 pin: normal max-size window (128 symbols) is accepted ───────
 
-test("pushRepair: window of exactly 128 symbols is accepted", () => {
-    const enc = new FecEncoder({
-        redundancyNumerator: 1,
-        redundancyDenominator: 1,
-        windowMaxSymbols: 128,
-        windowMaxBytes: 1 << 24,
-    })
+test("pushRepair: window of exactly 128 symbols is retained and accounted", () => {
     const dec = makeDec(128)
-    // Fill encoder window with 128 sources, all dropped.
-    const repairs = []
-    for (let i = 0; i < 128; i++) {
-        const out = enc.pushSource(i, new Uint8Array([i & 0xFF]))
-        repairs.push(...out.repairs)
-    }
-    // Feed repairs to decoder — should not crash and should not reject.
-    for (const r of repairs) {
-        dec.pushSymbol(r) // no throw = pass
-    }
+    dec.pushSymbol({
+        kind: "repair",
+        repairSeq: 1,
+        windowBase: 0,
+        windowEnd: 128,
+        payload: new Uint8Array([0, 0]),
+    })
+    assert.deepEqual(dec.getAccounting(), {
+        sourceSymbols: 128, repairSymbols: 1, dedupKeys: 1,
+        algebraSymbols: 128, retainedBytes: 128 * 8 + 2 + 16 + 8,
+    })
 })
 
 // ── Finding 5 pin: seenRepairKeys does not grow without bound ────────────
 
-test("seenRepairKeys: map is pruned when it exceeds 256 entries", () => {
-    // Build a decoder and feed it >256 unique (repairSeq, windowBase) pairs.
-    // First deliver sources 0..300 so highestContiguous advances, enabling pruning.
+test("seenRepairKeys prunes evicted repairs and still deduplicates retained repairs", () => {
     const dec = makeDec(128)
-    const enc = new FecEncoder({
-        redundancyNumerator: 1,
-        redundancyDenominator: 1,
-        windowMaxSymbols: 64,
-        windowMaxBytes: 1 << 24,
+    const repair = windowBase => ({
+        kind: "repair",
+        repairSeq: 1,
+        windowBase,
+        windowEnd: windowBase,
+        payload: new Uint8Array(0),
     })
+    for (let windowBase = 0; windowBase < 300; windowBase++) dec.pushSymbol(repair(windowBase))
+    assert.deepEqual(dec.getAccounting(), {
+        sourceSymbols: 0, repairSymbols: 128, dedupKeys: 128,
+        algebraSymbols: 128, retainedBytes: 128 * (16 + 8),
+    })
+    assert.equal(dec.getStats().repairSymbolsReceived, 300)
 
-    // Advance highestContiguous by delivering 300 sources.
-    for (let i = 0; i < 300; i++) {
-        const out = enc.pushSource(i, new Uint8Array([i & 0xFF]))
-        dec.pushSymbol(out.source)
-        for (const r of out.repairs) dec.pushSymbol(r)
-    }
-    // At this point seenRepairKeys should have been pruned.
-    // We can only observe indirectly: the decoder must still accept new repairs.
-    const out301 = enc.pushSource(300, new Uint8Array([0x42]))
-    dec.pushSymbol(out301.source)
-    for (const r of out301.repairs) {
-        const events = dec.pushSymbol(r)
-        // Should not throw; if it returns an empty array that's fine (source already known).
-        assert.ok(Array.isArray(events), "pushRepair must return an array after pruning")
-    }
+    dec.pushSymbol(repair(0))
+    assert.equal(dec.getStats().repairSymbolsReceived, 301, "the oldest dedup key was pruned with its repair")
+    dec.pushSymbol(repair(0))
+    assert.equal(dec.getStats().repairSymbolsReceived, 301, "the retained repair's dedup key rejects its duplicate")
 })
 
 // ── Message constants ─────────────────────────────────────────────────────

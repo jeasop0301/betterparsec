@@ -1,4 +1,5 @@
 use std::{
+    num::NonZeroU32,
     ops::Range,
     sync::{Arc, atomic::AtomicU32},
 };
@@ -186,6 +187,10 @@ pub trait TransportSender {
     /// Returns the live ABR target when this transport produces one.
     /// This is a target signal, not proof that the host encoder applied it.
     fn runtime_bitrate_target_kbps(&self) -> Option<Arc<AtomicU32>> {
+        None
+    }
+    /// Returns the actual v2 epoch currently owned by the FEC sender.
+    async fn fec_v2_epoch(&self) -> Option<NonZeroU32> {
         None
     }
 

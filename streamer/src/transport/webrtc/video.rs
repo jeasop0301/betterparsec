@@ -7,6 +7,8 @@ use std::{
     },
 };
 
+use std::num::NonZeroU32;
+
 use bytes::{Bytes, BytesMut};
 use common::{
     api_bindings::{LogMessageType, StreamServerMessage},
@@ -47,8 +49,8 @@ use crate::transport::{
     metrics::VideoTransportMetrics,
     webrtc::{
         WebRtcInner,
-        fec_sender::FecSenderHandle,
-        fec_wire::AckMsg,
+        fec_sender::{FecSenderExit, FecSenderHandle},
+        fec_wire::{Epoch, ParsedControlMsg, WireVersion},
         qu_relay::{DataChannelSink, QuRelayHandle},
         sender::{CcContext, SequencedTrackLocalStaticRTP, TrackLocalSender},
         video::{
@@ -103,6 +105,10 @@ pub struct WebRtcVideo {
     /// FEC sender handle; `None` until the first `setup()` call.
     /// Default state: dormant — one AtomicBool load per frame overhead only.
     fec_handle: Option<FecSenderHandle>,
+    /// Sender-owned epoch counter. It advances on every setup, including v1
+    /// setups, so a later v2 renegotiation cannot reuse an old sender epoch.
+    next_fec_epoch: u32,
+    fec_wire_version: WireVersion,
     /// Monotonic generation counter shared with every spawned QU relay task.
     /// Same ghost-writer guard pattern as `fec_generation`.
     qu_generation: Arc<AtomicU32>,
@@ -137,6 +143,8 @@ impl WebRtcVideo {
             cc_shared,
             fec_generation: Arc::new(AtomicU32::new(0)),
             fec_handle: None,
+            next_fec_epoch: 0,
+            fec_wire_version: WireVersion::V1,
             qu_generation: Arc::new(AtomicU32::new(0)),
             qu_handle: None,
             video_over_fec_only: false,
@@ -151,6 +159,10 @@ impl WebRtcVideo {
     /// app). Set before [`Self::setup`], like `set_configured_bitrate_kbps`.
     pub fn set_video_over_fec_only(&mut self, on: bool) {
         self.video_over_fec_only = on;
+    }
+    /// Selects the wire version before the next sender setup.
+    pub(crate) fn set_fec_wire_version(&mut self, version: WireVersion) {
+        self.fec_wire_version = version;
     }
 
     /// M4 stall watchdog: the client asked for an IDR over the signaling
@@ -233,11 +245,14 @@ impl WebRtcVideo {
         // task from a previous setup call (ghost-writer guard, mirrors CC pattern).
         {
             let new_fec_gen = self.fec_generation.fetch_add(1, Ordering::AcqRel) + 1;
+            let epoch = self.allocate_fec_epoch();
             self.fec_handle = Some(FecSenderHandle::spawn_for_channel(
                 new_fec_gen,
                 Arc::clone(&self.fec_generation),
                 inner.video_fec_channel.clone(),
                 Arc::clone(&self.needs_idr),
+                self.fec_wire_version,
+                epoch,
             ));
         }
 
@@ -393,12 +408,25 @@ impl WebRtcVideo {
         true
     }
 
-    /// Forward an ACK message received on `video_fec_ack` to the FEC sender task.
+    /// Forward a parsed `video_fec_ack` control to the FEC sender task.
     /// No-op before `setup()` (fec_handle is None).
-    pub(super) fn handle_fec_ack(&self, msg: AckMsg) {
+    pub(super) fn handle_fec_control(&self, msg: ParsedControlMsg) {
         if let Some(handle) = &self.fec_handle {
-            handle.forward_ack(msg);
+            handle.forward_control(msg);
         }
+    }
+
+    /// The actual epoch currently owned by a v2 sender.
+    pub(crate) fn fec_v2_epoch(&self) -> Option<NonZeroU32> {
+        self.fec_handle
+            .as_ref()
+            .and_then(FecSenderHandle::v2_epoch)
+            .and_then(|epoch| NonZeroU32::new(epoch.get()))
+    }
+
+    fn allocate_fec_epoch(&mut self) -> Epoch {
+        self.next_fec_epoch = next_fec_epoch(self.next_fec_epoch);
+        Epoch::new(self.next_fec_epoch).expect("epoch allocator skips zero")
     }
 
     /// Forward a raw `video_qu` DataChannel message from the client to the QU relay.
@@ -409,7 +437,11 @@ impl WebRtcVideo {
         }
     }
 
-    pub async fn send_decode_unit(&mut self, unit: &VideoDecodeUnit<&[u8]>) -> DecodeResult {
+    pub async fn send_decode_unit(
+        &mut self,
+        inner: &Arc<WebRtcInner>,
+        unit: &VideoDecodeUnit<&[u8]>,
+    ) -> DecodeResult {
         let timestamp = (unit.timestamp.as_nanos() * 90000 / 1_000_000_000) as u32;
 
         let mut full_frame = Vec::new();
@@ -429,13 +461,46 @@ impl WebRtcVideo {
         // when the client has not yet subscribed (default dormant state).
         // timestamp_us is truncated to u32, matching the existing WS data path.
         let mut fec_carried = false;
-        if let Some(fec) = &self.fec_handle
-            && fec.is_active()
-        {
-            let ts_us = unit.timestamp.as_micros() as u32;
-            fec_carried = fec
-                .enqueue(Bytes::copy_from_slice(&full_frame), important, ts_us)
-                .await;
+        let mut fec_terminal_code: Option<i32> = None;
+        if let Some(fec) = &self.fec_handle {
+            if fec.is_active() {
+                let ts_us = unit.timestamp.as_micros() as u32;
+                fec_carried = fec
+                    .enqueue(Bytes::copy_from_slice(&full_frame), important, ts_us)
+                    .await;
+            } else {
+                // Dead sender fail-closed: FEC-only clients have no RTP
+                // fallback, so a dead sender must terminate the connection
+                // rather than silently deliver nothing (the RTP track this
+                // client never subscribes to) or silently claim carriage.
+                // `take_terminal_exit()` is a single-claim latch gated on
+                // `!live`, so this fires at most once per task death. Take
+                // FIRST, then derive liveness from the result: a drained
+                // `Some` proves `live` was (and stays — it is monotonic per
+                // handle) false, so the pair is consistent by construction
+                // and a store landing between two separate loads can never
+                // discard the reason.
+                let exit = fec.take_terminal_exit();
+                let sender_live = exit.is_none() && fec.is_live();
+                fec_terminal_code =
+                    fec_terminal_error_code(self.video_over_fec_only, sender_live, exit);
+            }
+        }
+
+        if let Some(error_code) = fec_terminal_code {
+            warn!(
+                "[FecSender] FEC-only session's sender died (error_code={error_code}); \
+                 terminating instead of silently falling back"
+            );
+            if let Err(err) = inner
+                .event_sender
+                .send(TransportEvent::SendIpc(StreamerIpcMessage::WebSocket(
+                    StreamServerMessage::ConnectionTerminated { error_code },
+                )))
+                .await
+            {
+                warn!("Failed to send terminal error to client: {err}");
+            }
         }
 
         // FEC-primary client: the frame is already on the wire via the
@@ -574,6 +639,29 @@ impl WebRtcVideo {
 /// be blind during session startup.
 fn skip_rtp_track(fec_only: bool, fec_carried: bool) -> bool {
     fec_only && fec_carried
+}
+
+/// Fail-closed decision for a dead FEC sender (pure, unit-tested): only a
+/// FEC-only client is affected — it has no RTP fallback, so a dead sender
+/// must terminate the connection rather than silently deliver nothing or
+/// silently fall back to an RTP track the client never subscribes to.
+/// `exit` should be the value drained from
+/// [`FecSenderHandle::take_terminal_exit`] (a single-claim latch gated on
+/// `!live`), so this returns `Some` at most once per task death. Callers
+/// MUST take the exit first and derive `sender_live` from the result
+/// (`exit.is_none() && is_live()`) so the pair stays consistent under a
+/// racing `live` store. `Superseded` never yields an error code (normal
+/// ghost-writer retirement, not a failure).
+fn fec_terminal_error_code(
+    fec_only: bool,
+    sender_live: bool,
+    exit: Option<FecSenderExit>,
+) -> Option<i32> {
+    if fec_only && !sender_live {
+        exit.and_then(FecSenderExit::error_code)
+    } else {
+        None
+    }
 }
 
 pub fn register_video_codecs(media_engine: &mut MediaEngine) -> Result<(), webrtc::Error> {
@@ -780,6 +868,11 @@ fn video_format_to_codec(format: VideoFormat) -> Option<RTCRtpCodecParameters> {
     }
 }
 
+fn next_fec_epoch(current: u32) -> u32 {
+    let next = current.wrapping_add(1);
+    if next == 0 { 1 } else { next }
+}
+
 fn trim_bytes_to_range(mut buf: BytesMut, range: Range<usize>) -> BytesMut {
     if range.start > 0 {
         let _ = buf.split_to(range.start);
@@ -813,6 +906,12 @@ mod tests {
         assert!(!skip_rtp_track(false, true));
         assert!(!skip_rtp_track(false, false));
     }
+    #[test]
+    fn fec_epoch_allocator_is_monotonic_and_skips_zero() {
+        assert_eq!(next_fec_epoch(0), 1);
+        assert_eq!(next_fec_epoch(41), 42);
+        assert_eq!(next_fec_epoch(u32::MAX), 1);
+    }
 
     #[test]
     fn av1_main_profile_remains_available() {
@@ -821,5 +920,63 @@ mod tests {
             assert_eq!(codec.capability.mime_type, MIME_TYPE_AV1);
             assert_eq!(codec.capability.sdp_fmtp_line, "profile=0");
         }
+    }
+    // ── Dead-sender fail-closed (WebRtcVideo/main seam) ─────────────────
+
+    #[test]
+    fn fec_only_dead_sender_produces_terminal_error_code_not_silent_black() {
+        // The core "no silent RTP fallback" invariant: a FEC-only client
+        // whose sender died gets a terminal error code, never `None`
+        // (which would mean "say nothing, deliver nothing").
+        assert_eq!(
+            fec_terminal_error_code(true, false, Some(FecSenderExit::SinkClosed)),
+            Some(-1),
+        );
+        assert_eq!(
+            fec_terminal_error_code(true, false, Some(FecSenderExit::EncodeFailed)),
+            Some(-2),
+        );
+        assert_eq!(
+            fec_terminal_error_code(true, false, Some(FecSenderExit::ChannelClosed)),
+            Some(-3),
+        );
+        assert_eq!(
+            fec_terminal_error_code(true, false, Some(FecSenderExit::AckChannelClosed)),
+            Some(-4),
+        );
+    }
+
+    #[test]
+    fn fec_only_live_sender_never_terminates() {
+        assert_eq!(fec_terminal_error_code(true, true, None), None);
+    }
+
+    #[test]
+    fn fec_only_pending_exit_claim_is_a_single_claim_latch() {
+        // The second `take_terminal_exit()` call returns `None` (already
+        // claimed) — modeled here as the caller observing `None` on a
+        // second poll after a dead sender.
+        assert_eq!(fec_terminal_error_code(true, false, None), None);
+    }
+
+    #[test]
+    fn fec_only_dead_sender_superseded_exit_is_never_terminal() {
+        // A superseded exit reaching this seam (defensive — should not
+        // normally happen since a new setup() replaces the handle) must
+        // still never produce a terminal event.
+        assert_eq!(
+            fec_terminal_error_code(true, false, Some(FecSenderExit::Superseded)),
+            None,
+        );
+    }
+
+    #[test]
+    fn legacy_client_dead_sender_never_terminates() {
+        // Non-fec-only clients still have RTP: a dead FEC sender is not
+        // fatal for them.
+        assert_eq!(
+            fec_terminal_error_code(false, false, Some(FecSenderExit::SinkClosed)),
+            None,
+        );
     }
 }

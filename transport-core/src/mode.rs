@@ -214,8 +214,10 @@ mod tests {
         assert_eq!(knobs.codec_pref, base.codec_pref);
         // ...and the free-lunch constants never move regardless of mode or
         // user tradeoffs (they are not part of ModeKnobs at all).
-        assert!(free_lunch::SPATIAL_AQ_ON);
-        assert!(free_lunch::WEIGHTED_PRED_ON);
+        const {
+            assert!(free_lunch::SPATIAL_AQ_ON);
+            assert!(free_lunch::WEIGHTED_PRED_ON);
+        }
         assert_eq!(free_lunch::PRESET, "p4-quality-latency-balanced");
     }
 

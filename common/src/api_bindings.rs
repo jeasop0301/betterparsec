@@ -314,6 +314,11 @@ pub struct StreamSettings {
     /// missing field = false = legacy double-send behavior.
     #[serde(default)]
     pub video_over_fec_only: bool,
+    /// Highest FEC protocol version the client can decode. Missing means the
+    /// legacy v1 wire format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub requested_fec_protocol_version: Option<u8>,
 }
 
 #[derive(Serialize, Deserialize, Debug, TS)]
@@ -526,6 +531,17 @@ impl Display for RtcIceServer {
 #[ts(export, export_to = EXPORT_PATH)]
 pub struct StreamCapabilities {
     pub touch: bool,
+    /// Selected FEC wire version. Together with [`Self::fec_epoch`], this
+    /// forms a capability tuple: `(None, None)` and `(Some(1), None)` select
+    /// v1; `(Some(2), Some(nonzero))` selects v2. Every other tuple is a
+    /// protocol error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub selected_fec_protocol_version: Option<u8>,
+    /// Sender-owned v2 FEC epoch. This is present only for a v2 selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub fec_epoch: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, TS)]
@@ -570,6 +586,24 @@ pub enum StreamServerMessage {
         audio_mapping: [u8; 8],
     },
     ConnectionTerminated {
+        /// Stable negative code identifying why the stream was terminated.
+        /// This field also carries moonlight-common termination codes
+        /// verbatim (`0` = graceful host-app exit, `-100..=-104` band from
+        /// the Moonlight connection listener); the codes below never collide
+        /// with that band.
+        ///
+        /// Host fail-closed terminal codes (streamer FEC sender, G003 —
+        /// `streamer/src/transport/webrtc/fec_sender.rs::FecSenderExit`):
+        /// - `-1` `SinkClosed` — the FEC DataChannel sink is gone (send
+        ///   failed while emitting a frame's source symbol).
+        /// - `-2` `EncodeFailed` — wire-encoding of a FEC symbol failed.
+        /// - `-3` `ChannelClosed` — the FEC DataChannel sink is gone mid-frame
+        ///   (send failed while emitting a repair symbol).
+        /// - `-4` `AckChannelClosed` — the FEC ack/control channel closed
+        ///   unexpectedly (not a normal renegotiation retirement).
+        ///
+        /// A superseded FEC sender (renegotiation / a fresh setup) never
+        /// produces a terminal code — it is not an error.
         error_code: i32,
     },
 }
@@ -1265,5 +1299,43 @@ mod tests {
                 .expect("deserialize RestartIce"),
             StreamClientMessage::RestartIce
         ));
+    }
+    #[test]
+    fn fec_capabilities_preserve_wire_tuples() {
+        let capabilities: StreamCapabilities =
+            serde_json::from_str(r#"{"touch":false}"#).expect("deserialize legacy capabilities");
+        assert_eq!(capabilities.selected_fec_protocol_version, None);
+        assert_eq!(capabilities.fec_epoch, None);
+
+        let json = serde_json::to_value(StreamCapabilities {
+            touch: false,
+            selected_fec_protocol_version: Some(2),
+            fec_epoch: Some(42),
+        })
+        .expect("serialize v2 capabilities");
+        assert_eq!(json["selected_fec_protocol_version"], 2);
+        assert_eq!(json["fec_epoch"], 42);
+    }
+    #[test]
+    fn fec_request_serialization_is_optional_and_v2_is_explicit() {
+        let legacy: StreamSettings = serde_json::from_str(
+            r#"{"bitrate_kbps":8000,"width":1920,"height":1080,"fps":60,"play_audio_local":false,"supported_codecs":1,"hdr":false}"#,
+        )
+        .expect("deserialize legacy settings");
+        assert_eq!(legacy.requested_fec_protocol_version, None);
+
+        let request = StreamSettings {
+            bitrate_kbps: 8000,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            play_audio_local: false,
+            supported_codecs: 1,
+            hdr: false,
+            video_over_fec_only: true,
+            requested_fec_protocol_version: Some(2),
+        };
+        let json = serde_json::to_value(request).expect("serialize v2 request");
+        assert_eq!(json["requested_fec_protocol_version"], 2);
     }
 }

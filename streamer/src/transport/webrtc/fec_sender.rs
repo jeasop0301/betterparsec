@@ -1,6 +1,6 @@
 //! FEC sender: task + handle for the `video_fec` DataChannel.
 //!
-//! `FecSenderHandle` is a cheap-clone handle held by `WebRtcVideo`.
+//! `FecSenderHandle` is held by `WebRtcVideo`.
 //! A private async task owns the `FecEncoder` and drives sends to the wire.
 //! A generation counter (shared AtomicU32) lets the caller silently retire a
 //! stale task when the stream is re-setup — mirrors the CC ghost-writer guard
@@ -9,9 +9,10 @@
 use std::{
     collections::VecDeque,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -19,13 +20,15 @@ use bytes::Bytes;
 use tokio::{
     sync::{Mutex, Notify, mpsc},
     task,
+    time::Instant,
 };
 use tracing::{debug, warn};
 use webrtc::data_channel::RTCDataChannel;
 
-use transport_core::fec::{FecConfig, FecEncoder};
-
-use crate::transport::webrtc::fec_wire::{self, AckMsg};
+use transport_core::{
+    fec::{FecConfig, FecEncoder, Symbol},
+    fec_wire::{self, AckMsg, Epoch, ParsedControlMsg, V2Symbol, WireVersion},
+};
 
 // ── Sink abstraction ──────────────────────────────────────────────────────
 
@@ -59,11 +62,13 @@ impl FecSink for Arc<RTCDataChannel> {
 /// Non-key frame capacity.  Mirrors the `video_frame_queue_size` intent but
 /// kept small: at 60 fps the queue must not grow past ~67 ms of frames.
 const QUEUE_CAPACITY: usize = 4;
+const QUEUE_RESIDENCE_MAX: Duration = Duration::from_millis(100);
 
 struct FecFrame {
     data: Bytes,
     is_key: bool,
     timestamp_us: u32,
+    enqueued_at: Instant,
 }
 
 // ── Task command channel ──────────────────────────────────────────────────
@@ -77,59 +82,126 @@ enum AckCmd {
     /// Unrecoverable loss — set the shared needs-IDR flag.
     NeedsIdr,
 }
+// ── Typed terminal exit reasons ──────────────────────────────────────────
+
+/// Why `run_fec_sender` stopped running.
+///
+/// Every reason except [`Superseded`](Self::Superseded) is fail-closed: the
+/// task cannot claim carriage from a dead sender, and the caller
+/// (`WebRtcVideo`) must surface exactly one terminal
+/// `StreamServerMessage::ConnectionTerminated { error_code }` for a
+/// FEC-only (`video_over_fec_only`) session instead of silently dropping
+/// frames or silently falling back to an RTP track the client isn't
+/// consuming. See the code table on the `error_code` field doc in
+/// `common/src/api_bindings.rs` (mirrored in `web/api_bindings.ts`) — the
+/// values returned by [`Self::error_code`] below must stay in sync with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FecSenderExit {
+    /// The DataChannel sink is gone: `send_bytes` failed while emitting a
+    /// frame's *source* symbol (no bytes of this frame reached the wire).
+    SinkClosed,
+    /// Wire-encoding of a source or repair symbol failed (`fec_wire` error —
+    /// corrupt encoder state or a malformed chunk).
+    EncodeFailed,
+    /// The DataChannel sink is gone: `send_bytes` failed while emitting a
+    /// frame's *repair* symbol, i.e. mid-burst after the source already went
+    /// out. Kept distinct from [`SinkClosed`](Self::SinkClosed) for
+    /// diagnostics — a mid-frame death leaves more wire-state ambiguity.
+    ChannelClosed,
+    /// The `video_fec_ack` control mpsc channel closed (its sender dropped)
+    /// while this task's generation was still current. Normal ghost-writer
+    /// retirement always bumps the generation counter before dropping the
+    /// old handle, so an ack-channel close with a still-current generation
+    /// means the handle vanished unexpectedly.
+    AckChannelClosed,
+    /// A newer sender generation superseded this task (renegotiation / a
+    /// fresh `setup()` call) — normal retirement, not an error. No terminal
+    /// event is ever surfaced for this reason.
+    Superseded,
+}
+
+impl FecSenderExit {
+    /// Stable negative `StreamServerMessage::ConnectionTerminated::error_code`
+    /// for this reason, or `None` for [`Superseded`](Self::Superseded), which
+    /// is never terminal.
+    pub(crate) fn error_code(self) -> Option<i32> {
+        match self {
+            FecSenderExit::SinkClosed => Some(-1),
+            FecSenderExit::EncodeFailed => Some(-2),
+            FecSenderExit::ChannelClosed => Some(-3),
+            FecSenderExit::AckChannelClosed => Some(-4),
+            FecSenderExit::Superseded => None,
+        }
+    }
+}
 
 // ── Handle ────────────────────────────────────────────────────────────────
 
-/// Cheap-clone handle held by `WebRtcVideo`.
+/// Sender handle held by `WebRtcVideo`.
 ///
 /// The generation ghost-writer guard lives in the task itself: `spawn` hands
 /// the shared counter (`WebRtcVideo::fec_generation`) directly to
 /// `run_fec_sender`, which exits when it no longer matches `own_generation`.
-/// The handle deliberately does not keep its own copy.
-#[derive(Clone)]
 pub(crate) struct FecSenderHandle {
     /// `true` once the client sends SUBSCRIBE; enqueues are no-ops until then.
     pub(crate) active: Arc<AtomicBool>,
+    /// `true` while the sender task can drain queued frames.
+    live: Arc<AtomicBool>,
     queue: Arc<Mutex<VecDeque<FecFrame>>>,
     queue_notify: Arc<Notify>,
     ack_tx: mpsc::Sender<AckCmd>,
     needs_idr: Arc<AtomicBool>,
+    wire_version: WireVersion,
+    epoch: Epoch,
+    /// Single-claim latch for the task's typed terminal exit reason. `Some`
+    /// is written at most once, right before `live` flips to `false` (so a
+    /// reader observing `!is_live()` is guaranteed to see the reason).
+    /// [`Self::take_terminal_exit`] drains it exactly once — the exactly-once
+    /// guarantee the fail-closed terminal-event contract requires.
+    exit: Arc<StdMutex<Option<FecSenderExit>>>,
 }
 
 impl FecSenderHandle {
-    /// Create a handle and spawn the sender task.
-    ///
-    /// `own_generation` is the generation value for the new task.  The caller
-    /// must have already incremented `generation` so that `generation.load()
-    /// == own_generation` at spawn time.
-    pub(crate) fn spawn(
+    pub(crate) fn spawn_with_wire(
         own_generation: u32,
         generation: Arc<AtomicU32>,
         sink: Box<dyn FecSink>,
         needs_idr: Arc<AtomicBool>,
+        wire_version: WireVersion,
+        epoch: Epoch,
     ) -> Self {
         let active = Arc::new(AtomicBool::new(false));
+        let live = Arc::new(AtomicBool::new(true));
         let queue: Arc<Mutex<VecDeque<FecFrame>>> = Arc::new(Mutex::new(VecDeque::new()));
         let queue_notify = Arc::new(Notify::new());
         let (ack_tx, ack_rx) = mpsc::channel(16);
+        let exit = Arc::new(StdMutex::new(None));
 
         let handle = FecSenderHandle {
             active: active.clone(),
+            live: live.clone(),
             queue: queue.clone(),
             queue_notify: queue_notify.clone(),
             ack_tx,
             needs_idr: needs_idr.clone(),
+            wire_version,
+            epoch,
+            exit: exit.clone(),
         };
 
         task::spawn(run_fec_sender(
             own_generation,
             generation,
             active,
+            live,
             queue,
             queue_notify,
             ack_rx,
             sink,
             needs_idr,
+            wire_version,
+            epoch,
+            exit,
         ));
 
         handle
@@ -141,13 +213,49 @@ impl FecSenderHandle {
         generation: Arc<AtomicU32>,
         channel: Arc<RTCDataChannel>,
         needs_idr: Arc<AtomicBool>,
+        wire_version: WireVersion,
+        epoch: Epoch,
     ) -> Self {
-        Self::spawn(own_generation, generation, Box::new(channel), needs_idr)
+        Self::spawn_with_wire(
+            own_generation,
+            generation,
+            Box::new(channel),
+            needs_idr,
+            wire_version,
+            epoch,
+        )
     }
 
-    /// Whether the client has subscribed (active flag set).
+    /// Whether the sender is subscribed and has a live worker.
     pub(crate) fn is_active(&self) -> bool {
-        self.active.load(Ordering::Acquire)
+        self.active.load(Ordering::Acquire) && self.live.load(Ordering::Acquire)
+    }
+
+    /// Whether the sender task is still running, independent of whether the
+    /// client has subscribed yet. Unlike [`Self::is_active`] this is `true`
+    /// during the pre-subscribe startup window, so callers that need to
+    /// distinguish "not yet active" from "dead" (fail-closed termination)
+    /// must use this instead.
+    pub(crate) fn is_live(&self) -> bool {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// Claim the task's terminal exit reason exactly once. Returns `None`
+    /// while the task is still live (`live == true`), before the task has
+    /// exited, and after a previous caller has already claimed the reason —
+    /// this is the single-claim latch that guarantees racing callers cannot
+    /// double-report the same death. The live gate closes the race where a
+    /// caller that loaded `is_live() == true` drains a just-written exit
+    /// reason (the task writes the slot *before* flipping `live`), which
+    /// would otherwise discard the reason and produce zero terminals.
+    pub(crate) fn take_terminal_exit(&self) -> Option<FecSenderExit> {
+        if self.live.load(Ordering::Acquire) {
+            return None;
+        }
+        self.exit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     /// Enqueue a frame for FEC processing.
@@ -156,16 +264,54 @@ impl FecSenderHandle {
     /// queue and are always accepted. If a non-key frame hits capacity, the
     /// predictive chain is broken for FEC-primary clients: reject it, request
     /// an IDR, and return `false` instead of silently claiming it was carried.
+    ///
+    /// AwaitingIdr admission control: once `needs_idr` latches (from any
+    /// source — queue overflow, residence expiry, RTCP PLI, an explicit
+    /// client NeedsIdr control), the decoder's reference chain is already
+    /// broken, so further delta frames are worthless until the next key
+    /// frame. Reject them (`false`) instead of queuing dead weight — this is
+    /// what lets RTP-capable clients fall back per negotiation instead of
+    /// silently believing the frame was carried. Key frames are always
+    /// accepted and — via the existing skip-RTP consume path in
+    /// `WebRtcVideo::send_decode_unit` — clear `needs_idr`, re-admitting
+    /// deltas on the next call.
     pub(crate) async fn enqueue(&self, data: Bytes, is_key: bool, timestamp_us: u32) -> bool {
-        if !self.active.load(Ordering::Acquire) {
+        if !self.is_active() {
             return false;
         }
+        if !is_key && self.needs_idr.load(Ordering::Acquire) {
+            debug!("[FecSender] AwaitingIdr: rejecting delta enqueue until next key frame");
+            return false;
+        }
+        if self.wire_version == WireVersion::V2 && data.len() > fec_wire::ENCODED_FRAME_MAX {
+            self.needs_idr.store(true, Ordering::Release);
+            warn!("[FecSender] v2 frame exceeds encoded-frame limit; requested IDR");
+            return false;
+        }
+
+        let now = Instant::now();
+        let mut guard = self.queue.lock().await;
+        if !self.is_active() {
+            return false;
+        }
+
+        let mut expired_frame = false;
+        guard.retain(|queued| {
+            let expired = now.duration_since(queued.enqueued_at) >= QUEUE_RESIDENCE_MAX;
+            expired_frame |= expired;
+            !expired
+        });
+        if expired_frame {
+            self.needs_idr.store(true, Ordering::Release);
+            warn!("[FecSender] expired queued frame(s); requested IDR");
+        }
+
         let frame = FecFrame {
             data,
             is_key,
             timestamp_us,
+            enqueued_at: now,
         };
-        let mut guard = self.queue.lock().await;
         if is_key {
             // An IDR supersedes queued deltas. FEC-primary clients have no RTP
             // fallback, but the keyframe itself resets the decoder reference
@@ -191,17 +337,44 @@ impl FecSenderHandle {
         true
     }
 
-    /// Forward an `AckMsg` parsed from `video_fec_ack` to the sender task.
-    ///
-    /// Non-blocking (`try_send`): if the channel is full the message is
-    /// dropped — ACK loss is tolerable (window stays larger until next ACK).
-    pub(crate) fn forward_ack(&self, msg: AckMsg) {
+    /// Forward a versioned control message to the sender task. Controls from a
+    /// prior epoch, or from the other wire version, cannot affect this sender.
+    pub(crate) fn forward_control(&self, msg: ParsedControlMsg) {
+        let accepted = match (self.wire_version, msg) {
+            (WireVersion::V1, ParsedControlMsg::V1(msg)) => Some(msg),
+            (WireVersion::V2, ParsedControlMsg::V2(msg)) => match msg {
+                transport_core::fec_wire::V2ControlMsg::Subscribe { epoch }
+                    if epoch == self.epoch =>
+                {
+                    Some(AckMsg::Subscribe)
+                }
+                transport_core::fec_wire::V2ControlMsg::Ack { epoch, highest_seq }
+                    if epoch == self.epoch =>
+                {
+                    Some(AckMsg::Ack(highest_seq))
+                }
+                transport_core::fec_wire::V2ControlMsg::NeedsIdr { epoch, .. }
+                    if epoch == self.epoch =>
+                {
+                    Some(AckMsg::NeedsIdr)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(msg) = accepted else {
+            return;
+        };
         let cmd = match msg {
             AckMsg::Subscribe => AckCmd::Subscribe,
             AckMsg::NeedsIdr => AckCmd::NeedsIdr,
             AckMsg::Ack(v) => AckCmd::Ack(v),
         };
         let _ = self.ack_tx.try_send(cmd);
+    }
+
+    pub(crate) fn v2_epoch(&self) -> Option<Epoch> {
+        (self.wire_version == WireVersion::V2).then_some(self.epoch)
     }
 }
 
@@ -211,17 +384,21 @@ async fn run_fec_sender(
     own_generation: u32,
     generation: Arc<AtomicU32>,
     active: Arc<AtomicBool>,
+    live: Arc<AtomicBool>,
     queue: Arc<Mutex<VecDeque<FecFrame>>>,
     queue_notify: Arc<Notify>,
     mut ack_rx: mpsc::Receiver<AckCmd>,
     sink: Box<dyn FecSink>,
     needs_idr: Arc<AtomicBool>,
+    wire_version: WireVersion,
+    epoch: Epoch,
+    exit_slot: Arc<StdMutex<Option<FecSenderExit>>>,
 ) {
     let mut encoder = FecEncoder::new(FecConfig::default_streaming());
     let mut next_seq: u32 = 0;
     let mut next_frame_id: u32 = 0;
 
-    loop {
+    let exit = 'sender: loop {
         tokio::select! {
             _ = queue_notify.notified() => {
                 // Drain all queued frames (notify_one stores one permit;
@@ -233,20 +410,45 @@ async fn run_fec_sender(
                     };
                     let Some(frame) = frame else { break; };
 
+                    if Instant::now().duration_since(frame.enqueued_at) >= QUEUE_RESIDENCE_MAX {
+                        needs_idr.store(true, Ordering::Release);
+                        warn!("[FecSender] expired queued frame; requested IDR");
+                        continue;
+                    }
+
                     let frame_id = next_frame_id;
                     next_frame_id = next_frame_id.wrapping_add(1);
 
-                    let chunks = fec_wire::chunk_frame(
-                        frame_id,
-                        frame.is_key,
-                        frame.timestamp_us,
-                        &frame.data,
-                    );
+                    let chunks = match wire_version {
+                        WireVersion::V1 => fec_wire::chunk_frame(
+                            frame_id,
+                            frame.is_key,
+                            frame.timestamp_us,
+                            &frame.data,
+                        ),
+                        WireVersion::V2 => match fec_wire::chunk_frame_v2(
+                            frame_id,
+                            frame.is_key,
+                            frame.timestamp_us,
+                            &frame.data,
+                        ) {
+                            Ok(chunks) => chunks,
+                            Err(error) => {
+                                warn!("[FecSender] dropped invalid v2 frame: {error:?}");
+                                needs_idr.store(true, Ordering::Release);
+                                continue;
+                            }
+                        },
+                    };
 
                     for chunk in &chunks {
-                        // Ghost-writer guard: exit if this task is stale.
+                        if Instant::now().duration_since(frame.enqueued_at) >= QUEUE_RESIDENCE_MAX {
+                            needs_idr.store(true, Ordering::Release);
+                            warn!("[FecSender] frame expired before send; requested IDR");
+                            continue;
+                        }
                         if generation.load(Ordering::Acquire) != own_generation {
-                            return;
+                            break 'sender FecSenderExit::Superseded;
                         }
 
                         let seq = next_seq;
@@ -258,22 +460,40 @@ async fn run_fec_sender(
                         // was closed by the remote while the peer connection stayed
                         // alive.  Without this check the task would spin doing full
                         // GF(256) encoding followed by a failing send on every frame.
-                        let src_wire = Bytes::from(fec_wire::encode_symbol_msg(&out.source));
+                        let src_wire = match encode_symbol(wire_version, epoch, &out.source) {
+                            Ok(wire) => Bytes::from(wire),
+                            Err(error) => {
+                                warn!("[FecSender] failed to encode source symbol: {error:?}");
+                                break 'sender FecSenderExit::EncodeFailed;
+                            }
+                        };
                         if !sink.send_bytes(src_wire).await {
                             debug!("[FecSender] sink closed (source send failed); exiting task");
-                            return;
+                            break 'sender FecSenderExit::SinkClosed;
                         }
 
                         // Send repair symbols emitted for this source.
                         for repair in &out.repairs {
-                            if generation.load(Ordering::Acquire) != own_generation {
-                                return;
+                            if Instant::now().duration_since(frame.enqueued_at)
+                                >= QUEUE_RESIDENCE_MAX
+                            {
+                                needs_idr.store(true, Ordering::Release);
+                                warn!("[FecSender] frame expired before repair send; requested IDR");
+                                break;
                             }
-                            let repair_wire =
-                                Bytes::from(fec_wire::encode_symbol_msg(repair));
+                            if generation.load(Ordering::Acquire) != own_generation {
+                                break 'sender FecSenderExit::Superseded;
+                            }
+                            let repair_wire = match encode_symbol(wire_version, epoch, repair) {
+                                Ok(wire) => Bytes::from(wire),
+                                Err(error) => {
+                                    warn!("[FecSender] failed to encode repair symbol: {error:?}");
+                                    break 'sender FecSenderExit::EncodeFailed;
+                                }
+                            };
                             if !sink.send_bytes(repair_wire).await {
                                 debug!("[FecSender] sink closed (repair send failed); exiting task");
-                                return;
+                                break 'sender FecSenderExit::ChannelClosed;
                             }
                         }
                     }
@@ -291,35 +511,108 @@ async fn run_fec_sender(
                         needs_idr.store(true, Ordering::Release);
                     }
                     None => {
-                        // ack_tx dropped (handle dropped / stream ended).
-                        return;
+                        // ack_tx dropped (handle dropped / stream ended). If the
+                        // generation already moved on, this is the normal
+                        // ghost-writer retirement path (a new setup() replaced
+                        // the handle) — not an error, no terminal event. If the
+                        // generation is still current, the handle vanished
+                        // without that bump: anomalous, surface it.
+                        break 'sender if generation.load(Ordering::Acquire) != own_generation {
+                            FecSenderExit::Superseded
+                        } else {
+                            FecSenderExit::AckChannelClosed
+                        };
                     }
                 }
             }
         }
+    };
+    active.store(false, Ordering::Release);
+    if exit != FecSenderExit::Superseded {
+        needs_idr.store(true, Ordering::Release);
     }
+    // Write the exit reason, then flip `live` — Release ordering on the
+    // `live` store makes the mutex-protected write visible to any reader
+    // that observes `live == false` via an Acquire load (`is_live`).
+    *exit_slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(exit);
+    live.store(false, Ordering::Release);
+    queue.lock().await.clear();
 }
 
+fn encode_symbol(
+    wire_version: WireVersion,
+    epoch: Epoch,
+    symbol: &Symbol,
+) -> Result<Vec<u8>, transport_core::fec_wire::FecWireError> {
+    match wire_version {
+        WireVersion::V1 => Ok(fec_wire::encode_symbol_msg(symbol)),
+        WireVersion::V2 => {
+            let symbol = match symbol {
+                Symbol::Source { seq, payload } => V2Symbol::Source {
+                    epoch,
+                    seq: *seq,
+                    payload: payload.clone(),
+                },
+                Symbol::Repair {
+                    repair_seq,
+                    window_base,
+                    window_end,
+                    payload,
+                } => V2Symbol::Repair {
+                    epoch,
+                    repair_seq: *repair_seq,
+                    window_base: *window_base,
+                    window_end: *window_end,
+                    payload: payload.clone(),
+                },
+            };
+            fec_wire::encode_symbol_msg_v2(&symbol)
+        }
+    }
+}
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use tokio::time::{Duration, sleep};
+    use tokio::time::{Duration, sleep, timeout};
 
     // ── Test sinks ────────────────────────────────────────────────────────
 
-    /// A sink that always returns false (channel closed); used to verify the
-    /// sender task exits rather than spinning on send errors (Finding 9).
-    #[derive(Clone, Default)]
-    struct FailSink;
+    /// A sink that deterministically reports a failed send.
+    struct FailSink {
+        attempts: Arc<AtomicU32>,
+        attempted: Arc<Notify>,
+    }
 
     #[async_trait]
     impl FecSink for FailSink {
         async fn send_bytes(&self, _data: Bytes) -> bool {
-            false // simulate RTCDataChannel reset
+            self.attempts.fetch_add(1, Ordering::AcqRel);
+            self.attempted.notify_one();
+            false
+        }
+    }
+    /// A sink that pauses one successful send until the test releases it.
+    struct BlockingSink {
+        attempts: Arc<AtomicU32>,
+        block_on: u32,
+        blocked: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl FecSink for BlockingSink {
+        async fn send_bytes(&self, _data: Bytes) -> bool {
+            let attempt = self.attempts.fetch_add(1, Ordering::AcqRel) + 1;
+            if attempt == self.block_on {
+                self.blocked.notify_one();
+                self.release.notified().await;
+            }
+            true
         }
     }
 
@@ -331,17 +624,26 @@ mod tests {
             VecSink(Arc::new(std::sync::Mutex::new(Vec::new())))
         }
         fn snapshot(&self) -> Vec<Bytes> {
-            self.0.lock().unwrap().clone()
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         }
         fn len(&self) -> usize {
-            self.0.lock().unwrap().len()
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
         }
     }
 
     #[async_trait]
     impl FecSink for VecSink {
         async fn send_bytes(&self, data: Bytes) -> bool {
-            self.0.lock().unwrap().push(data);
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(data);
             true
         }
     }
@@ -352,7 +654,14 @@ mod tests {
         generation: Arc<AtomicU32>,
     ) -> FecSenderHandle {
         let gen_val = generation.load(Ordering::Acquire);
-        FecSenderHandle::spawn(gen_val, generation, Box::new(sink), needs_idr)
+        FecSenderHandle::spawn_with_wire(
+            gen_val,
+            generation,
+            Box::new(sink),
+            needs_idr,
+            WireVersion::V1,
+            Epoch::new(1).expect("constant epoch is nonzero"),
+        )
     }
 
     // ── Queue domain tests ────────────────────────────────────────────────
@@ -456,7 +765,11 @@ mod tests {
         handle.enqueue(Bytes::from_static(b"IDR"), true, 0).await;
         let q = handle.queue.lock().await;
         assert_eq!(q.len(), 1, "key frame on empty queue: 0 → 1");
-        assert!(q.front().unwrap().is_key);
+        assert!(
+            q.front()
+                .expect("queue contains the enqueued key frame")
+                .is_key
+        );
     }
 
     /// Non-key at capacity is rejected and requests immediate IDR repair.
@@ -500,7 +813,7 @@ mod tests {
             Arc::clone(&needs_idr),
             Arc::clone(&generation),
         );
-        // Do NOT call forward_ack(Subscribe) — active stays false.
+        // Do NOT forward a V1 Subscribe control — active stays false.
 
         handle.enqueue(Bytes::from_static(b"frame"), false, 0).await;
         handle.enqueue(Bytes::from_static(b"key"), true, 0).await;
@@ -528,7 +841,7 @@ mod tests {
         );
 
         assert!(!handle.is_active(), "initially inactive");
-        handle.forward_ack(AckMsg::Subscribe);
+        handle.forward_control(ParsedControlMsg::V1(AckMsg::Subscribe));
         sleep(Duration::from_millis(15)).await;
         assert!(handle.is_active(), "Subscribe must activate the handle");
     }
@@ -551,7 +864,7 @@ mod tests {
             Arc::clone(&needs_idr),
             Arc::clone(&generation),
         );
-        handle.forward_ack(AckMsg::Subscribe);
+        handle.forward_control(ParsedControlMsg::V1(AckMsg::Subscribe));
         sleep(Duration::from_millis(5)).await;
 
         // 8 frames one at a time; yield after each so the task drains before the next.
@@ -574,14 +887,18 @@ mod tests {
         assert_eq!(repairs_a.len(), 1, "1 repair after 8 sources at 1/8 ratio");
 
         // Repair wire: [kind=1 (1B)] [repair_seq (2B LE)] [window_base (4B LE)] ...
-        let first_window_base = u32::from_le_bytes(repairs_a[0][3..7].try_into().unwrap());
+        let first_window_base = u32::from_le_bytes(
+            repairs_a[0][3..7]
+                .try_into()
+                .expect("repair wire includes a four-byte window base"),
+        );
         assert_eq!(
             first_window_base, 0,
             "first repair window_base before ack must be 0"
         );
 
         // ACK seq 7 → FecEncoder evicts seq 0..7 from the window.
-        handle.forward_ack(AckMsg::Ack(7));
+        handle.forward_control(ParsedControlMsg::V1(AckMsg::Ack(7)));
         sleep(Duration::from_millis(10)).await;
 
         // 8 more frames; ratio_acc (still 0 after repair for seq 7) accumulates to 8
@@ -607,7 +924,11 @@ mod tests {
 
         // The second repair's window_base must be 8 (sliding from seq 8 onward),
         // not 0. This confirms ack(7) was processed by the encoder.
-        let second_window_base = u32::from_le_bytes(repairs_b[1][3..7].try_into().unwrap());
+        let second_window_base = u32::from_le_bytes(
+            repairs_b[1][3..7]
+                .try_into()
+                .expect("repair wire includes a four-byte window base"),
+        );
         assert_eq!(
             second_window_base, 8,
             "second repair window_base must be 8 after ack(7) slid the encoder window"
@@ -630,7 +951,7 @@ mod tests {
             Arc::clone(&needs_idr),
             Arc::clone(&generation),
         );
-        old_handle.forward_ack(AckMsg::Subscribe);
+        old_handle.forward_control(ParsedControlMsg::V1(AckMsg::Subscribe));
         sleep(Duration::from_millis(5)).await;
 
         // First frame must arrive in the sink.
@@ -646,11 +967,13 @@ mod tests {
 
         // Spawn a new task with generation=2 (uses a separate sink).
         let new_sink = VecSink::new();
-        let _new_handle = FecSenderHandle::spawn(
+        let _new_handle = FecSenderHandle::spawn_with_wire(
             2,
             Arc::clone(&generation),
             Box::new(new_sink),
             Arc::clone(&needs_idr),
+            WireVersion::V1,
+            Epoch::new(1).expect("constant epoch is nonzero"),
         );
 
         // Old handle (active=true) can still enqueue, but old task will exit
@@ -681,7 +1004,7 @@ mod tests {
             Arc::clone(&needs_idr),
             Arc::clone(&generation),
         );
-        handle.forward_ack(AckMsg::Subscribe);
+        handle.forward_control(ParsedControlMsg::V1(AckMsg::Subscribe));
         sleep(Duration::from_millis(5)).await;
 
         let frame_data = Bytes::from(vec![0xABu8; 3000]);
@@ -726,7 +1049,7 @@ mod tests {
         );
 
         assert!(!needs_idr.load(Ordering::Acquire));
-        handle.forward_ack(AckMsg::NeedsIdr);
+        handle.forward_control(ParsedControlMsg::V1(AckMsg::NeedsIdr));
         sleep(Duration::from_millis(15)).await;
         assert!(
             needs_idr.load(Ordering::Acquire),
@@ -734,49 +1057,492 @@ mod tests {
         );
     }
 
-    // ── Finding 9: sink error exits the task ──────────────────────────────
-
-    /// When the DataChannel is closed (FailSink returns false), the sender task
-    /// must exit rather than spinning and doing useless GF(256) work.
-    ///
-    /// Observable: after the task exits, enqueuing more frames should NOT add
-    /// any new messages to the sink.  We confirm this by counting messages
-    /// before and after a brief wait post-failure.
     #[tokio::test]
-    async fn test_failed_sink_exits_task() {
+    async fn v2_sender_emits_epoch_bound_source_and_rejects_other_epochs() {
         let generation = Arc::new(AtomicU32::new(1));
         let needs_idr = Arc::new(AtomicBool::new(false));
-        let gen_val = generation.load(Ordering::Acquire);
-        let handle = FecSenderHandle::spawn(
-            gen_val,
+        let sink = VecSink::new();
+        let epoch = Epoch::new(77).expect("test epoch is nonzero");
+        let handle = FecSenderHandle::spawn_with_wire(
+            1,
             Arc::clone(&generation),
-            Box::new(FailSink),
-            Arc::clone(&needs_idr),
+            Box::new(sink.clone()),
+            needs_idr,
+            WireVersion::V2,
+            epoch,
         );
 
-        // Activate the handle so frames are enqueued.
-        handle.active.store(true, Ordering::Release);
+        handle.forward_control(ParsedControlMsg::V1(AckMsg::Subscribe));
+        handle.forward_control(ParsedControlMsg::V2(
+            transport_core::fec_wire::V2ControlMsg::Subscribe {
+                epoch: Epoch::new(76).expect("test epoch is nonzero"),
+            },
+        ));
+        sleep(Duration::from_millis(5)).await;
+        assert!(!handle.is_active());
 
-        // Enqueue one frame — the task will attempt to send, get false, and exit.
-        handle
-            .enqueue(Bytes::from_static(b"frame_that_fails"), false, 0)
-            .await;
-        sleep(Duration::from_millis(30)).await;
+        handle.forward_control(ParsedControlMsg::V2(
+            transport_core::fec_wire::V2ControlMsg::Subscribe { epoch },
+        ));
+        sleep(Duration::from_millis(5)).await;
+        assert!(handle.is_active());
 
-        // Enqueue a second frame after the task should have exited.
-        handle
-            .enqueue(Bytes::from_static(b"no_one_home"), false, 1000)
-            .await;
+        assert!(handle.enqueue(Bytes::from_static(b"abc"), true, 123).await);
         sleep(Duration::from_millis(20)).await;
 
-        // The FailSink received 0 bytes (it returns false, not counting sends).
-        // The key assertion: no panic, and the task did not keep spinning
-        // (evidenced by the test completing within the sleep window above).
-        // If the task had spun it would have blocked the Tokio runtime.
-        // We assert the handle's ack_tx channel is still available (handle alive).
+        let messages = sink.snapshot();
+        assert_eq!(messages.len(), 1);
+        let bytes = &messages[0];
+        assert_eq!(bytes[0], 0x02);
+        assert_eq!(
+            u32::from_le_bytes(
+                bytes[1..5]
+                    .try_into()
+                    .expect("v2 source wire includes an epoch"),
+            ),
+            77
+        );
+        assert_eq!(
+            u32::from_le_bytes(
+                bytes[5..9]
+                    .try_into()
+                    .expect("v2 source wire includes a sequence"),
+            ),
+            0
+        );
+        assert_eq!(
+            u16::from_le_bytes(
+                bytes[9..11]
+                    .try_into()
+                    .expect("v2 source wire includes a payload length"),
+            ),
+            24
+        );
+
+        let parsed =
+            fec_wire::parse_symbol_msg_versioned(bytes).expect("sender emits a valid v2 source");
+        let transport_core::fec_wire::ParsedSymbolMsg::V2(V2Symbol::Source {
+            epoch: actual_epoch,
+            seq,
+            payload,
+        }) = parsed
+        else {
+            panic!("expected v2 source");
+        };
+        assert_eq!(actual_epoch, epoch);
+        assert_eq!(seq, 0);
+        let (chunk, fragment) =
+            fec_wire::parse_chunk_v2(&payload).expect("v2 source payload is a valid chunk");
+        assert_eq!(chunk.frame_id, 0);
+        assert_eq!(chunk.timestamp_us, 123);
+        assert_eq!(fragment, b"abc");
+    }
+    #[tokio::test]
+    async fn test_failed_sink_clears_liveness_queue_and_requests_idr() {
+        let generation = Arc::new(AtomicU32::new(1));
+        let needs_idr = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempted = Arc::new(Notify::new());
+        let handle = FecSenderHandle::spawn_with_wire(
+            generation.load(Ordering::Acquire),
+            Arc::clone(&generation),
+            Box::new(FailSink {
+                attempts: Arc::clone(&attempts),
+                attempted: Arc::clone(&attempted),
+            }),
+            Arc::clone(&needs_idr),
+            WireVersion::V1,
+            Epoch::new(1).expect("constant epoch is nonzero"),
+        );
+
+        handle.active.store(true, Ordering::Release);
         assert!(
-            !handle.is_active() || handle.is_active(), // trivially true; no panic = pass
-            "task must exit cleanly on sink failure — no panic or hang"
+            handle
+                .enqueue(Bytes::from_static(b"frame_that_fails"), false, 0)
+                .await
+        );
+        attempted.notified().await;
+        while handle.is_active() {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(attempts.load(Ordering::Acquire), 1);
+        assert!(!handle.is_active(), "failed sender must no longer be live");
+        assert!(!handle.is_live(), "failed sender must no longer be live");
+        assert!(needs_idr.load(Ordering::Acquire));
+        assert_eq!(handle.queue.lock().await.len(), 0);
+        assert!(
+            !handle
+                .enqueue(Bytes::from_static(b"no_one_home"), false, 1000)
+                .await,
+            "dead worker must not claim FEC carriage"
+        );
+        assert_eq!(handle.queue.lock().await.len(), 0);
+
+        // Typed exit reason: a source-send failure is SinkClosed, and its
+        // stable error_code is -1.
+        assert_eq!(handle.take_terminal_exit(), Some(FecSenderExit::SinkClosed));
+        assert_eq!(FecSenderExit::SinkClosed.error_code(), Some(-1));
+        // Single-claim latch: a second claim returns None even though the
+        // task already exited.
+        assert_eq!(handle.take_terminal_exit(), None);
+    }
+    #[tokio::test]
+    async fn worker_expired_key_frame_requests_idr() {
+        let generation = Arc::new(AtomicU32::new(1));
+        let needs_idr = Arc::new(AtomicBool::new(false));
+        let handle = make_handle(
+            VecSink::new(),
+            Arc::clone(&needs_idr),
+            Arc::clone(&generation),
+        );
+        handle.active.store(true, Ordering::Release);
+        handle.queue.lock().await.push_front(FecFrame {
+            data: Bytes::from_static(b"stale_key"),
+            is_key: true,
+            timestamp_us: 0,
+            enqueued_at: Instant::now() - QUEUE_RESIDENCE_MAX,
+        });
+        handle.queue_notify.notify_one();
+
+        timeout(Duration::from_secs(1), async {
+            while !handle.queue.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker must drain the stale key frame");
+
+        assert!(needs_idr.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn worker_partial_key_source_send_expiration_requests_idr() {
+        let generation = Arc::new(AtomicU32::new(1));
+        let needs_idr = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicU32::new(0));
+        let blocked = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let handle = FecSenderHandle::spawn_with_wire(
+            1,
+            generation,
+            Box::new(BlockingSink {
+                attempts: Arc::clone(&attempts),
+                block_on: 1,
+                blocked: Arc::clone(&blocked),
+                release: Arc::clone(&release),
+            }),
+            Arc::clone(&needs_idr),
+            WireVersion::V1,
+            Epoch::new(1).expect("constant epoch is nonzero"),
+        );
+        handle.active.store(true, Ordering::Release);
+
+        assert!(
+            handle
+                .enqueue(
+                    Bytes::from(vec![0; fec_wire::CHUNK_FRAGMENT_MAX + 1]),
+                    true,
+                    0,
+                )
+                .await
+        );
+        timeout(Duration::from_secs(1), blocked.notified())
+            .await
+            .expect("first source send must block");
+        sleep(QUEUE_RESIDENCE_MAX + Duration::from_millis(10)).await;
+        release.notify_one();
+
+        timeout(Duration::from_secs(1), async {
+            while !needs_idr.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expired unsent source must request IDR");
+
+        assert_eq!(attempts.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_partial_key_repair_send_expiration_requests_idr() {
+        let generation = Arc::new(AtomicU32::new(1));
+        let needs_idr = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicU32::new(0));
+        let blocked = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let handle = FecSenderHandle::spawn_with_wire(
+            1,
+            generation,
+            Box::new(BlockingSink {
+                attempts: Arc::clone(&attempts),
+                block_on: 8,
+                blocked: Arc::clone(&blocked),
+                release: Arc::clone(&release),
+            }),
+            Arc::clone(&needs_idr),
+            WireVersion::V1,
+            Epoch::new(1).expect("constant epoch is nonzero"),
+        );
+        handle.active.store(true, Ordering::Release);
+
+        assert!(
+            handle
+                .enqueue(
+                    Bytes::from(vec![0; fec_wire::CHUNK_FRAGMENT_MAX * 8]),
+                    true,
+                    0,
+                )
+                .await
+        );
+        timeout(Duration::from_secs(1), blocked.notified())
+            .await
+            .expect("eighth source send must block before its repair");
+        sleep(QUEUE_RESIDENCE_MAX + Duration::from_millis(10)).await;
+        release.notify_one();
+
+        timeout(Duration::from_secs(1), async {
+            while !needs_idr.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expired unsent repair must request IDR");
+
+        assert_eq!(attempts.load(Ordering::Acquire), 8);
+    }
+
+    #[tokio::test]
+    async fn queue_residence_expires_at_100ms_not_before() {
+        for (age, expected_len, expects_idr) in [
+            (Duration::from_millis(99), 2, false),
+            (Duration::from_millis(100), 1, true),
+            (Duration::from_millis(101), 1, true),
+        ] {
+            let generation = Arc::new(AtomicU32::new(1));
+            let needs_idr = Arc::new(AtomicBool::new(false));
+            let handle = make_handle(
+                VecSink::new(),
+                Arc::clone(&needs_idr),
+                Arc::clone(&generation),
+            );
+            handle.active.store(true, Ordering::Release);
+            handle.queue.lock().await.push_front(FecFrame {
+                data: Bytes::from_static(b"old_delta"),
+                is_key: false,
+                timestamp_us: 0,
+                enqueued_at: Instant::now() - age,
+            });
+
+            assert!(handle.enqueue(Bytes::from_static(b"new"), false, 0).await);
+            assert_eq!(handle.queue.lock().await.len(), expected_len);
+            assert_eq!(needs_idr.load(Ordering::Acquire), expects_idr);
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_encoded_frame_limit_is_preflighted_before_carriage() {
+        let generation = Arc::new(AtomicU32::new(1));
+        let needs_idr = Arc::new(AtomicBool::new(false));
+        let handle = FecSenderHandle::spawn_with_wire(
+            1,
+            generation,
+            Box::new(VecSink::new()),
+            Arc::clone(&needs_idr),
+            WireVersion::V2,
+            Epoch::new(1).expect("constant epoch is nonzero"),
+        );
+        handle.active.store(true, Ordering::Release);
+
+        assert!(
+            handle
+                .enqueue(Bytes::from(vec![0; fec_wire::ENCODED_FRAME_MAX]), false, 0)
+                .await
+        );
+        assert!(
+            !handle
+                .enqueue(
+                    Bytes::from(vec![0; fec_wire::ENCODED_FRAME_MAX + 1]),
+                    false,
+                    0,
+                )
+                .await
+        );
+        assert!(needs_idr.load(Ordering::Acquire));
+    }
+    // ── Typed terminal exit reasons (G003) ──────────────────────────────
+
+    /// Generation bump retires the old task via the ack-channel-close path
+    /// (handle dropped): its exit reason must be `Superseded`, and
+    /// `Superseded` must never carry a terminal `error_code`.
+    #[tokio::test]
+    async fn test_superseded_exit_produces_no_terminal_error_code() {
+        let generation = Arc::new(AtomicU32::new(1));
+        let needs_idr = Arc::new(AtomicBool::new(false));
+        let sink = VecSink::new();
+
+        let old_handle = make_handle(
+            sink.clone(),
+            Arc::clone(&needs_idr),
+            Arc::clone(&generation),
+        );
+        old_handle.forward_control(ParsedControlMsg::V1(AckMsg::Subscribe));
+        sleep(Duration::from_millis(5)).await;
+
+        // Bump generation, then drop the old handle so its ack_tx closes —
+        // this exercises the ack_rx `None` branch's generation check.
+        generation.fetch_add(1, Ordering::AcqRel);
+        drop(old_handle);
+
+        // Give the retired task a bounded settle window to run its exit
+        // epilogue; there is no handle left to poll, so yield then sleep.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            !needs_idr.load(Ordering::Acquire),
+            "a superseded exit must not request an IDR"
+        );
+    }
+
+    /// B1 regression: the exit latch is gated on liveness. A racing reader
+    /// that loaded `is_live() == true` must NOT be able to drain a
+    /// just-written exit reason — `take_terminal_exit` returns `None` until
+    /// the task's `live = false` store is visible, so the reason can never
+    /// be discarded before a `!is_live()` observer claims it.
+    #[tokio::test]
+    async fn take_terminal_exit_is_gated_on_liveness() {
+        let generation = Arc::new(AtomicU32::new(1));
+        let needs_idr = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempted = Arc::new(Notify::new());
+        let handle = FecSenderHandle::spawn_with_wire(
+            generation.load(Ordering::Acquire),
+            Arc::clone(&generation),
+            Box::new(FailSink {
+                attempts: Arc::clone(&attempts),
+                attempted: Arc::clone(&attempted),
+            }),
+            Arc::clone(&needs_idr),
+            WireVersion::V1,
+            Epoch::new(1).expect("constant epoch is nonzero"),
+        );
+
+        // While the task is live, no reader can drain the (empty) latch.
+        assert!(handle.is_live());
+        assert_eq!(handle.take_terminal_exit(), None);
+
+        // Kill the sink; wait for the death to become observable.
+        handle.active.store(true, Ordering::Release);
+        assert!(handle.enqueue(Bytes::from_static(b"x"), true, 0).await);
+        attempted.notified().await;
+        while handle.is_live() {
+            tokio::task::yield_now().await;
+        }
+
+        // Only a !is_live observer claims the reason — exactly once.
+        assert_eq!(handle.take_terminal_exit(), Some(FecSenderExit::SinkClosed));
+        assert_eq!(handle.take_terminal_exit(), None);
+    }
+    /// Racing exits: a dead sender's terminal exit reason must be claimable
+    /// exactly once even when multiple concurrent readers poll for it —
+    /// the `Mutex<Option<T>>::take()` latch guarantees a single winner.
+    #[tokio::test]
+    async fn test_one_terminal_per_task_under_concurrent_claims() {
+        let generation = Arc::new(AtomicU32::new(1));
+        let needs_idr = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempted = Arc::new(Notify::new());
+        let handle = Arc::new(FecSenderHandle::spawn_with_wire(
+            generation.load(Ordering::Acquire),
+            Arc::clone(&generation),
+            Box::new(FailSink {
+                attempts: Arc::clone(&attempts),
+                attempted: Arc::clone(&attempted),
+            }),
+            Arc::clone(&needs_idr),
+            WireVersion::V1,
+            Epoch::new(1).expect("constant epoch is nonzero"),
+        ));
+
+        handle.active.store(true, Ordering::Release);
+        assert!(
+            handle
+                .enqueue(Bytes::from_static(b"frame_that_fails"), false, 0)
+                .await
+        );
+        attempted.notified().await;
+        while handle.is_live() {
+            tokio::task::yield_now().await;
+        }
+
+        // 8 concurrent claimants race for the single terminal exit reason.
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let handle = Arc::clone(&handle);
+            tasks.push(tokio::spawn(async move { handle.take_terminal_exit() }));
+        }
+
+        let mut claimed = 0;
+        for task in tasks {
+            if task.await.expect("claim task must not panic").is_some() {
+                claimed += 1;
+            }
+        }
+
+        assert_eq!(
+            claimed, 1,
+            "exactly one concurrent claimant must observe the terminal exit reason"
+        );
+    }
+
+    // ── AwaitingIdr delta rejection ──────────────────────────────────────
+
+    /// Once `needs_idr` latches, deltas are rejected (not silently queued)
+    /// until the flag is cleared by the next key frame's consumer; keys are
+    /// always accepted regardless of `needs_idr`.
+    #[tokio::test]
+    async fn test_awaiting_idr_rejects_deltas_key_always_accepted() {
+        let generation = Arc::new(AtomicU32::new(1));
+        let needs_idr = Arc::new(AtomicBool::new(false));
+        let handle = make_handle(
+            VecSink::new(),
+            Arc::clone(&needs_idr),
+            Arc::clone(&generation),
+        );
+        handle.active.store(true, Ordering::Release);
+
+        // Baseline: deltas accepted while not awaiting an IDR.
+        assert!(handle.enqueue(Bytes::from_static(b"d0"), false, 0).await);
+
+        // Latch AwaitingIdr.
+        needs_idr.store(true, Ordering::Release);
+
+        // Deltas are rejected while AwaitingIdr — no silent carriage claim.
+        assert!(
+            !handle.enqueue(Bytes::from_static(b"d1"), false, 1).await,
+            "delta must be rejected while AwaitingIdr"
+        );
+        assert!(
+            !handle.enqueue(Bytes::from_static(b"d2"), false, 2).await,
+            "delta must stay rejected while AwaitingIdr"
+        );
+
+        // Keys are always accepted, even while AwaitingIdr.
+        assert!(
+            handle.enqueue(Bytes::from_static(b"key"), true, 3).await,
+            "key frames must always be accepted"
+        );
+
+        // Re-admission: once the flag is cleared (as the real consumer in
+        // `WebRtcVideo::send_decode_unit` does after a carried key), deltas
+        // are accepted again.
+        needs_idr.store(false, Ordering::Release);
+        assert!(
+            handle.enqueue(Bytes::from_static(b"d3"), false, 4).await,
+            "delta must be re-admitted once AwaitingIdr clears"
         );
     }
 }

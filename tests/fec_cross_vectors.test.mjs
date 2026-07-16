@@ -14,10 +14,12 @@ import test from "node:test"
 
 import { FecEncoder, FecDecoder } from "../dist/stream/video/fec.js"
 import {
-    parseSymbolMessage,
     encodeSymbolMessage,
+    encodeSymbolMessageV2,
+    parseSymbolMessage,
     chunkFrame,
     CHUNK_HEADER_SIZE,
+    crc32,
 } from "../dist/stream/video/fec_wire.js"
 
 // ── Fixture ───────────────────────────────────────────────────────────────
@@ -180,4 +182,54 @@ test("fec_cross_vectors: TS encoder produces identical hex to committed Rust fix
         fixture.messages,
         "TS encoder hex output must match committed Rust fixture messages byte-for-byte",
     )
+})
+test("fec v2 source and repair vectors match the committed Rust fixture", () => {
+    assert.deepEqual(
+        fixture.v2_symbols.map(record => record.kind),
+        ["source", "repair"],
+        "fixture must include canonical source then repair v2 symbols",
+    )
+
+    for (const record of fixture.v2_symbols) {
+        const payload = hexToU8(record.payload_hex)
+        const symbol = record.kind === "source"
+            ? {
+                kind: "source",
+                version: 2,
+                epoch: record.epoch,
+                seq: record.seq,
+                payload,
+            }
+            : {
+                kind: "repair",
+                version: 2,
+                epoch: record.epoch,
+                repairSeq: record.repair_seq,
+                windowBase: record.window_base,
+                windowEnd: record.window_end,
+                payload,
+            }
+
+        assert.equal(crc32(payload), record.payload_crc32, `${record.kind} payload CRC must match fixture`)
+        const encoded = encodeSymbolMessageV2(symbol)
+        const bytes = new Uint8Array(encoded)
+        const view = new DataView(encoded)
+        const crcOffset = record.kind === "source" ? 11 : 17
+        assert.equal(u8ToHex(bytes), record.encoded_hex, `${record.kind} encoding must match Rust fixture`)
+        assert.equal(view.getUint32(crcOffset, true), record.payload_crc32, `${record.kind} wire CRC must match fixture`)
+
+        const decoded = parseSymbolMessage(encoded)
+        assert.ok(decoded, `${record.kind} encoding must parse`)
+        assert.equal(decoded.kind, record.kind)
+        assert.equal(decoded.version, 2)
+        assert.equal(decoded.epoch, record.epoch)
+        assert.deepEqual(decoded.payload, payload)
+        if (record.kind === "source") {
+            assert.equal(decoded.seq, record.seq)
+        } else {
+            assert.equal(decoded.repairSeq, record.repair_seq)
+            assert.equal(decoded.windowBase, record.window_base)
+            assert.equal(decoded.windowEnd, record.window_end)
+        }
+    }
 })

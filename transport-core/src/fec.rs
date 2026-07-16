@@ -10,8 +10,6 @@
 //! Pure/deterministic: no clocks, no I/O. Transport attachment (datachannel
 //! or custom RTP framing) is out of scope for this module.
 
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::OnceLock;
 
@@ -68,18 +66,6 @@ fn gf_inv(a: u8) -> u8 {
     assert_ne!(a, 0, "gf_inv(0) is undefined");
     let t = gf_tables();
     t.exp[255 - t.log[a as usize] as usize]
-}
-
-/// GF(256) division a/b. Returns 0 if a==0. Panics if b==0.
-fn gf_div(a: u8, b: u8) -> u8 {
-    assert_ne!(b, 0, "gf_div by zero");
-    if a == 0 {
-        return 0;
-    }
-    let t = gf_tables();
-    let la = t.log[a as usize] as i16;
-    let lb = t.log[b as usize] as i16;
-    t.exp[((la - lb).rem_euclid(255)) as usize]
 }
 
 /// Deterministic GF(256) coefficient for (repair_seq, src_seq).
@@ -162,6 +148,27 @@ struct WindowEntry {
     prefixed_payload: Vec<u8>,
 }
 
+/// RFC 1982 ordering for u32 serials. `None` is the intentionally unordered
+/// exact half-range case.
+fn serial_cmp(a: u32, b: u32) -> Option<std::cmp::Ordering> {
+    if a == b {
+        return Some(std::cmp::Ordering::Equal);
+    }
+    let distance = a.wrapping_sub(b);
+    if distance == 0x8000_0000 {
+        None
+    } else if distance < 0x8000_0000 {
+        Some(std::cmp::Ordering::Greater)
+    } else {
+        Some(std::cmp::Ordering::Less)
+    }
+}
+
+/// True when `seq` belongs to the bounded serial interval `[base, base + len)`.
+fn seq_in_window(seq: u32, base: u32, len: u32) -> bool {
+    seq.wrapping_sub(base) < len
+}
+
 /// 체계적 슬라이딩 윈도우 FEC 인코더.
 #[derive(Debug)]
 pub struct FecEncoder {
@@ -239,25 +246,22 @@ impl FecEncoder {
     }
 
     pub fn acknowledge(&mut self, highest_fully_decoded: u32) {
-        // §4-C: "미래 seq (윈도우에 없는 seq 초과) → 무시 (윈도우 변경 없음)".
-        // Guard: if ack exceeds the highest seq we have ever emitted (window back),
-        // treat as a no-op — prevents accidental total-wipe from a stale or erroneous
-        // feedback value (e.g. u32::MAX).
-        // Blast radius when ack == window.back().seq: N → 0 (total wipe, all entries
-        // irrecoverable from this module). This is spec-mandated behaviour: the caller
-        // only sends this value once the receiver has confirmed decoding all symbols.
         let Some(back_seq) = self.window.back().map(|e| e.seq) else {
-            return; // empty window — nothing to evict
-        };
-        if highest_fully_decoded > back_seq {
-            // Future seq: ignore per spec §4-C
             return;
+        };
+        // RFC 1982 makes the exact half-range unordered. Never let such an ACK
+        // mutate the window, and ignore ACKs serially after the latest source.
+        match serial_cmp(highest_fully_decoded, back_seq) {
+            None | Some(std::cmp::Ordering::Greater) => return,
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) => {}
         }
+
         while let Some(front) = self.window.front() {
-            if front.seq <= highest_fully_decoded {
-                self.evict_oldest();
-            } else {
-                break;
+            match serial_cmp(front.seq, highest_fully_decoded) {
+                Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) => {
+                    self.evict_oldest();
+                }
+                None | Some(std::cmp::Ordering::Greater) => break,
             }
         }
     }
@@ -339,9 +343,15 @@ pub enum DecoderEvent {
         from_seq: u32,
         to_seq_exclusive: u32,
     },
+    /// The bounded decoder discarded unresolved source state. The epoch-owning
+    /// receiver turns this into its public discontinuity signal.
+    Evicted {
+        from_seq: u32,
+        to_seq_exclusive: u32,
+    },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SourceState {
     Received(Vec<u8>),
     Recovered(Vec<u8>),
@@ -361,7 +371,7 @@ impl SourceState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ReceivedRepair {
     repair_seq: u16,
     window_base: u32,
@@ -408,8 +418,22 @@ pub struct FecDecoderStats {
     /// direct arrival).
     pub loss_spans_recovered: u64,
 }
+
+/// Bounded-state snapshot. `retained_bytes` is source payload bytes + 8 bytes
+/// per source, repair payload bytes + 16 bytes per repair, and 8 bytes per
+/// dedup key. Gaussian work is admitted only when this plus its scratch fits
+/// the configured byte cap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FecDecoderAccounting {
+    pub source_symbols: usize,
+    pub repair_symbols: usize,
+    pub dedup_keys: usize,
+    /// Largest active matrix dimension; source and repair dimensions are each capped at 128.
+    pub algebra_symbols: usize,
+    pub retained_bytes: usize,
+}
 /// 체계적 슬라이딩 윈도우 FEC 디코더.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FecDecoder {
     max_symbols: u16,
     max_bytes: u32,
@@ -421,8 +445,6 @@ pub struct FecDecoder {
     /// repair_seq=128 shared key 0 even though gf_coeff(0,s) ≠ gf_coeff(128,s).
     seen_repair_keys: std::collections::HashSet<(u16, u32)>,
     highest_contiguous: Option<u32>,
-    /// Lowest seq we still care about (eviction watermark).
-    window_base: Option<u32>,
     /// Cheap instrumentation counters (see [`FecDecoderStats`] doc comment).
     /// Monotonic, default-zero, no allocation on the hot path.
     stats: FecDecoderStats,
@@ -434,21 +456,42 @@ pub struct FecDecoder {
     /// genuine FEC recovery (`SourceState::Recovered`) rather than a late
     /// direct arrival (`SourceState::Received`).
     open_loss_span_has_recovery: bool,
+    newest_seq: Option<u32>,
+    /// `(window_base, window_end)` of the most recently committed forward
+    /// repair, i.e. the active retained/frontier horizon that
+    /// `roll_for_repair` has already rolled state up to. `None` until the
+    /// first repair commits — before that, nothing has been retired, so any
+    /// window is trivially forward. This is intentionally independent of
+    /// `sources`/`repairs` contents: cap-driven eviction (`make_room`) can
+    /// remove arbitrary entries without moving the declared rolling horizon,
+    /// so only an accepted repair's own window may advance it. Tracking both
+    /// endpoints (not just `window_base`) is required to reject a delayed,
+    /// same-or-earlier-base repair whose `window_end` does not extend past
+    /// what has already been committed — e.g. a stale `[50, 60)` arriving
+    /// after `[50, 110)` has already rolled state forward.
+    roll_horizon: Option<(u32, u32)>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepairHorizonRelation {
+    Stale,
+    Overlapping,
+    Forward,
 }
 
 impl FecDecoder {
     pub fn new(max_symbols: u16, max_bytes: u32) -> Self {
         Self {
             max_symbols: max_symbols.clamp(1, 128),
-            max_bytes: max_bytes.max(1),
+            max_bytes: max_bytes.clamp(1, 16 * 1024 * 1024),
             sources: BTreeMap::new(),
             repairs: Vec::new(),
             seen_repair_keys: std::collections::HashSet::new(),
             highest_contiguous: None,
-            window_base: None,
             stats: FecDecoderStats::default(),
             open_loss_span: None,
             open_loss_span_has_recovery: false,
+            newest_seq: None,
+            roll_horizon: None,
         }
     }
 
@@ -472,6 +515,198 @@ impl FecDecoder {
     /// struct; cheap to call at any time — no allocation, no traversal).
     pub fn stats(&self) -> FecDecoderStats {
         self.stats
+    }
+
+    pub fn accounting(&self) -> FecDecoderAccounting {
+        let source_bytes: usize = self
+            .sources
+            .values()
+            .map(|state| match state {
+                SourceState::Received(payload) | SourceState::Recovered(payload) => {
+                    payload.len() + 8
+                }
+                SourceState::Missing => 8,
+            })
+            .sum();
+        let repair_bytes: usize = self
+            .repairs
+            .iter()
+            .map(|repair| repair.payload.len() + 16)
+            .sum();
+        FecDecoderAccounting {
+            source_symbols: self.sources.len(),
+            repair_symbols: self.repairs.len(),
+            dedup_keys: self.seen_repair_keys.len(),
+            algebra_symbols: self.sources.len().max(self.repairs.len()),
+            retained_bytes: source_bytes + repair_bytes + self.seen_repair_keys.len() * 8,
+        }
+    }
+
+    fn note_newest(&mut self, seq: u32) {
+        match self.newest_seq {
+            None => self.newest_seq = Some(seq),
+            Some(current) if seq.wrapping_sub(current) < 0x8000_0000 => {
+                self.newest_seq = Some(seq);
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Classify a repair before changing retained state. `roll_horizon` is the
+    /// `(window_base, window_end)` of the most recently committed forward
+    /// repair — the declared point up to which `roll_for_repair` has already
+    /// retired state. Comparisons use RFC1982 half-range arithmetic so this
+    /// stays correct as `u32` sequence numbers wrap.
+    ///
+    /// - `Stale`: `window_end` is serially older than the committed end, or
+    ///   equal to it with a different `window_base` (a same-or-narrower
+    ///   sub-window that gains no new coverage — e.g. a delayed `[50, 60)`
+    ///   after `[50, 110)` has already committed).
+    /// - `Forward`: `window_end` is serially newer than the committed end AND
+    ///   `window_base` is not serially older than the committed base, or the
+    ///   window is byte-for-byte identical to the committed one (a second,
+    ///   independent equation for the currently active window, not a
+    ///   backward roll).
+    /// - `Overlapping`: `window_end` is serially newer but `window_base` is
+    ///   serially older than the committed base — would need equations for
+    ///   already-retired state, so it cannot be admitted.
+    fn repair_horizon_relation(&self, window_base: u32, window_end: u32) -> RepairHorizonRelation {
+        let Some((horizon_base, horizon_end)) = self.roll_horizon else {
+            return RepairHorizonRelation::Forward;
+        };
+        match serial_cmp(window_end, horizon_end) {
+            None | Some(std::cmp::Ordering::Less) => RepairHorizonRelation::Stale,
+            Some(std::cmp::Ordering::Equal) => {
+                if window_base == horizon_base {
+                    RepairHorizonRelation::Forward
+                } else {
+                    RepairHorizonRelation::Stale
+                }
+            }
+            Some(std::cmp::Ordering::Greater) => match serial_cmp(window_base, horizon_base) {
+                Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) => {
+                    RepairHorizonRelation::Forward
+                }
+                Some(std::cmp::Ordering::Less) | None => RepairHorizonRelation::Overlapping,
+            },
+        }
+    }
+
+    /// Evict retained state until adding the specified accounting deltas fits.
+    /// Returns the eviction discontinuities produced before the caller mutates
+    /// state. Callers must reject an admission whose own deltas cannot fit.
+    fn make_room(
+        &mut self,
+        added_sources: usize,
+        added_repairs: usize,
+        added_keys: usize,
+        added_bytes: usize,
+    ) -> Vec<DecoderEvent> {
+        let mut events = Vec::new();
+        loop {
+            let accounting = self.accounting();
+            let over_symbols = accounting.source_symbols.saturating_add(added_sources)
+                > self.max_symbols as usize
+                || accounting.repair_symbols.saturating_add(added_repairs)
+                    > self.max_symbols as usize;
+            let over_bytes = accounting
+                .retained_bytes
+                .saturating_add(added_bytes)
+                .saturating_add(added_keys.saturating_mul(8))
+                > self.max_bytes as usize;
+            if !over_symbols && !over_bytes {
+                break;
+            }
+            if !self.repairs.is_empty()
+                && (accounting.repair_symbols.saturating_add(added_repairs)
+                    > self.max_symbols as usize
+                    || over_bytes)
+            {
+                self.repairs.remove(0);
+                self.seen_repair_keys.clear();
+                self.seen_repair_keys.extend(
+                    self.repairs
+                        .iter()
+                        .map(|repair| (repair.repair_seq, repair.window_base)),
+                );
+                continue;
+            }
+            let Some(newest) = self.newest_seq else { break };
+            // Prefer the oldest entry behind the contiguous frontier. Sequence
+            // age uses RFC1982 half-range arithmetic, so this remains correct
+            // as u32 sequence numbers wrap.
+            let frontier = self.highest_contiguous.unwrap_or(newest);
+            let mut candidate = self
+                .sources
+                .iter()
+                .filter(|entry| frontier.wrapping_sub(*entry.0) < 0x8000_0000)
+                .max_by_key(|entry| frontier.wrapping_sub(*entry.0));
+            if candidate.is_none() {
+                candidate = self
+                    .sources
+                    .iter()
+                    .max_by_key(|entry| newest.wrapping_sub(*entry.0));
+            }
+            let Some((seq, state)) = candidate else { break };
+            let seq = *seq;
+            let unresolved = matches!(state, SourceState::Missing);
+            self.sources.remove(&seq);
+            if unresolved {
+                events.push(DecoderEvent::Evicted {
+                    from_seq: seq,
+                    to_seq_exclusive: seq.wrapping_add(1),
+                });
+            }
+        }
+        events
+    }
+
+    /// Retire equations that require source state outside the incoming bounded
+    /// serial window, then retire that source state. Keeping those operations
+    /// coupled prevents an equation from silently treating an evicted source as
+    /// zero during elimination.
+    fn roll_for_repair(&mut self, window_base: u32, window_len: u32) -> Vec<DecoderEvent> {
+        if window_len == 0 {
+            return Vec::new();
+        }
+        self.repairs.retain(|repair| {
+            seq_in_window(repair.window_base, window_base, window_len)
+                && seq_in_window(repair.window_end.wrapping_sub(1), window_base, window_len)
+        });
+        self.seen_repair_keys.clear();
+        self.seen_repair_keys.extend(
+            self.repairs
+                .iter()
+                .map(|repair| (repair.repair_seq, repair.window_base)),
+        );
+
+        let obsolete_sources: Vec<u32> = self
+            .sources
+            .keys()
+            .copied()
+            .filter(|seq| !seq_in_window(*seq, window_base, window_len))
+            .collect();
+        let mut events = Vec::new();
+        for seq in obsolete_sources {
+            if matches!(self.sources.remove(&seq), Some(SourceState::Missing)) {
+                events.push(DecoderEvent::Evicted {
+                    from_seq: seq,
+                    to_seq_exclusive: seq.wrapping_add(1),
+                });
+            }
+        }
+        events
+    }
+
+    /// Remove the oldest retained repair and rebuild its dedup index.
+    fn evict_oldest_repair(&mut self) {
+        self.repairs.remove(0);
+        self.seen_repair_keys.clear();
+        self.seen_repair_keys.extend(
+            self.repairs
+                .iter()
+                .map(|repair| (repair.repair_seq, repair.window_base)),
+        );
     }
 
     /// If the frontier (`highest_contiguous + 1`, or 0 if unset) is already
@@ -506,6 +741,13 @@ impl FecDecoder {
     }
 
     fn push_source(&mut self, seq: u32, payload: Vec<u8>) -> Vec<DecoderEvent> {
+        if payload.len().saturating_add(8) > self.max_bytes as usize {
+            return vec![DecoderEvent::Recovered {
+                seq,
+                payload,
+                via_fec: false,
+            }];
+        }
         // Ignore if already known
         if matches!(
             self.sources.get(&seq),
@@ -514,17 +756,24 @@ impl FecDecoder {
             return Vec::new();
         }
 
+        let (added_sources, added_bytes) = match self.sources.get(&seq) {
+            Some(SourceState::Missing) => (0, payload.len()),
+            Some(SourceState::Received(_) | SourceState::Recovered(_)) => return Vec::new(),
+            None => (1, payload.len().saturating_add(8)),
+        };
+        let mut events = self.make_room(added_sources, 0, 0, added_bytes);
         self.note_open_span_at_frontier();
+        self.note_newest(seq);
 
         self.sources
             .insert(seq, SourceState::Received(payload.clone()));
         self.stats.source_symbols_received += 1;
 
-        let mut events = vec![DecoderEvent::Recovered {
+        events.push(DecoderEvent::Recovered {
             seq,
             payload,
             via_fec: false,
-        }];
+        });
         // Try to cascade-recover missing symbols using available repairs
         let recovered = self.try_recover();
         events.extend(recovered.into_iter().map(|(s, p)| DecoderEvent::Recovered {
@@ -543,6 +792,25 @@ impl FecDecoder {
         window_end: u32,
         payload: Vec<u8>,
     ) -> Vec<DecoderEvent> {
+        // Reject malformed repairs before classifying them against live state.
+        let window_len = window_end.wrapping_sub(window_base);
+        if payload.len().saturating_add(16) > self.max_bytes as usize
+            || window_len > 128
+            || window_len > self.max_symbols as u32
+        {
+            return Vec::new();
+        }
+
+        // Do not let an unseen historical equation roll the retained horizon
+        // backward. An overlap whose prefix has already been retired cannot be
+        // used safely: elimination would otherwise treat that prefix as zero.
+        match self.repair_horizon_relation(window_base, window_end) {
+            RepairHorizonRelation::Stale | RepairHorizonRelation::Overlapping => {
+                return Vec::new();
+            }
+            RepairHorizonRelation::Forward => {}
+        }
+
         // Deduplicate by (repair_seq, window_base) — full u16 to avoid false-positive
         // collisions: e.g. repair_seq=0 and repair_seq=128 had the same truncated key.
         let key = (repair_seq, window_base);
@@ -550,23 +818,86 @@ impl FecDecoder {
             return Vec::new();
         }
 
-        // Reject repairs declaring a window beyond the 128-symbol design cap
-        // (Cauchy constraint; mirrors the TS decoder guard).  An off-spec or
-        // corrupt symbol would otherwise insert window_len Missing entries
-        // below.  Checked before the dedup insert, like the TS side, so the
-        // rejected key is not recorded.
-        let window_len = window_end.wrapping_sub(window_base);
-        if window_len > 128 {
+        // Compute the complete coupled retirement/admission plan on a private
+        // copy. A failed plan is discarded, so rejected repairs cannot evict
+        // sources or equations, change accounting, or leak eviction events.
+        let mut planned = self.clone();
+        let Some(events) = planned.admit_repair(repair_seq, window_base, window_end, payload, key)
+        else {
             return Vec::new();
+        };
+        *self = planned;
+        events
+    }
+
+    fn admit_repair(
+        &mut self,
+        repair_seq: u16,
+        window_base: u32,
+        window_end: u32,
+        payload: Vec<u8>,
+        key: (u16, u32),
+    ) -> Option<Vec<DecoderEvent>> {
+        let window_len = window_end.wrapping_sub(window_base);
+        // A full decoder is a rolling window, not a terminal state. Retire any
+        // equation before the source state it depends on, then make byte and
+        // repair-row room by dropping the oldest remaining equations.
+        let mut events = self.roll_for_repair(window_base, window_len);
+        loop {
+            let added_sources = (0..window_len)
+                .filter(|offset| {
+                    !self
+                        .sources
+                        .contains_key(&window_base.wrapping_add(*offset))
+                })
+                .count();
+            let added_bytes = added_sources
+                .saturating_mul(8)
+                .saturating_add(payload.len())
+                .saturating_add(16);
+            let accounting = self.accounting();
+            let over_repairs = accounting.repair_symbols >= self.max_symbols as usize;
+            let over_bytes = accounting
+                .retained_bytes
+                .saturating_add(added_bytes)
+                .saturating_add(8)
+                > self.max_bytes as usize;
+            if !over_repairs && !over_bytes {
+                break;
+            }
+            if self.repairs.is_empty() {
+                return None;
+            }
+            self.evict_oldest_repair();
+        }
+
+        let added_sources = (0..window_len)
+            .filter(|offset| {
+                !self
+                    .sources
+                    .contains_key(&window_base.wrapping_add(*offset))
+            })
+            .count();
+        let added_bytes = added_sources
+            .saturating_mul(8)
+            .saturating_add(payload.len())
+            .saturating_add(16);
+        let accounting = self.accounting();
+        if accounting.source_symbols.saturating_add(added_sources) > self.max_symbols as usize
+            || accounting
+                .retained_bytes
+                .saturating_add(added_bytes)
+                .saturating_add(8)
+                > self.max_bytes as usize
+        {
+            return None;
         }
         self.seen_repair_keys.insert(key);
         self.stats.repair_symbols_received += 1;
 
         // Register all seqs in this repair's window as at least Missing.
         // Use wrapping iteration (seq != window_end) to handle the case where
-        // window_end wrapped to 0 (i.e., window contains u32::MAX).  A plain
-        // `for seq in window_base..window_end` range is empty when
-        // window_end <= window_base after wrapping.
+        // window_end wrapped to 0 (i.e., window contains u32::MAX).
         let mut seq = window_base;
         while seq != window_end {
             self.sources.entry(seq).or_insert(SourceState::Missing);
@@ -574,6 +905,12 @@ impl FecDecoder {
         }
 
         self.note_open_span_at_frontier();
+        if window_len != 0 {
+            self.note_newest(window_end.wrapping_sub(1));
+            // Advance the declared rolling horizon to this repair's base now
+            // that roll_for_repair has actually retired everything below it.
+            self.roll_horizon = Some((window_base, window_end));
+        }
 
         self.repairs.push(ReceivedRepair {
             repair_seq,
@@ -583,16 +920,13 @@ impl FecDecoder {
         });
 
         let recovered = self.try_recover();
-        let mut events: Vec<DecoderEvent> = recovered
-            .into_iter()
-            .map(|(s, p)| DecoderEvent::Recovered {
-                seq: s,
-                payload: p,
-                via_fec: true,
-            })
-            .collect();
+        events.extend(recovered.into_iter().map(|(s, p)| DecoderEvent::Recovered {
+            seq: s,
+            payload: p,
+            via_fec: true,
+        }));
         events.extend(self.advance_contiguous());
-        events
+        Some(events)
     }
 
     /// Iteratively recover missing symbols via Gaussian elimination.
@@ -602,6 +936,15 @@ impl FecDecoder {
         loop {
             let batch = self.one_elim_pass();
             if batch.is_empty() {
+                break;
+            }
+            let recovered_bytes: usize = batch.iter().map(|(_, payload)| payload.len()).sum();
+            if self
+                .accounting()
+                .retained_bytes
+                .saturating_add(recovered_bytes)
+                > self.max_bytes as usize
+            {
                 break;
             }
             self.stats.symbols_recovered += batch.len() as u64;
@@ -646,6 +989,18 @@ impl FecDecoder {
         }
 
         let n_unknowns = missing_seqs.len();
+        if n_unknowns > 128 || self.repairs.len() > 128 {
+            return Vec::new();
+        }
+        let scratch = self
+            .repairs
+            .len()
+            .saturating_mul(n_unknowns.saturating_add(max_eff_len))
+            .saturating_add(2 * n_unknowns)
+            .saturating_add(2 * max_eff_len);
+        if self.accounting().retained_bytes.saturating_add(scratch) > self.max_bytes as usize {
+            return Vec::new();
+        }
 
         // Build coefficient matrix [n_repairs × n_unknowns] and RHS [n_repairs × max_eff_len]
         let mut coeffs: Vec<Vec<u8>> = Vec::new();
@@ -737,12 +1092,10 @@ impl FecDecoder {
     ///
     /// **Loss-span counter approximation (U2 P2 groundwork)**: this decoder
     /// has no independent structure tracking arbitrary loss episodes, and
-    /// `sources` entries are never evicted (window sliding is dead code here
-    /// — see the unused `max_symbols`/`max_bytes` fields), so the only place
-    /// a gap is ever truly discovered is right here, as `highest_contiguous`
-    /// walks forward. Spans are therefore counted lazily, at the moment the
-    /// contiguous frontier reaches them, not the instant a repair's window
-    /// first registers a seq as `Missing`. Because `next` is always exactly
+    /// Source entries are evicted with their dependent equations as the repair
+    /// window rolls. Gaps are therefore counted lazily when the contiguous
+    /// frontier reaches them, not when a repair first registers a seq as
+    /// `Missing`. Because `next` is always exactly
     /// `highest_contiguous + 1`, at most one span can ever be "open" (blocking
     /// the frontier) at a time, so `open_loss_span` / `open_loss_span_has_recovery`
     /// need only track a single in-flight span:
@@ -800,6 +1153,14 @@ impl FecDecoder {
                                     from_seq: span_start,
                                     to_seq_exclusive: scan,
                                 });
+                                // The discontinuity is final: retaining these
+                                // Missing entries would let later cap eviction
+                                // report the same loss a second time.
+                                let mut abandoned = span_start;
+                                while abandoned != scan {
+                                    self.sources.remove(&abandoned);
+                                    abandoned = abandoned.wrapping_add(1);
+                                }
                                 self.highest_contiguous = Some(scan.wrapping_sub(1));
                                 self.open_loss_span = None;
                                 self.open_loss_span_has_recovery = false;
@@ -861,7 +1222,6 @@ fn gaussian_elim(
     }
 
     let mut pivot_row: Vec<Option<usize>> = vec![None; n_unknowns]; // col → row
-    let mut row_pivot_col: Vec<Option<usize>> = vec![None; n_rows]; // row → col
     let mut current_row = 0usize;
 
     for col in 0..n_unknowns {
@@ -904,7 +1264,6 @@ fn gaussian_elim(
         }
 
         pivot_row[col] = Some(current_row);
-        row_pivot_col[current_row] = Some(col);
         current_row += 1;
         if current_row >= n_rows {
             break;
@@ -1136,10 +1495,6 @@ mod tests {
             }
             events
         }
-
-        fn push_repair_only(&mut self, repair: Symbol) -> Vec<DecoderEvent> {
-            self.dec.push_symbol(repair)
-        }
     }
 
     fn collect_recovered(events: &[DecoderEvent]) -> Vec<u32> {
@@ -1317,24 +1672,110 @@ mod tests {
 
     #[test]
     fn rt_stale_repair_ignored() {
-        let mut s = Scenario::new(1, 1, 64);
-        // Build a repair that covers seq 0..4
-        let mut stale_repairs = Vec::new();
-        for i in 0..4u32 {
-            let out = s.enc.push_source(i, b"data");
-            stale_repairs.extend(out.repairs);
+        let config = FecConfig {
+            redundancy_numerator: 1,
+            redundancy_denominator: 1,
+            window_max_symbols: 4,
+            window_max_bytes: 1 << 20,
+        };
+        let mut enc = FecEncoder::new(config);
+        let mut dec = FecDecoder::new(4, 1 << 20);
+        let mut stale = None;
+        let mut current = None;
+        let mut next = None;
+
+        for seq in 0..=9u32 {
+            let output = enc.push_source(seq, &[seq as u8]);
+            if seq == 0 {
+                stale = output.repairs.first().cloned();
+            }
+            if seq <= 8 {
+                dec.push_symbol(output.source);
+            }
+            if seq == 8 {
+                current = output.repairs.first().cloned();
+            }
+            if seq == 9 {
+                next = output.repairs.first().cloned();
+            }
         }
-        // Ack everything up to 3
-        s.enc.acknowledge(3);
-        // Now push repair to decoder — window_base=0 is stale relative to decoder state
-        // The decoder should not crash and should not produce spurious events
-        for repair in stale_repairs {
-            let events = s.dec.push_symbol(repair);
-            // No source was ever registered missing in decoder, so events may be empty or contain
-            // harmless Recovered events for sources the decoder did receive.
-            // Key: no panic.
-            let _ = events;
+
+        // The [5, 9) repair retires older state and establishes the current horizon.
+        dec.push_symbol(current.expect("repair for the current window"));
+        let before_accounting = dec.accounting();
+        let before_stats = dec.stats();
+        let before_frontier = dec.highest_fully_decoded();
+        let before_sources = dec.sources.clone();
+        let before_repairs = dec.repairs.clone();
+        let before_keys = dec.seen_repair_keys.clone();
+
+        assert!(
+            dec.push_symbol(stale.expect("repair for the stale window"))
+                .is_empty(),
+            "an unseen repair fully behind the retained horizon must be ignored"
+        );
+        assert_eq!(dec.accounting(), before_accounting);
+        assert_eq!(dec.stats(), before_stats);
+        assert_eq!(dec.highest_fully_decoded(), before_frontier);
+        assert_eq!(dec.sources, before_sources);
+        assert_eq!(dec.repairs, before_repairs);
+        assert_eq!(dec.seen_repair_keys, before_keys);
+
+        let events = dec.push_symbol(next.expect("repair for the next window"));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DecoderEvent::Recovered {
+                seq: 9,
+                payload,
+                via_fec: true,
+            } if payload.as_slice() == [9]
+        )));
+    }
+    #[test]
+    fn rt_same_base_shorter_end_reordered_repair_ignored() {
+        // A delayed repair with the SAME window_base as an already-committed,
+        // wider repair must not be treated as Forward just because its base is
+        // not older: it also needs a serially newer window_end. [50, 60) must
+        // be rejected as Stale after [50, 110) has already rolled the horizon
+        // forward, leaving retained sources/repairs/accounting/events unchanged.
+        let mut dec = FecDecoder::new(128, 1 << 20);
+        for seq in 50..110u32 {
+            dec.push_symbol(Symbol::Source {
+                seq,
+                payload: vec![seq as u8],
+            });
         }
+        dec.push_symbol(Symbol::Repair {
+            repair_seq: 1,
+            window_base: 50,
+            window_end: 110,
+            payload: vec![0, 0],
+        });
+
+        let before_accounting = dec.accounting();
+        let before_stats = dec.stats();
+        let before_frontier = dec.highest_fully_decoded();
+        let before_sources = dec.sources.clone();
+        let before_repairs = dec.repairs.clone();
+        let before_keys = dec.seen_repair_keys.clone();
+
+        let events = dec.push_symbol(Symbol::Repair {
+            repair_seq: 2,
+            window_base: 50,
+            window_end: 60,
+            payload: vec![0, 0],
+        });
+
+        assert!(
+            events.is_empty(),
+            "same-base shorter-end repair delayed behind a wider committed window must be ignored"
+        );
+        assert_eq!(dec.accounting(), before_accounting);
+        assert_eq!(dec.stats(), before_stats);
+        assert_eq!(dec.highest_fully_decoded(), before_frontier);
+        assert_eq!(dec.sources, before_sources);
+        assert_eq!(dec.repairs, before_repairs);
+        assert_eq!(dec.seen_repair_keys, before_keys);
     }
 
     #[test]
@@ -1619,7 +2060,9 @@ mod tests {
                 events.extend(dec.push_symbol(r));
             }
         }
-        // All seqs should appear in either Recovered or LossSpan
+        // A delivered successor bounds any final gap, so every input sequence
+        // must be accounted for as delivery, recovery, loss, or eviction.
+        events.extend(dec.push_symbol(enc.push_source(64, b"sentinel").source));
         let mut covered = std::collections::HashSet::new();
         for e in &events {
             match e {
@@ -1629,16 +2072,24 @@ mod tests {
                 DecoderEvent::LossSpan {
                     from_seq,
                     to_seq_exclusive,
+                }
+                | DecoderEvent::Evicted {
+                    from_seq,
+                    to_seq_exclusive,
                 } => {
-                    for s in *from_seq..*to_seq_exclusive {
-                        covered.insert(s);
+                    let mut seq = *from_seq;
+                    while seq != *to_seq_exclusive {
+                        covered.insert(seq);
+                        seq = seq.wrapping_add(1);
                     }
                 }
             }
         }
-        // At minimum, all recovered seqs must be in 0..64
-        for s in collect_recovered(&events) {
-            assert!(s < 64, "recovered seq {s} out of range");
+        for seq in 0..=64 {
+            assert!(
+                covered.contains(&seq),
+                "loss fuzz left seq {seq} unaccounted"
+            );
         }
     }
 
@@ -1687,6 +2138,32 @@ mod tests {
         enc.acknowledge(u32::MAX);
         assert_eq!(enc.window_len(), 4, "u32::MAX ack must not wipe window");
         assert_eq!(enc.window_base(), Some(0));
+    }
+    #[test]
+    fn ack_wraps_and_rejects_half_range() {
+        let mut enc = FecEncoder::new(FecConfig {
+            redundancy_numerator: 0,
+            redundancy_denominator: 1,
+            window_max_symbols: 8,
+            window_max_bytes: 1 << 20,
+        });
+        for seq in [u32::MAX - 1, u32::MAX, 0, 1] {
+            enc.push_source(seq, b"x");
+        }
+
+        enc.acknowledge(u32::MAX);
+        assert_eq!(enc.window_base(), Some(0));
+        assert_eq!(enc.window_len(), 2);
+
+        enc.acknowledge(0x8000_0001);
+        assert_eq!(enc.window_base(), Some(0));
+        assert_eq!(enc.window_len(), 2);
+        enc.acknowledge(0);
+        assert_eq!(enc.window_base(), Some(1));
+        assert_eq!(enc.window_len(), 1);
+
+        enc.acknowledge(1);
+        assert_eq!(enc.window_len(), 0);
     }
 
     /// ack(window_back.seq) evicts ALL entries — total wipe, spec-mandated.
@@ -2098,7 +2575,11 @@ mod tests {
         let mut enc = FecEncoder::new(config);
         let out = enc.push_source(0, b"payload_zero");
         assert!(!out.repairs.is_empty(), "1/1 redundancy must emit a repair");
-        let real_repair = out.repairs.into_iter().next().unwrap();
+        let real_repair = out
+            .repairs
+            .into_iter()
+            .next()
+            .expect("1/1 redundancy must emit a repair");
         let (repair_seq, window_base) = match &real_repair {
             Symbol::Repair {
                 repair_seq,
@@ -2205,6 +2686,46 @@ mod tests {
         });
         assert!(events.is_empty(), "129-wide repair window must be rejected");
     }
+    #[test]
+    fn decoder_rolls_after_repair_cap_and_recovers_late_loss() {
+        let config = FecConfig {
+            redundancy_numerator: 1,
+            redundancy_denominator: 1,
+            window_max_symbols: 128,
+            window_max_bytes: 1 << 20,
+        };
+        let mut enc = FecEncoder::new(config);
+        let mut dec = FecDecoder::new(128, 1 << 20);
+        let lost_seq = 260;
+        let mut events = Vec::new();
+
+        for seq in 0..=lost_seq {
+            let output = enc.push_source(seq, &[seq as u8]);
+            if seq != lost_seq {
+                events.extend(dec.push_symbol(output.source));
+            }
+            for repair in output.repairs {
+                events.extend(dec.push_symbol(repair));
+            }
+        }
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                DecoderEvent::Recovered {
+                    seq,
+                    payload,
+                    via_fec: true,
+                } if *seq == lost_seq && payload.as_slice() == [lost_seq as u8]
+            )),
+            "a loss after more than two 128-symbol windows must be recovered"
+        );
+        assert_eq!(dec.highest_fully_decoded(), Some(lost_seq));
+        let accounting = dec.accounting();
+        assert!(accounting.source_symbols <= 128);
+        assert!(accounting.repair_symbols <= 128);
+        assert_eq!(accounting.repair_symbols, accounting.dedup_keys);
+    }
 
     /// window_max_symbols=u16::MAX → sanitised() clamps to 128.
     #[test]
@@ -2239,31 +2760,176 @@ mod tests {
             "empty-payload pushes must not trigger byte-cap eviction"
         );
     }
-
-    // ── mds_guarantee_sweep ───────────────────────────────────────────────
-
-    /// Sweep: for window sizes {1,2,8,64,128} × redundancy 1..=4 × erasure
-    /// count k=1..=min(redundancy, window_size), verify k source erasures are
-    /// fully recovered using the k last (widest-window) repair symbols.
-    ///
-    /// Design: uses ratio 1/1 (one repair per source) so repairs cover
-    /// nested windows [0..1), [0..2), …, [0..n). Erasing the last k sources
-    /// and using the last k repairs enables cascading recovery: each repair
-    /// introduces exactly one new unknown that its predecessor resolved.
     #[test]
-    fn mds_guarantee_sweep() {
+    fn decoder_repair_admission_honours_exact_symbol_and_byte_caps() {
+        let repair = |window_end, payload| Symbol::Repair {
+            repair_seq: 1,
+            window_base: 0,
+            window_end,
+            payload,
+        };
+
+        let mut exact_symbols = FecDecoder::new(2, 64);
+        exact_symbols.push_symbol(Symbol::Source {
+            seq: 0,
+            payload: vec![],
+        });
+        exact_symbols.push_symbol(repair(2, vec![]));
+        let accounting = exact_symbols.accounting();
+        assert_eq!(accounting.source_symbols, 2);
+        assert!(accounting.retained_bytes <= 64);
+
+        let mut over_symbols = FecDecoder::new(1, 64);
+        over_symbols.push_symbol(Symbol::Source {
+            seq: 0,
+            payload: vec![],
+        });
+        assert!(over_symbols.push_symbol(repair(2, vec![])).is_empty());
+        assert_eq!(over_symbols.accounting().source_symbols, 1);
+        assert_eq!(over_symbols.accounting().repair_symbols, 0);
+
+        let mut exact_bytes = FecDecoder::new(1, 32);
+        exact_bytes.push_symbol(repair(1, vec![]));
+        assert_eq!(exact_bytes.accounting().retained_bytes, 32);
+
+        let mut over_bytes = FecDecoder::new(1, 31);
+        assert!(over_bytes.push_symbol(repair(1, vec![])).is_empty());
+        assert_eq!(over_bytes.accounting().retained_bytes, 0);
+    }
+    #[test]
+    fn rejected_forward_repair_leaves_nonempty_decoder_unchanged() {
+        // An empty one-symbol repair needs 8 source bytes, 16 repair bytes, and
+        // 8 dedup bytes. It is therefore intrinsically unadmittable at 31 bytes
+        // even after a forward roll has retired every existing entry.
+        let mut dec = FecDecoder::new(1, 31);
+        dec.push_symbol(Symbol::Source {
+            seq: 100,
+            payload: vec![],
+        });
+        let before_accounting = dec.accounting();
+        let before_stats = dec.stats();
+        let before_frontier = dec.highest_fully_decoded();
+        let before_sources = dec.sources.clone();
+        let before_repairs = dec.repairs.clone();
+        let before_keys = dec.seen_repair_keys.clone();
+        let before_newest = dec.newest_seq;
+        let before_open_loss_span = dec.open_loss_span;
+        let before_open_loss_span_has_recovery = dec.open_loss_span_has_recovery;
+
+        let events = dec.push_symbol(Symbol::Repair {
+            repair_seq: 7,
+            window_base: 101,
+            window_end: 102,
+            payload: vec![],
+        });
+
+        assert!(
+            events.is_empty(),
+            "rejected repair must emit no eviction event"
+        );
+        assert_eq!(dec.accounting(), before_accounting);
+        assert_eq!(dec.stats(), before_stats);
+        assert_eq!(dec.highest_fully_decoded(), before_frontier);
+        assert_eq!(dec.sources, before_sources);
+        assert_eq!(dec.repairs, before_repairs);
+        assert_eq!(dec.seen_repair_keys, before_keys);
+        assert_eq!(dec.newest_seq, before_newest);
+        assert_eq!(dec.open_loss_span, before_open_loss_span);
+        assert_eq!(
+            dec.open_loss_span_has_recovery,
+            before_open_loss_span_has_recovery
+        );
+    }
+
+    #[test]
+    fn decoder_rejects_128_wide_repair_when_symbol_cap_is_smaller() {
+        let mut dec = FecDecoder::new(127, 1 << 20);
+        assert!(
+            dec.push_symbol(Symbol::Repair {
+                repair_seq: 1,
+                window_base: 0,
+                window_end: 128,
+                payload: vec![],
+            })
+            .is_empty()
+        );
+        assert_eq!(dec.accounting().source_symbols, 0);
+        assert_eq!(dec.accounting().repair_symbols, 0);
+        assert_eq!(dec.accounting().retained_bytes, 0);
+    }
+
+    #[test]
+    fn loss_span_is_pruned_before_later_limit_enforcement() {
+        let mut dec = FecDecoder::new(128, 1 << 20);
+        dec.push_symbol(Symbol::Source {
+            seq: 0,
+            payload: vec![],
+        });
+        let mut events = dec.push_symbol(Symbol::Repair {
+            repair_seq: 1,
+            window_base: 1,
+            window_end: 128,
+            payload: vec![],
+        });
+        events.extend(dec.push_symbol(Symbol::Source {
+            seq: 128,
+            payload: vec![],
+        }));
+        events.extend(dec.push_symbol(Symbol::Repair {
+            repair_seq: 2,
+            window_base: 129,
+            window_end: 256,
+            payload: vec![],
+        }));
+        events.extend(dec.push_symbol(Symbol::Source {
+            seq: 256,
+            payload: vec![],
+        }));
+
+        let losses: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event, DecoderEvent::LossSpan { .. }))
+            .collect();
+        assert_eq!(losses.len(), 2);
+        assert!(matches!(
+            losses[0],
+            DecoderEvent::LossSpan {
+                from_seq: 1,
+                to_seq_exclusive: 128,
+            }
+        ));
+        assert!(matches!(
+            losses[1],
+            DecoderEvent::LossSpan {
+                from_seq: 129,
+                to_seq_exclusive: 256,
+            }
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, DecoderEvent::Evicted { .. }))
+        );
+        assert!(dec.accounting().source_symbols <= 128);
+    }
+    // ── single_erasure_recovery_sweep ──────────────────────────────────────
+    /// Sweep the supported window sizes and repair rates with one erased source.
+    /// This checks an actual independent repair equation without claiming MDS
+    /// behavior from the hash-derived coefficient matrix.
+    #[test]
+    fn single_erasure_recovery_sweep() {
         let window_sizes: &[u16] = &[1, 2, 8, 64, 128];
         for &w in window_sizes {
             for redundancy in 1u8..=4 {
                 let n = w as usize;
-                // Config: 1 repair per source → nested window coverage.
+                // Emit the configured number of independent repairs per source.
                 let config = FecConfig {
-                    redundancy_numerator: 1,
+                    redundancy_numerator: redundancy,
                     redundancy_denominator: 1,
                     window_max_symbols: w,
                     window_max_bytes: 1 << 24,
                 };
-                for k in 1..=(redundancy as usize).min(n) {
+                for k in 1..=1 {
                     // Fresh enc/dec per scenario.
                     let mut enc = FecEncoder::new(config);
                     let mut dec = FecDecoder::new(w, 1 << 24);

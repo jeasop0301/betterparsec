@@ -14,11 +14,14 @@
 use std::collections::HashMap;
 
 use crate::fec::{DecoderEvent, FecDecoder};
-use crate::fec_wire::{CHUNK_HEADER_LEN, parse_chunk_header, parse_symbol_msg};
+use crate::fec_wire::{
+    CHUNK_V2_FRAGMENT_MAX, ENCODED_FRAME_MAX, ParsedSymbolMsg, V2_CHUNK_COUNT_MAX, V2Symbol,
+    parse_chunk_header, parse_chunk_v2, parse_symbol_msg_versioned, validate_encoded_frame_v2,
+};
 
 // ── Constants (mirror fec_decode_pipe.ts) ─────────────────────────────────
 
-/// Maximum pending frame_ids before evicting the oldest (sets needs_idr).
+/// Maximum pending frame_ids before a full-reset discontinuity (sets needs_idr).
 pub const MAX_PENDING_FRAMES: usize = 8;
 
 /// ACK after this many delivered source symbols since the last ack.
@@ -26,6 +29,10 @@ pub const ACK_SYMBOL_INTERVAL: u32 = 32;
 
 /// ACK after this many ms since the last ack (whichever comes first).
 pub const ACK_TIME_INTERVAL_MS: u64 = 50;
+/// Completed frames may wait for a missing predecessor only while this many are queued.
+pub const REORDER_MAX_COMPLETED_FRAMES: usize = 4;
+/// Completed frames may wait for a missing predecessor only for this long.
+pub const REORDER_MAX_WAIT_MS: u64 = 100;
 
 /// FEC decoder window cap — design fec-framing.md §4 (mirrors TS `new
 /// FecDecoder(128, 16 MiB)`).
@@ -44,6 +51,10 @@ pub const RX_DECODER_MAX_BYTES: u32 = 16 * 1024 * 1024;
 pub struct DecodeUnit {
     /// Chunk-header frame_id (monotonic from the host sender).
     pub frame_id: u32,
+    /// FEC epoch this frame was reassembled under (mirrors the receiver's
+    /// `active_epoch` at completion; carried so downstream decoder-recovery
+    /// state can be keyed per epoch without a second lookup).
+    pub epoch: u32,
     /// true = key/IDR frame, false = delta.
     pub is_key: bool,
     /// Sender capture timestamp (µs, wraps at u32).
@@ -58,10 +69,32 @@ pub struct DecodeUnit {
 /// Events produced while consuming one wire message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RxEvent {
-    /// A frame finished reassembly (in completion order).
+    /// A frame finished reassembly and passed bounded ordering.
     Frame(DecodeUnit),
+    /// Transport state was invalidated; deltas are gated until an IDR is admitted.
+    Discontinuity {
+        epoch: u32,
+        reason: DiscontinuityReason,
+    },
     /// The ACK cadence gate fired: send `AckMsg::Ack(seq)` on `video_fec_ack`.
     Ack(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscontinuityReason {
+    EpochTransition,
+    ReorderGap,
+    ReassemblyEviction,
+    MetadataMismatch,
+    FrameCrc,
+    MemoryCap,
+    FecEviction,
+    /// Client-transport-only reason (stable C ABI code 8): the decoder-side
+    /// frame queue overflowed and its stale backlog was cleared. Never
+    /// produced by [`VideoReceiver`] itself — reserved here so the single
+    /// [`DiscontinuityReason`] enum covers every discontinuity that can ride
+    /// the client-transport event queue.
+    QueueOverflow,
 }
 
 // ── Internal reassembly state ─────────────────────────────────────────────
@@ -91,17 +124,23 @@ pub struct VideoReceiverStats {
 
 #[derive(Debug)]
 struct PendingFrame {
-    /// Header fields from the first chunk seen (TS mirror: later chunks'
-    /// header fields other than chunk_index are ignored).
+    is_v2: bool,
     is_key: bool,
     timestamp_us: u32,
     chunk_count: u16,
-    /// index = chunk_index, value = fragment bytes.
+    encoded_frame_len: u32,
+    encoded_frame_crc32: u32,
     parts: Vec<Option<Vec<u8>>>,
     received_count: u16,
-    /// Set once any delivered chunk arrived via FEC recovery rather than
-    /// direct receipt. Feeds `stats.frames_recovered` on completion.
+    bytes: usize,
     used_recovery: bool,
+}
+
+#[derive(Debug)]
+struct CompletedFrame {
+    frame_id: u32,
+    frame: PendingFrame,
+    completed_at_ms: u64,
 }
 
 // ── VideoReceiver ─────────────────────────────────────────────────────────
@@ -118,9 +157,13 @@ pub struct VideoReceiver {
     decoder: FecDecoder,
 
     // Reassembly state
-    pending: HashMap<u32, PendingFrame>,
-    /// Eviction order — insertion-ordered frame_ids.
-    pending_order: Vec<u32>,
+    pending: HashMap<(u32, u32), PendingFrame>,
+    pending_order: Vec<(u32, u32)>,
+    completed: HashMap<(u32, u32), CompletedFrame>,
+    completed_order: Vec<(u32, u32)>,
+    buffered_bytes: usize,
+    active_epoch: Option<u32>,
+    next_frame_id: Option<u32>,
 
     /// Latched until polled (mirrors TS `pollRequestIdr`).
     needs_idr: bool,
@@ -149,6 +192,11 @@ impl VideoReceiver {
             decoder: FecDecoder::new(RX_DECODER_MAX_SYMBOLS, RX_DECODER_MAX_BYTES),
             pending: HashMap::new(),
             pending_order: Vec::new(),
+            completed: HashMap::new(),
+            completed_order: Vec::new(),
+            buffered_bytes: 0,
+            active_epoch: None,
+            next_frame_id: None,
             needs_idr: false,
             awaiting_idr: false,
             last_timestamp_us: 0,
@@ -165,27 +213,76 @@ impl VideoReceiver {
     /// Returns completed frames and at most one ACK, in the order they were
     /// produced. Malformed messages are silently dropped (TS mirror).
     pub fn on_message(&mut self, buf: &[u8], now_ms: u64) -> Vec<RxEvent> {
-        let Some(sym) = parse_symbol_msg(buf) else {
-            return Vec::new();
+        let parsed = match parse_symbol_msg_versioned(buf) {
+            Ok(parsed) => parsed,
+            Err(_) => return Vec::new(),
+        };
+        let (epoch, is_v2, sym) = match parsed {
+            ParsedSymbolMsg::V1(sym) => (0, false, sym),
+            ParsedSymbolMsg::V2(V2Symbol::Source {
+                epoch,
+                seq,
+                payload,
+            }) => (
+                epoch.get(),
+                true,
+                crate::fec::Symbol::Source { seq, payload },
+            ),
+            ParsedSymbolMsg::V2(V2Symbol::Repair {
+                epoch,
+                repair_seq,
+                window_base,
+                window_end,
+                payload,
+            }) => (
+                epoch.get(),
+                true,
+                crate::fec::Symbol::Repair {
+                    repair_seq,
+                    window_base,
+                    window_end,
+                    payload,
+                },
+            ),
         };
 
         let mut out = Vec::new();
-        for ev in self.decoder.push_symbol(sym) {
-            match ev {
-                DecoderEvent::Recovered {
-                    payload, via_fec, ..
-                } => {
-                    if let Some(unit) = self.deliver_chunk(&payload, via_fec) {
-                        out.push(RxEvent::Frame(unit));
-                    }
-                    if let Some(ack) = self.tick_ack(now_ms) {
-                        out.push(RxEvent::Ack(ack));
-                    }
+        if !self.accept_epoch(epoch, is_v2, now_ms, &mut out) {
+            return out;
+        }
+        let decoder_events = self.decoder.push_symbol(sym);
+        self.process_decoder_events(epoch, is_v2, decoder_events, now_ms, &mut out);
+        self.flush_reorder(now_ms, &mut out);
+        out
+    }
+
+    fn process_decoder_events(
+        &mut self,
+        epoch: u32,
+        is_v2: bool,
+        decoder_events: Vec<DecoderEvent>,
+        now_ms: u64,
+        out: &mut Vec<RxEvent>,
+    ) {
+        if decoder_events.iter().any(|event| {
+            matches!(
+                event,
+                DecoderEvent::LossSpan { .. } | DecoderEvent::Evicted { .. }
+            )
+        }) {
+            self.discontinue(epoch, DiscontinuityReason::FecEviction, out);
+        }
+        for event in decoder_events {
+            if let DecoderEvent::Recovered {
+                payload, via_fec, ..
+            } = event
+            {
+                self.deliver_chunk(epoch, is_v2, &payload, via_fec, now_ms, out);
+                if let Some(ack) = self.tick_ack(now_ms) {
+                    out.push(RxEvent::Ack(ack));
                 }
-                DecoderEvent::LossSpan { .. } => self.handle_loss_span(),
             }
         }
-        out
     }
 
     /// Independent ~50 ms timer tick (TS `tickTimer`). Fires an ACK when
@@ -193,6 +290,15 @@ impl VideoReceiver {
     /// time threshold is met, even when no symbols arrive.
     pub fn tick(&mut self, now_ms: u64) -> Option<u32> {
         self.tick_ack(now_ms)
+    }
+    /// Timer path that also drains the bounded completed-frame reorder queue.
+    pub fn tick_events(&mut self, now_ms: u64) -> Vec<RxEvent> {
+        let mut out = Vec::new();
+        self.flush_reorder(now_ms, &mut out);
+        if let Some(ack) = self.tick_ack(now_ms) {
+            out.push(RxEvent::Ack(ack));
+        }
+        out
     }
 
     /// Latched needs-IDR flag; cleared by the poll (TS `pollRequestIdr`).
@@ -221,120 +327,283 @@ impl VideoReceiver {
         }
     }
 
-    // ── Private helpers ───────────────────────────────────────────────────
-
-    /// Deliver one chunk (source-symbol payload) into the reassembly map.
-    /// Returns the finished frame when this chunk completes it.
-    fn deliver_chunk(&mut self, payload: &[u8], via_fec: bool) -> Option<DecodeUnit> {
-        if payload.len() < CHUNK_HEADER_LEN {
-            return None;
+    fn accept_epoch(
+        &mut self,
+        epoch: u32,
+        is_v2: bool,
+        now_ms: u64,
+        out: &mut Vec<RxEvent>,
+    ) -> bool {
+        let Some(current) = self.active_epoch else {
+            self.active_epoch = Some(epoch);
+            return true;
+        };
+        if epoch == current {
+            return true;
         }
-        let (hdr, fragment) = parse_chunk_header(payload)?;
-
-        // DIVERGENCE: the TS pipe lets an out-of-range chunk_index grow the
-        // sparse parts array and can then assemble a short frame; here a
-        // malformed index (or zero chunk_count) drops the chunk instead.
-        // The host encoder (chunk_frame) never emits either shape.
-        if hdr.chunk_count == 0 || hdr.chunk_index >= hdr.chunk_count {
-            return None;
+        let distance = epoch.wrapping_sub(current);
+        if is_v2 && (current == 0 || (distance != 0 && distance < 0x8000_0000)) {
+            self.decoder = FecDecoder::new(RX_DECODER_MAX_SYMBOLS, RX_DECODER_MAX_BYTES);
+            self.active_epoch = Some(epoch);
+            self.symbols_since_ack = 0;
+            self.last_ack_time_ms = now_ms;
+            self.last_acked_highest = None;
+            self.discontinue(epoch, DiscontinuityReason::EpochTransition, out);
+            return true;
         }
+        false
+    }
 
-        if !self.pending.contains_key(&hdr.frame_id) {
-            // Evict oldest if at cap. Missing an assembled frame invalidates
-            // the predictive reference chain, so request and await an IDR.
-            if self.pending_order.len() >= MAX_PENDING_FRAMES {
-                let evict_id = self.pending_order.remove(0);
-                self.pending.remove(&evict_id);
-                self.needs_idr = true;
-                self.awaiting_idr = true;
+    fn discontinue(&mut self, epoch: u32, reason: DiscontinuityReason, out: &mut Vec<RxEvent>) {
+        self.pending.clear();
+        self.pending_order.clear();
+        self.completed.clear();
+        self.completed_order.clear();
+        self.buffered_bytes = 0;
+        self.next_frame_id = None;
+        self.needs_idr = true;
+        self.awaiting_idr = true;
+        out.push(RxEvent::Discontinuity { epoch, reason });
+    }
+
+    fn deliver_chunk(
+        &mut self,
+        epoch: u32,
+        is_v2: bool,
+        payload: &[u8],
+        via_fec: bool,
+        now_ms: u64,
+        out: &mut Vec<RxEvent>,
+    ) {
+        let parsed = if is_v2 {
+            let Ok((hdr, fragment)) = parse_chunk_v2(payload) else {
+                return;
+            };
+            (
+                hdr.frame_id,
+                hdr.chunk_index,
+                hdr.chunk_count,
+                hdr.frame_type_key,
+                hdr.timestamp_us,
+                hdr.encoded_frame_len,
+                hdr.encoded_frame_crc32,
+                fragment,
+            )
+        } else {
+            let Some((hdr, fragment)) = parse_chunk_header(payload) else {
+                return;
+            };
+            if hdr.chunk_count == 0 || hdr.chunk_index >= hdr.chunk_count {
+                return;
+            }
+            (
+                hdr.frame_id,
+                hdr.chunk_index,
+                hdr.chunk_count,
+                hdr.frame_type_key,
+                hdr.timestamp_us,
+                0,
+                0,
+                fragment,
+            )
+        };
+        let (
+            frame_id,
+            chunk_index,
+            chunk_count,
+            is_key,
+            timestamp_us,
+            encoded_len,
+            encoded_crc,
+            fragment,
+        ) = parsed;
+        if chunk_count == 0
+            || chunk_count > V2_CHUNK_COUNT_MAX
+            || encoded_len as usize > ENCODED_FRAME_MAX
+        {
+            return;
+        }
+        if is_v2 {
+            let expected_count = (encoded_len as usize)
+                .max(1)
+                .div_ceil(CHUNK_V2_FRAGMENT_MAX);
+            if usize::from(chunk_count) != expected_count {
+                return;
+            }
+            let expected_fragment_len = if usize::from(chunk_index + 1) == usize::from(chunk_count)
+            {
+                encoded_len as usize - CHUNK_V2_FRAGMENT_MAX * (usize::from(chunk_count) - 1)
+            } else {
+                CHUNK_V2_FRAGMENT_MAX
+            };
+            if fragment.len() != expected_fragment_len {
+                return;
+            }
+        }
+        let key = (epoch, frame_id);
+        if self.completed.contains_key(&key) {
+            return;
+        }
+        if !self.pending.contains_key(&key) {
+            if self.pending_order.len() + self.completed_order.len() >= MAX_PENDING_FRAMES {
+                self.discontinue(epoch, DiscontinuityReason::ReassemblyEviction, out);
+                return;
+            }
+            if self.buffered_bytes.saturating_add(fragment.len()) > RX_DECODER_MAX_BYTES as usize {
+                self.discontinue(epoch, DiscontinuityReason::MemoryCap, out);
+                return;
             }
             self.pending.insert(
-                hdr.frame_id,
+                key,
                 PendingFrame {
-                    is_key: hdr.frame_type_key,
-                    timestamp_us: hdr.timestamp_us,
-                    chunk_count: hdr.chunk_count,
-                    parts: vec![None; hdr.chunk_count as usize],
+                    is_v2,
+                    is_key,
+                    timestamp_us,
+                    chunk_count,
+                    encoded_frame_len: encoded_len,
+                    encoded_frame_crc32: encoded_crc,
+                    parts: vec![None; chunk_count as usize],
                     received_count: 0,
+                    bytes: 0,
                     used_recovery: false,
                 },
             );
-            self.pending_order.push(hdr.frame_id);
+            self.pending_order.push(key);
+            // While awaiting an IDR, an incomplete delta must never claim the
+            // post-reset ordering anchor: only the first pending key frame
+            // (or a non-gated pending frame once recovery has settled) may
+            // become `next_frame_id`, so a stale/incomplete delta cannot
+            // stall a later complete key behind a reorder-gap wait.
+            if self.next_frame_id.is_none() && (!self.awaiting_idr || is_key) {
+                self.next_frame_id = Some(frame_id);
+            }
         }
-
-        let frame = self
-            .pending
-            .get_mut(&hdr.frame_id)
-            .expect("inserted above if absent");
-        frame.used_recovery |= via_fec;
-
-        // A later chunk's count may disagree with the first-seen one (never
-        // produced by our encoder); bound by the allocated parts length.
-        let idx = hdr.chunk_index as usize;
-        if idx >= frame.parts.len() {
-            return None;
+        let metadata_matches = self.pending.get(&key).is_some_and(|frame| {
+            frame.is_v2 == is_v2
+                && frame.is_key == is_key
+                && frame.timestamp_us == timestamp_us
+                && frame.chunk_count == chunk_count
+                && frame.encoded_frame_len == encoded_len
+                && frame.encoded_frame_crc32 == encoded_crc
+        });
+        if !metadata_matches {
+            self.discontinue(epoch, DiscontinuityReason::MetadataMismatch, out);
+            return;
         }
-        // Guard against duplicate delivery.
-        if frame.parts[idx].is_some() {
-            return None;
+        let frame = self.pending.get_mut(&key).expect("present: checked above");
+        let index = chunk_index as usize;
+        if index >= frame.parts.len() || frame.parts[index].is_some() {
+            return;
         }
-        frame.parts[idx] = Some(fragment.to_vec());
+        if self.buffered_bytes.saturating_add(fragment.len()) > RX_DECODER_MAX_BYTES as usize {
+            self.discontinue(epoch, DiscontinuityReason::MemoryCap, out);
+            return;
+        }
+        frame.parts[index] = Some(fragment.to_vec());
         frame.received_count += 1;
+        frame.bytes += fragment.len();
+        frame.used_recovery |= via_fec;
+        self.buffered_bytes += fragment.len();
 
-        if frame.received_count >= frame.chunk_count {
-            let frame = self
-                .pending
-                .remove(&hdr.frame_id)
-                .expect("present: just mutated");
-            self.pending_order.retain(|&id| id != hdr.frame_id);
-            if self.awaiting_idr && !frame.is_key {
-                self.frames_dropped_awaiting_idr += 1;
-                return None;
-            }
-            if frame.is_key {
-                self.awaiting_idr = false;
-            }
-            return Some(self.assemble_frame(hdr.frame_id, frame));
+        if frame.received_count != frame.chunk_count {
+            return;
         }
-        None
+        let frame = self.pending.remove(&key).expect("present: completed above");
+        self.pending_order.retain(|pending| *pending != key);
+        if self.awaiting_idr && !frame.is_key {
+            self.buffered_bytes -= frame.bytes;
+            self.frames_dropped_awaiting_idr += 1;
+            // A dropped delta must not establish the reorder baseline: the next
+            // admitted keyframe is the new decode reference and must flush alone.
+            if self.next_frame_id == Some(frame_id) {
+                self.next_frame_id = None;
+            }
+            return;
+        }
+        if frame.is_key {
+            self.awaiting_idr = false;
+        }
+        self.completed.insert(
+            key,
+            CompletedFrame {
+                frame_id,
+                frame,
+                completed_at_ms: now_ms,
+            },
+        );
+        self.completed_order.push(key);
     }
 
-    /// Concatenate all parts into a [`DecodeUnit`] (TS `assembleFrame`).
-    fn assemble_frame(&mut self, frame_id: u32, frame: PendingFrame) -> DecodeUnit {
-        let total: usize = frame
-            .parts
-            .iter()
-            .map(|p| p.as_deref().map_or(0, <[u8]>::len))
-            .sum();
-        let mut data = Vec::with_capacity(total);
-        for part in frame.parts.iter().flatten() {
-            data.extend_from_slice(part);
+    fn flush_reorder(&mut self, now_ms: u64, out: &mut Vec<RxEvent>) {
+        while let Some(first_key) = self.completed_order.first().copied() {
+            let first = self
+                .completed
+                .get(&first_key)
+                .expect("order refers to completed");
+            let expected = (first_key.0, self.next_frame_id.unwrap_or(first.frame_id));
+            if !self.completed.contains_key(&expected) {
+                if self.completed_order.len() <= REORDER_MAX_COMPLETED_FRAMES
+                    && now_ms.saturating_sub(first.completed_at_ms) < REORDER_MAX_WAIT_MS
+                {
+                    return;
+                }
+                self.discontinue(first_key.0, DiscontinuityReason::ReorderGap, out);
+                return;
+            }
+            let completed = self.completed.remove(&expected).expect("checked above");
+            self.completed_order.retain(|key| *key != expected);
+            if let Some(unit) =
+                self.assemble_frame(completed.frame_id, completed.frame, expected.0, out)
+            {
+                out.push(RxEvent::Frame(unit));
+            }
+            self.next_frame_id = Some(completed.frame_id.wrapping_add(1));
+        }
+    }
+
+    fn assemble_frame(
+        &mut self,
+        frame_id: u32,
+        frame: PendingFrame,
+        epoch: u32,
+        out: &mut Vec<RxEvent>,
+    ) -> Option<DecodeUnit> {
+        let mut data = Vec::with_capacity(frame.bytes);
+        for part in frame.parts.iter() {
+            data.extend_from_slice(part.as_deref()?);
+        }
+        self.buffered_bytes -= frame.bytes;
+        if frame.is_v2
+            && validate_encoded_frame_v2(
+                &crate::fec_wire::ChunkV2Header {
+                    frame_id,
+                    chunk_index: 0,
+                    chunk_count: frame.chunk_count,
+                    frame_type_key: frame.is_key,
+                    timestamp_us: frame.timestamp_us,
+                    encoded_frame_len: frame.encoded_frame_len,
+                    encoded_frame_crc32: frame.encoded_frame_crc32,
+                },
+                &data,
+            )
+            .is_err()
+        {
+            self.discontinue(epoch, DiscontinuityReason::FrameCrc, out);
+            return None;
         }
         if frame.used_recovery {
             self.frames_recovered += 1;
         }
-
         let duration_us = i64::from(frame.timestamp_us) - i64::from(self.last_timestamp_us);
         self.last_timestamp_us = frame.timestamp_us;
-
-        DecodeUnit {
+        Some(DecodeUnit {
             frame_id,
+            epoch,
             is_key: frame.is_key,
             timestamp_us: frame.timestamp_us,
             duration_us,
             data,
-        }
-    }
-
-    /// A LossSpan means source seqs are unrecoverably gone. This invalidates
-    /// the predictive reference chain even when every chunk of the lost frame
-    /// was absent and `pending` is empty. Drop partial frames, request an IDR,
-    /// and withhold subsequent deltas until a keyframe arrives.
-    fn handle_loss_span(&mut self) {
-        self.pending.clear();
-        self.pending_order.clear();
-        self.needs_idr = true;
-        self.awaiting_idr = true;
+        })
     }
 
     /// ACK cadence gate — called on every recovered symbol and from `tick`.
@@ -348,7 +617,7 @@ impl VideoReceiver {
     fn tick_ack(&mut self, now_ms: u64) -> Option<u32> {
         let hfd = self.decoder.highest_fully_decoded()?;
         if let Some(last) = self.last_acked_highest
-            && hfd <= last
+            && !seq_advanced(hfd, last)
         {
             return None;
         }
@@ -366,6 +635,14 @@ impl VideoReceiver {
     }
 }
 
+/// Returns whether `candidate` is RFC 1982-forward from `previous`.
+///
+/// Zero distance and the half-range are both rejected; this admits max→0.
+fn seq_advanced(candidate: u32, previous: u32) -> bool {
+    let distance = candidate.wrapping_sub(previous);
+    distance != 0 && distance < 0x8000_0000
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────
 //
 // Scenario parity with tests/fec_pipe.test.mjs (the TS production pipe),
@@ -375,7 +652,9 @@ impl VideoReceiver {
 mod tests {
     use super::*;
     use crate::fec::{FecConfig, FecEncoder, Symbol};
-    use crate::fec_wire::encode_symbol_msg;
+    use crate::fec_wire::{
+        CHUNK_HEADER_LEN, Epoch, chunk_frame_v2, encode_symbol_msg, encode_symbol_msg_v2,
+    };
 
     // ── Helpers (mirror fec_pipe.test.mjs helpers) ────────────────────────
 
@@ -418,7 +697,7 @@ mod tests {
             .iter()
             .filter_map(|e| match e {
                 RxEvent::Frame(u) => Some(u),
-                RxEvent::Ack(_) => None,
+                RxEvent::Discontinuity { .. } | RxEvent::Ack(_) => None,
             })
             .collect()
     }
@@ -428,9 +707,18 @@ mod tests {
             .iter()
             .filter_map(|e| match e {
                 RxEvent::Ack(a) => Some(*a),
-                RxEvent::Frame(_) => None,
+                RxEvent::Frame(_) | RxEvent::Discontinuity { .. } => None,
             })
             .collect()
+    }
+
+    fn source_msg_v2(epoch: u32, seq: u32, payload: Vec<u8>) -> Vec<u8> {
+        encode_symbol_msg_v2(&V2Symbol::Source {
+            epoch: Epoch::new(epoch).expect("nonzero test epoch"),
+            seq,
+            payload,
+        })
+        .expect("valid v2 source")
     }
 
     // ── Reassembly (TS parity) ────────────────────────────────────────────
@@ -614,9 +902,17 @@ mod tests {
     }
 
     #[test]
-    fn loss_without_pending_requests_idr_and_gates_deltas_until_keyframe() {
+    fn discontinuity_without_pending_requests_idr_and_gates_deltas_until_keyframe() {
         let mut rx = VideoReceiver::new(0);
-        rx.handle_loss_span();
+        let mut events = Vec::new();
+        rx.discontinue(0, DiscontinuityReason::FecEviction, &mut events);
+        assert!(matches!(
+            events.as_slice(),
+            [RxEvent::Discontinuity {
+                epoch: 0,
+                reason: DiscontinuityReason::FecEviction,
+            }]
+        ));
         assert!(rx.poll_needs_idr());
 
         let delta = build_chunk_payload(1, 0, 1, false, 1_000, &[0x11]);
@@ -636,7 +932,63 @@ mod tests {
         );
     }
     #[test]
-    fn pending_cap_evicts_oldest_and_sets_needs_idr() {
+    fn key_after_incomplete_earlier_delta_becomes_the_reorder_anchor_immediately() {
+        // WATCH finding agent://76-FinalReviewCore: while awaiting_idr is
+        // latched, an incomplete pending delta must never claim
+        // next_frame_id. Adversarial order: an earlier delta's first chunk
+        // arrives (never completes), then a later same-epoch key completes
+        // in full — the key must become the post-reset anchor and flush
+        // immediately, not wait behind the stale delta's frame_id.
+        let mut rx = VideoReceiver::new(0);
+        let mut events = Vec::new();
+        rx.discontinue(0, DiscontinuityReason::FecEviction, &mut events);
+        assert!(rx.poll_needs_idr(), "discontinuity latches needs_idr");
+
+        // Earlier delta (frame_id 5, 2 chunks) — only the first chunk ever
+        // arrives, so it stays pending/incomplete forever.
+        let stale_delta = build_chunk_payload(5, 0, 2, false, 5_000, &[0xAA]);
+        let stale_events = rx.on_message(&source_msg(0, &stale_delta), 0);
+        assert!(frames_of(&stale_events).is_empty());
+        assert!(
+            stale_events
+                .iter()
+                .all(|e| !matches!(e, RxEvent::Discontinuity { .. })),
+            "an incomplete pending delta must not itself trigger a discontinuity"
+        );
+
+        // Later key (frame_id 6, single chunk) completes in the same message.
+        let key = build_chunk_payload(6, 0, 1, true, 6_000, &[0xBB]);
+        let key_events = rx.on_message(&source_msg(1, &key), 0);
+        let frames = frames_of(&key_events);
+        assert_eq!(
+            frames.len(),
+            1,
+            "the key must emit immediately, not wait for a reorder gap"
+        );
+        assert!(frames[0].is_key);
+        assert_eq!(frames[0].frame_id, 6);
+        assert!(
+            key_events
+                .iter()
+                .all(|e| !matches!(e, RxEvent::Discontinuity { .. })),
+            "no extra ReorderGap/IDR discontinuity from the stale incomplete delta"
+        );
+        assert!(
+            !rx.poll_needs_idr(),
+            "the recovered key must not trigger a second IDR request"
+        );
+
+        // The gate has cleared: the next delta emits immediately too.
+        let delta = build_chunk_payload(7, 0, 1, false, 7_000, &[0xCC]);
+        let delta_events = rx.on_message(&source_msg(2, &delta), 0);
+        assert_eq!(
+            frames_of(&delta_events).len(),
+            1,
+            "subsequent delta emits once the gate has cleared"
+        );
+    }
+    #[test]
+    fn pending_cap_triggers_full_reset_discontinuity_and_sets_needs_idr() {
         let mut rx = VideoReceiver::new(0);
 
         // 8 partial frames (chunk 0 of 2 each — never complete).
@@ -646,18 +998,24 @@ mod tests {
         }
         assert!(!rx.poll_needs_idr(), "no eviction yet at exactly 8");
 
-        // 9th partial frame evicts the oldest.
+        // The 9th partial frame trips the cap: this is a full-reset
+        // discontinuity (ReassemblyEviction), not a selective evict-the-
+        // oldest — every pending/completed record is cleared, not just #0.
         let chunk9 = build_chunk_payload(8, 0, 2, false, 9000, &[9]);
         rx.on_message(&source_msg(16, &chunk9), 0);
-        assert!(rx.poll_needs_idr(), "eviction at 9th frame sets needs_idr");
+        assert!(
+            rx.poll_needs_idr(),
+            "full-reset discontinuity at 9th frame sets needs_idr"
+        );
         assert!(!rx.poll_needs_idr(), "cleared after one poll");
 
-        // The evicted frame (id 0) can no longer complete.
+        // Frame id 0 cannot complete either: the reset cleared every
+        // record, so it restarts from a single chunk like all the rest.
         let chunk0b = build_chunk_payload(0, 1, 2, false, 0, &[0xEE]);
         let ev = rx.on_message(&source_msg(17, &chunk0b), 0);
         assert!(
             frames_of(&ev).is_empty(),
-            "evicted frame restarts from one chunk; must not assemble"
+            "reset frame restarts from one chunk; must not assemble"
         );
     }
 
@@ -720,6 +1078,122 @@ mod tests {
     fn tick_before_any_symbol_is_silent() {
         let mut rx = VideoReceiver::new(0);
         assert_eq!(rx.tick(1000), None, "no hfd yet — no ack");
+    }
+    #[test]
+    fn epoch_transition_resets_ack_cadence_and_wrap_ack_progresses() {
+        let mut rx = VideoReceiver::new(0);
+        let first = chunk_frame_v2(0, true, 0, &[1]).expect("valid v2 frame");
+        assert_eq!(
+            acks_of(&rx.on_message(&source_msg_v2(1, 0, first[0].clone()), 50)),
+            [0]
+        );
+
+        let next = chunk_frame_v2(0, true, 0, &[2]).expect("valid v2 frame");
+        let transition = rx.on_message(&source_msg_v2(2, 0, next[0].clone()), 100);
+        assert!(transition.iter().any(|event| matches!(
+            event,
+            RxEvent::Discontinuity {
+                reason: DiscontinuityReason::EpochTransition,
+                ..
+            }
+        )));
+        assert_eq!(
+            rx.tick(150),
+            Some(0),
+            "new epoch ACK is not blocked by old ACK"
+        );
+
+        let mut wrap = VideoReceiver::new(0);
+        wrap.last_acked_highest = Some(u32::MAX);
+        assert_eq!(
+            acks_of(&wrap.on_message(
+                &source_msg(0, &build_chunk_payload(0, 0, 1, true, 0, &[3])),
+                50,
+            )),
+            [0],
+            "RFC1982 max→0 is forward"
+        );
+        assert!(!seq_advanced(0x8000_0000, 0), "half-range is not forward");
+    }
+
+    #[test]
+    fn same_batch_loss_and_keyframe_admits_the_keyframe() {
+        let mut rx = VideoReceiver::new(0);
+        let key = chunk_frame_v2(0, true, 0, &[7]).expect("valid v2 keyframe");
+        let mut events = Vec::new();
+        rx.process_decoder_events(
+            1,
+            true,
+            vec![
+                DecoderEvent::Recovered {
+                    seq: 0,
+                    payload: key[0].clone(),
+                    via_fec: true,
+                },
+                DecoderEvent::LossSpan {
+                    from_seq: 1,
+                    to_seq_exclusive: 2,
+                },
+            ],
+            0,
+            &mut events,
+        );
+        rx.flush_reorder(0, &mut events);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RxEvent::Discontinuity {
+                reason: DiscontinuityReason::FecEviction,
+                ..
+            }
+        )));
+        assert_eq!(
+            frames_of(&events).len(),
+            1,
+            "the same-batch key clears the IDR gate"
+        );
+    }
+
+    #[test]
+    fn completed_duplicate_replay_does_not_trigger_record_cap() {
+        let mut rx = VideoReceiver::new(0);
+        let key = (0, 99);
+        rx.completed.insert(
+            key,
+            CompletedFrame {
+                frame_id: 99,
+                frame: PendingFrame {
+                    is_v2: false,
+                    is_key: false,
+                    timestamp_us: 0,
+                    chunk_count: 1,
+                    encoded_frame_len: 0,
+                    encoded_frame_crc32: 0,
+                    parts: vec![Some(vec![1])],
+                    received_count: 1,
+                    bytes: 1,
+                    used_recovery: false,
+                },
+                completed_at_ms: 0,
+            },
+        );
+        rx.completed_order.push(key);
+        rx.next_frame_id = Some(0);
+        rx.pending_order = (0..MAX_PENDING_FRAMES as u32).map(|id| (0, id)).collect();
+
+        let replay = build_chunk_payload(99, 0, 1, false, 0, &[1]);
+        let events = rx.on_message(&source_msg(0, &replay), 0);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            RxEvent::Discontinuity {
+                reason: DiscontinuityReason::ReassemblyEviction | DiscontinuityReason::MemoryCap,
+                ..
+            }
+        )));
+        assert!(
+            !rx.poll_needs_idr(),
+            "duplicate replay consumes no capacity"
+        );
     }
 
     // ── Hardening (Rust-side DIVERGENCE cases) ────────────────────────────
@@ -875,5 +1349,149 @@ mod tests {
             );
         }
         assert!(!rx.poll_needs_idr(), "no unrecoverable loss occurred");
+    }
+    #[test]
+    fn v2_reorder_epoch_and_crc_contract_vectors() {
+        let mut rx = VideoReceiver::new(0);
+        let epoch = 7;
+        let n = chunk_frame_v2(10, false, 10, &vec![0x10; 1165])
+            .expect("multi-chunk v2 frame should be valid");
+        let n1 =
+            chunk_frame_v2(11, false, 11, &[0x11]).expect("single-chunk v2 frame should be valid");
+        assert!(frames_of(&rx.on_message(&source_msg_v2(epoch, 0, n[0].clone()), 0)).is_empty());
+        assert!(frames_of(&rx.on_message(&source_msg_v2(epoch, 1, n1[0].clone()), 0)).is_empty());
+        let events = rx.on_message(&source_msg_v2(epoch, 2, n[1].clone()), 0);
+        assert_eq!(
+            frames_of(&events)
+                .iter()
+                .map(|u| u.frame_id)
+                .collect::<Vec<_>>(),
+            [10, 11]
+        );
+
+        let f20 = chunk_frame_v2(20, false, 20, &vec![0x20; 1165])
+            .expect("multi-chunk v2 frame should be valid");
+        let f21 =
+            chunk_frame_v2(21, false, 21, &[0x21]).expect("single-chunk v2 frame should be valid");
+        rx.on_message(&source_msg_v2(epoch, 3, f20[0].clone()), 0);
+        rx.on_message(&source_msg_v2(epoch, 4, f21[0].clone()), 0);
+        assert!(rx.tick_events(100).iter().any(|event| matches!(
+            event,
+            RxEvent::Discontinuity {
+                reason: DiscontinuityReason::ReorderGap,
+                ..
+            }
+        )));
+
+        let delta = chunk_frame_v2(30, false, 30, &[1])
+            .expect("single-chunk delta v2 frame should be valid");
+        assert!(
+            frames_of(&rx.on_message(&source_msg_v2(epoch, 5, delta[0].clone()), 101)).is_empty()
+        );
+        let key =
+            chunk_frame_v2(31, true, 31, &[2]).expect("single-chunk key v2 frame should be valid");
+        assert_eq!(
+            frames_of(&rx.on_message(&source_msg_v2(epoch, 6, key[0].clone()), 101)).len(),
+            1
+        );
+
+        let transition = chunk_frame_v2(0, true, 0, &[3])
+            .expect("single-chunk epoch-transition v2 frame should be valid");
+        assert!(
+            rx.on_message(&source_msg_v2(8, 0, transition[0].clone()), 102)
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    RxEvent::Discontinuity {
+                        reason: DiscontinuityReason::EpochTransition,
+                        ..
+                    }
+                ))
+        );
+        assert!(
+            rx.on_message(&source_msg_v2(7, 7, transition[0].clone()), 102)
+                .is_empty()
+        );
+
+        let mut wrap = VideoReceiver::new(0);
+        wrap.on_message(&source_msg_v2(0xffff_ffff, 0, transition[0].clone()), 0);
+        assert!(
+            wrap.on_message(&source_msg_v2(1, 1, transition[0].clone()), 0)
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    RxEvent::Discontinuity {
+                        reason: DiscontinuityReason::EpochTransition,
+                        ..
+                    }
+                ))
+        );
+        let mut half_range = VideoReceiver::new(0);
+        half_range.on_message(&source_msg_v2(1, 0, transition[0].clone()), 0);
+        assert!(
+            half_range
+                .on_message(&source_msg_v2(0x8000_0001, 1, transition[0].clone()), 0)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn v2_metadata_crc_and_record_cap_are_typed_discontinuities() {
+        let mut rx = VideoReceiver::new(0);
+        let chunks = chunk_frame_v2(0, false, 0, &vec![1; 1165])
+            .expect("multi-chunk metadata test frame should be valid");
+        rx.on_message(&source_msg_v2(1, 0, chunks[0].clone()), 0);
+        let mut mixed = chunks[1].clone();
+        mixed[8] = 1;
+        assert!(
+            rx.on_message(&source_msg_v2(1, 1, mixed), 0)
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    RxEvent::Discontinuity {
+                        reason: DiscontinuityReason::MetadataMismatch,
+                        ..
+                    }
+                ))
+        );
+
+        let mut crc = VideoReceiver::new(0);
+        let mut corrupt = chunk_frame_v2(0, true, 0, &[1])
+            .expect("single-chunk CRC test frame should be valid")[0]
+            .clone();
+        *corrupt
+            .last_mut()
+            .expect("encoded v2 chunk must contain a payload byte") ^= 1;
+        assert!(
+            crc.on_message(&source_msg_v2(1, 0, corrupt), 0)
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    RxEvent::Discontinuity {
+                        reason: DiscontinuityReason::FrameCrc,
+                        ..
+                    }
+                ))
+        );
+
+        let mut cap = VideoReceiver::new(0);
+        for id in 0..8 {
+            let partial = chunk_frame_v2(id, false, id, &vec![0; 1165])
+                .expect("multi-chunk record-cap test frame should be valid");
+            cap.on_message(&source_msg_v2(1, id, partial[0].clone()), 0);
+        }
+        let ninth = chunk_frame_v2(8, false, 8, &vec![0; 1165])
+            .expect("multi-chunk record-cap test frame should be valid");
+        assert!(
+            cap.on_message(&source_msg_v2(1, 8, ninth[0].clone()), 0)
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    RxEvent::Discontinuity {
+                        reason: DiscontinuityReason::ReassemblyEviction,
+                        ..
+                    }
+                ))
+        );
     }
 }

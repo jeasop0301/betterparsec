@@ -411,11 +411,17 @@ export class WebRTCTransport implements Transport {
         // RTCDataChannels consumed directly by the FEC pipeline in stream/index).
         if (label === "video_fec") {
             this.logger?.debug("Stashing video_fec DataChannel")
+            // Spec default binaryType is "blob" (notably Firefox); FEC symbol
+            // parsing expects ArrayBuffer, so every message would otherwise
+            // parse to null. Set explicitly rather than relying on the sender
+            // to negotiate this (DataChannel binaryType is receiver-local).
+            remoteChannel.binaryType = "arraybuffer"
             this.fecDataChannel = remoteChannel
             return
         }
         if (label === "video_fec_ack") {
             this.logger?.debug("Stashing video_fec_ack DataChannel")
+            remoteChannel.binaryType = "arraybuffer"
             this.fecAckChannel = remoteChannel
             return
         }

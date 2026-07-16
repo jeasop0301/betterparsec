@@ -14,6 +14,7 @@
 //! (decoder D3D11 texture straight into the swapchain) and
 //! ALLOW_TEARING/vsync-off land with Phase B (§2 topology).
 
+use client_transport::capi::RxCore;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError};
 
@@ -970,9 +971,13 @@ impl StreamSurface {
     /// `want_10bit` is the settings-store preference (G005 S1b,
     /// `main.rs::App::want_10bit_pref`); `BP_PRESENT_10BIT=1` still wins
     /// over a `false` store value — folded in by [`Renderer::new_with_10bit`].
+    /// `core` feeds the G004 present-success heartbeat
+    /// (`RxCore::note_presented`) — only on an actual successful
+    /// `Present`, never on draw/upload alone.
     pub fn create(
         parent: isize,
         shared: Arc<VideoShared>,
+        core: Arc<RxCore>,
         want_10bit: bool,
     ) -> Result<Self, PresentError> {
         let hwnd = create_stream_child(HWND(parent as *mut _))?;
@@ -981,7 +986,7 @@ impl StreamSurface {
             let hwnd_val = hwnd.0 as isize;
             std::thread::Builder::new()
                 .name("a0-present".into())
-                .spawn(move || render_loop(HWND(hwnd_val as *mut _), &shared, want_10bit))
+                .spawn(move || render_loop(HWND(hwnd_val as *mut _), &shared, &core, want_10bit))
                 .map_err(|e| PresentError(format!("spawn present thread: {e}")))?
         };
         Ok(Self {
@@ -1175,16 +1180,86 @@ impl Drop for StreamSurface {
     }
 }
 
+/// G004 `PresentStall` consumption: watchdog-detected present stalls
+/// (frames keep arriving but nothing reaches the swapchain) recreate the
+/// D3D11 device up to [`PRESENT_STALL_MAX_RECREATES`] times before giving
+/// up and falling back to the egui present path — the same
+/// `raw_present_failed` seam an ordinary `present()` failure already
+/// uses. Bounding the recreate count is the whole point: a present path
+/// that stays wedged after fresh devices keeps failing must eventually
+/// hand off to the fallback (and, transitively, the session's own
+/// receive/decode-stall ladder) instead of recreating forever. A real
+/// successful present resets the ladder.
+const PRESENT_STALL_MAX_RECREATES: u32 = 3;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PresentStallLadder {
+    attempts: u32,
+}
+
+/// What to do about one watchdog-reported present stall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresentStallStep {
+    /// Recreate the device and keep going; `attempt` is the 1-based
+    /// count, for logging.
+    Recreate { attempt: u32 },
+    /// Recreate attempts exhausted — latch the egui fallback.
+    Fallback,
+}
+
+impl PresentStallLadder {
+    /// A present actually succeeded — any stall is over.
+    fn on_present_success(&mut self) {
+        self.attempts = 0;
+    }
+
+    /// The watchdog reported a present stall: advance the bounded ladder.
+    fn on_present_stall(&mut self) -> PresentStallStep {
+        self.attempts += 1;
+        if self.attempts > PRESENT_STALL_MAX_RECREATES {
+            PresentStallStep::Fallback
+        } else {
+            PresentStallStep::Recreate {
+                attempt: self.attempts,
+            }
+        }
+    }
+}
+
 /// Render thread: block on the frame condvar, then waitable → upload →
 /// copy → present. Newest-wins; a decode burst never queues presents.
-fn render_loop(hwnd: HWND, shared: &Arc<VideoShared>, want_10bit: bool) {
+/// `core` feeds the G004 present-success heartbeat
+/// (`RxCore::note_presented`) — fed only after `Renderer::present`
+/// actually succeeds, never on draw/upload alone.
+fn render_loop(hwnd: HWND, shared: &Arc<VideoShared>, core: &Arc<RxCore>, want_10bit: bool) {
     let mut renderer: Option<Renderer> = None;
+    let mut stall_ladder = PresentStallLadder::default();
     loop {
         let frame = {
             let mut guard = shared.frame.lock().unwrap_or_else(PoisonError::into_inner);
             loop {
                 if shared.present_stop.load(Ordering::Acquire) {
                     return;
+                }
+                // G004 `PresentStall` consumption: cross-thread signal
+                // from the UI-thread watchdog readback (see
+                // `VideoShared::present_stall_pending`) — checked on
+                // every wake, so at least every 250 ms even with no new
+                // frame arriving.
+                if shared.present_stall_pending.swap(false, Ordering::AcqRel) {
+                    match stall_ladder.on_present_stall() {
+                        PresentStallStep::Recreate { attempt } => {
+                            tracing::warn!(attempt, "present stall — recreating device");
+                            renderer = None; // forces recreate below on the next frame
+                        }
+                        PresentStallStep::Fallback => {
+                            tracing::error!(
+                                "present stall — recreate attempts exhausted, egui fallback"
+                            );
+                            shared.raw_present_failed.store(true, Ordering::Release);
+                            return;
+                        }
+                    }
                 }
                 if let Some(f) = guard.take() {
                     break f;
@@ -1220,25 +1295,37 @@ fn render_loop(hwnd: HWND, shared: &Arc<VideoShared>, want_10bit: bool) {
             DecodedFrame::Rgba(f) => r.draw(f),
             DecodedFrame::Nv12(f) => r.draw_nv12(f),
         };
-        if let Err(e) = draw.and_then(|()| r.present()) {
-            // Device removed/reset etc.: retry a fresh device once per
-            // frame; latch fallback only if recreation also fails.
-            tracing::warn!(err = %e, "present failed — recreating device");
-            renderer = None;
-            match Renderer::new_with_10bit(hwnd, fw, fh, want_10bit) {
-                Ok(mut r) => {
-                    let draw2 = match &frame {
-                        DecodedFrame::Rgba(f) => r.draw(f),
-                        DecodedFrame::Nv12(f) => r.draw_nv12(f),
-                    };
-                    if draw2.and_then(|()| r.present()).is_ok() {
-                        renderer = Some(r);
+        match draw.and_then(|()| r.present()) {
+            Ok(()) => {
+                // G004: the only point that feeds the present-success
+                // heartbeat — an actual successful `Present`, never the
+                // preceding `draw` (upload/convert) alone.
+                stall_ladder.on_present_success();
+                core.note_presented();
+            }
+            Err(e) => {
+                // Device removed/reset etc.: retry a fresh device once
+                // per frame; latch fallback only if recreation also
+                // fails.
+                tracing::warn!(err = %e, "present failed — recreating device");
+                renderer = None;
+                match Renderer::new_with_10bit(hwnd, fw, fh, want_10bit) {
+                    Ok(mut r) => {
+                        let draw2 = match &frame {
+                            DecodedFrame::Rgba(f) => r.draw(f),
+                            DecodedFrame::Nv12(f) => r.draw_nv12(f),
+                        };
+                        if draw2.and_then(|()| r.present()).is_ok() {
+                            renderer = Some(r);
+                            stall_ladder.on_present_success();
+                            core.note_presented();
+                        }
                     }
-                }
-                Err(e2) => {
-                    tracing::error!(err = %e2, "device recreation failed — egui fallback");
-                    shared.raw_present_failed.store(true, Ordering::Release);
-                    return;
+                    Err(e2) => {
+                        tracing::error!(err = %e2, "device recreation failed — egui fallback");
+                        shared.raw_present_failed.store(true, Ordering::Release);
+                        return;
+                    }
                 }
             }
         }
@@ -1251,6 +1338,42 @@ fn render_loop(hwnd: HWND, shared: &Arc<VideoShared>, want_10bit: bool) {
 mod tests {
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::{CW_USEDEFAULT, WS_OVERLAPPEDWINDOW};
+
+    // ── G004: PresentStall bounded ladder (pure, no D3D11 device) ───────
+
+    #[test]
+    fn present_stall_ladder_recreates_up_to_the_bound_then_falls_back() {
+        let mut ladder = PresentStallLadder::default();
+        for expected in 1..=PRESENT_STALL_MAX_RECREATES {
+            assert_eq!(
+                ladder.on_present_stall(),
+                PresentStallStep::Recreate { attempt: expected }
+            );
+        }
+        assert_eq!(
+            ladder.on_present_stall(),
+            PresentStallStep::Fallback,
+            "attempts exhausted — must hand off to the egui fallback"
+        );
+        assert_eq!(
+            ladder.on_present_stall(),
+            PresentStallStep::Fallback,
+            "stays latched at Fallback — never un-bounds back to Recreate"
+        );
+    }
+
+    #[test]
+    fn present_stall_ladder_resets_on_a_real_present_success() {
+        let mut ladder = PresentStallLadder::default();
+        ladder.on_present_stall();
+        ladder.on_present_stall();
+        ladder.on_present_success();
+        assert_eq!(
+            ladder.on_present_stall(),
+            PresentStallStep::Recreate { attempt: 1 },
+            "a successful present clears prior stall attempts"
+        );
+    }
 
     /// GATING acceptance: the 10-bit format selector is pure and needs
     /// no D3D11 device — default off, want+supported -> R10, and

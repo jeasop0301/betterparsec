@@ -77,6 +77,116 @@ pub struct ClientSettings {
     pub client_cursor: bool,
 }
 
+/// Which role(s) this install runs. Purely a settings-schema switch (G005
+/// S1c) — it does not itself start/stop the host role; consuming `role`
+/// to auto-boot `host::start` alongside the client shell is the G006
+/// role-UI wiring: `App::new` and the host-section role-select combo box
+/// (see `main.rs::App::host_section`) spawn `host::start` on a background
+/// thread (`App::start_host`) whenever `role` wants the host role, and
+/// stop it when it stops wanting it. Backward-compatible: an old store predating this field
+/// deserializes with `#[serde(default)]` on [`Settings`] and gets
+/// `Role::Client` (today's only behavior), never a hard parse failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    #[default]
+    Client,
+    Host,
+    Both,
+}
+
+/// Where the managed host role keeps everything it owns on disk, all
+/// under `%APPDATA%/betterparsec/` so a fresh install never scatters
+/// state next to the exe. `host/` holds the server account/pairing
+/// config plus the migrated Sunshine identity and the generated child
+/// config (see [`generate_child_config`]); `logs/` and `updates/` are
+/// separate top-level siblings (consolidated log capture, G006 update
+/// staging) rather than nested under `host/`, so a client-only install
+/// that later adds host role doesn't need to move anything.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HostPaths {
+    /// Server account/pairing config (`web_server::Config`, `host.rs`'s
+    /// managed replacement for the standalone `./server/config.json`).
+    pub config_path: PathBuf,
+    /// Staged Foundation Sunshine binary root (`sunshine.rs::SunshineConfig::stage_root`).
+    pub sunshine_stage_root: PathBuf,
+    /// Migrated Sunshine identity (certs/state/apps) — the managed
+    /// `identity_source` `sunshine.rs::SunshineConfig` launches from,
+    /// and `identity.rs`'s migration destination.
+    pub sunshine_identity_dir: PathBuf,
+    /// Consolidated host/child-process logs.
+    pub logs_dir: PathBuf,
+    /// G006 update staging (download/verify area; no update logic here).
+    pub updates_dir: PathBuf,
+}
+
+impl Default for HostPaths {
+    fn default() -> Self {
+        let base = data_dir();
+        HostPaths {
+            config_path: base.join("host").join("config.json"),
+            sunshine_stage_root: base.join("host").join("sunshine"),
+            sunshine_identity_dir: base.join("host").join("identity"),
+            logs_dir: base.join("logs"),
+            updates_dir: base.join("updates"),
+        }
+    }
+}
+
+/// Host-role network binding — must agree with whatever Sunshine/the
+/// embedded server actually bind so pairing and the generated child
+/// config stay in lockstep (see [`generate_child_config`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HostNetwork {
+    /// Embedded account/pairing/signaling web-server port
+    /// (`common::config::WebServerConfig::bind_address` default: 8080).
+    pub web_port: u16,
+    /// Moonlight HTTP port Sunshine/pairing use
+    /// (`common::config::MoonlightConfig::default_http_port` default:
+    /// 47989).
+    pub moonlight_port: u16,
+}
+
+impl Default for HostNetwork {
+    fn default() -> Self {
+        HostNetwork {
+            web_port: 8080,
+            moonlight_port: 47989,
+        }
+    }
+}
+
+/// Update channel placeholders only — real update-check/apply logic is
+/// G006; this just reserves the schema slot so a future build doesn't
+/// need another migration to add it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct HostUpdate {
+    pub channel: String,
+    pub url: String,
+}
+
+/// The full host-role settings section. Read (not written) by the
+/// managed-host supervision lane (`host.rs`/`sunshine.rs`) — see the
+/// `HostSettings`/`HostPaths` field-name contract agreed with that lane
+/// over IRC (G005 split): `paths.sunshine_stage_root`,
+/// `paths.sunshine_identity_dir`, `paths.logs_dir` are the fields it
+/// consumes; `network`/`update` are settings-only for now. `unknown`
+/// preserves any host-section keys this build doesn't recognize, the
+/// same forward/back-compat guarantee [`Settings::unknown`] gives
+/// top-level keys.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct HostSettings {
+    pub paths: HostPaths,
+    pub network: HostNetwork,
+    pub update: HostUpdate,
+    #[serde(flatten)]
+    pub unknown: serde_json::Map<String, serde_json::Value>,
+}
+
 /// The on-disk settings document. `unknown` preserves any top-level keys
 /// this build doesn't recognize (forward/back-compat: an older or newer
 /// build's `save()` never drops fields it doesn't understand).
@@ -85,6 +195,10 @@ pub struct ClientSettings {
 pub struct Settings {
     pub schema: u32,
     pub client: ClientSettings,
+    /// client|host|both — see [`Role`].
+    pub role: Role,
+    /// Host-role paths/network/update — see [`HostSettings`].
+    pub host: HostSettings,
     #[serde(flatten)]
     pub unknown: serde_json::Map<String, serde_json::Value>,
 }
@@ -94,6 +208,8 @@ impl Default for Settings {
         Settings {
             schema: 1,
             client: ClientSettings::default(),
+            role: Role::default(),
+            host: HostSettings::default(),
             unknown: serde_json::Map::new(),
         }
     }
@@ -125,6 +241,20 @@ pub fn to_flowconfig_fields(client: &ClientSettings) -> (u32, u32, u32, u32, u32
         knobs.fps as u32,
         supported_codecs,
     )
+}
+
+/// The base `%APPDATA%/betterparsec` (or XDG-equivalent) data directory,
+/// derived from [`default_settings_path`]'s parent. `HostPaths::default`
+/// nests `host/`, `logs/`, `updates/` under this same root so client-only
+/// and host-role installs share one data directory. Falls back to `.`
+/// (relative to cwd) in a headless/CI env with no usable base dir — the
+/// same "never touch disk unexpectedly, just resolve *some* path" stance
+/// as the rest of this module; callers still gate actual disk I/O behind
+/// their own checks.
+fn data_dir() -> PathBuf {
+    default_settings_path()
+        .and_then(|p| p.parent().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// `%APPDATA%/betterparsec/settings.json` on Windows; `$XDG_CONFIG_HOME`
@@ -231,13 +361,86 @@ pub fn save(settings: &Settings) -> Result<(), String> {
 
 /// Core save: pretty JSON, preserving `unknown` (via `#[serde(flatten)]`
 /// on `Settings`) — a round trip through an older/newer build's `save()`
-/// keeps every field neither one recognizes.
+/// keeps every field neither one recognizes. Atomic like
+/// [`write_child_config_atomic`]: a torn write must never corrupt the
+/// user's store (the corrupt-backup-regenerate path is for external
+/// corruption, not our own saves).
 pub fn save_to(path: &Path, settings: &Settings) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
     let text = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
-    std::fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename {} -> {}: {e}", tmp.display(), path.display())
+    })
+}
+
+/// Pure derivation of the generated runtime Sunshine/streamer child
+/// config content from settings (G005 S1c "atomic child-config
+/// generation"). Users never hand-edit the file this produces — it is
+/// fully re-derivable from `Settings` alone, so regenerating it (e.g. on
+/// every host-role start) is always safe and idempotent: same settings
+/// in, byte-identical text out, every time. Reuses
+/// [`to_flowconfig_fields`] so the generated child config and a live
+/// client session agree on bitrate/resolution/fps bit-for-bit with the
+/// mode engine, exactly like the client store does.
+pub fn generate_child_config(settings: &Settings) -> String {
+    let (bitrate_kbps, width, height, fps, _supported_codecs) =
+        to_flowconfig_fields(&settings.client);
+    let mut lines = vec![
+        "# Generated by betterparsec app-native — DO NOT EDIT".to_string(),
+        "# Regenerated from settings.json on every host-role start; hand edits are lost."
+            .to_string(),
+        format!("port = {}", settings.host.network.moonlight_port),
+        format!("web_port = {}", settings.host.network.web_port),
+        format!("bitrate_kbps = {bitrate_kbps}"),
+        format!("width = {width}"),
+        format!("height = {height}"),
+        format!("fps = {fps}"),
+    ];
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+/// Write generated content to `path` atomically: write to a sibling temp
+/// file, then `rename` over the destination. On the same volume (always
+/// true here — the temp file lives next to `path`) a rename is atomic, so
+/// a reader never observes a partially-written child config, and a crash
+/// mid-write leaves the previous good file untouched (the temp file is
+/// simply orphaned, not the live config). The temp file is removed on a
+/// failed rename so a failed attempt never leaks a stray sibling.
+pub fn write_child_config_atomic(path: &Path, content: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| format!("{}: config path has no parent directory", path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+
+    let tmp_name = format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("child-config"),
+        std::process::id()
+    );
+    let tmp_path = parent.join(tmp_name);
+    std::fs::write(&tmp_path, content)
+        .map_err(|e| format!("write temp {}: {e}", tmp_path.display()))?;
+
+    match std::fs::rename(&tmp_path, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(format!(
+                "rename {} -> {}: {e}",
+                tmp_path.display(),
+                path.display()
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -251,7 +454,7 @@ mod tests {
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("system clock is after the unix epoch")
                 .as_nanos()
         ));
         p
@@ -294,8 +497,12 @@ mod tests {
         assert_eq!(loaded, Settings::default());
 
         // A backup sibling with the .bak-<ts> suffix must exist.
-        let dir = path.parent().unwrap();
-        let stem = path.file_name().unwrap().to_string_lossy().to_string();
+        let dir = path.parent().expect("tmp path has a parent dir");
+        let stem = path
+            .file_name()
+            .expect("tmp path has a file name")
+            .to_string_lossy()
+            .to_string();
         let backed_up = std::fs::read_dir(dir)
             .expect("read tmp dir")
             .filter_map(|e| e.ok())
@@ -313,15 +520,40 @@ mod tests {
     }
 
     #[test]
-    fn parse_error_surfaced() {
-        // Corrupt-handling variant: the parse error itself is not
-        // swallowed silently — it is logged (tracing::warn in
-        // load_from) and the caller gets back known-good defaults
-        // rather than a partially-deserialized/garbage Settings.
+    fn parse_error_backs_up_the_corrupt_file_before_regenerating() {
+        // Corrupt-handling variant distinct from
+        // `corrupt_backs_up_and_regenerates` (which asserts the .bak
+        // sibling appears): this pins that the *returned* value is exactly
+        // the known-good defaults — never a partially-deserialized or
+        // garbage Settings — and that the corrupt bytes survive in the
+        // backup rather than being silently destroyed.
         let path = tmp_path("parse-error-surfaced");
         std::fs::write(&path, "not json").expect("write junk");
         let result = load_from(&path);
         assert_eq!(result, Ok(Settings::default()));
+
+        let dir = path.parent().expect("tmp path has a parent dir");
+        let stem = path
+            .file_name()
+            .expect("tmp path has a file name")
+            .to_string_lossy()
+            .to_string();
+        let backup = std::fs::read_dir(dir)
+            .expect("read tmp dir")
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{stem}.bak-"))
+            })
+            .expect("corrupt file is backed up, not destroyed");
+        let preserved = std::fs::read_to_string(backup.path()).expect("read backup");
+        assert_eq!(
+            preserved, "not json",
+            "backup keeps the corrupt bytes verbatim"
+        );
+
+        let _ = std::fs::remove_file(backup.path());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -410,5 +642,169 @@ mod tests {
             "store value persists round-trip"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn role_and_host_schema_roundtrip() {
+        // G005 S1c: role + host section round-trip through the store,
+        // and defaults come back byte-for-byte equal to `Settings::default`.
+        let path = tmp_path("role-host-roundtrip");
+        let mut settings = Settings {
+            role: Role::Both,
+            ..Default::default()
+        };
+        settings.host.paths.sunshine_stage_root = PathBuf::from("C:/stage");
+        settings.host.paths.sunshine_identity_dir = PathBuf::from("C:/identity");
+        settings.host.paths.logs_dir = PathBuf::from("C:/logs");
+        settings.host.paths.updates_dir = PathBuf::from("C:/updates");
+        settings.host.paths.config_path = PathBuf::from("C:/host/config.json");
+        settings.host.network.web_port = 9090;
+        settings.host.network.moonlight_port = 47000;
+        settings.host.update.channel = "beta".into();
+        settings.host.update.url = "https://example.invalid/update".into();
+        save_to(&path, &settings).expect("save");
+
+        let loaded = load_from(&path).expect("load");
+        assert_eq!(loaded, settings, "role/host section round-trips exactly");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unknown_keys_nested_under_host_are_preserved() {
+        // Forward-compat inside the host section: a newer build's
+        // `host.some_future_host_key` must survive this build's
+        // load -> save round trip, exactly like unknown top-level keys.
+        let path = tmp_path("host-unknown");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema": 1,
+                "role": "host",
+                "host": {
+                    "network": {"web_port": 9191, "moonlight_port": 47989},
+                    "some_future_host_key": {"x": 1}
+                }
+            })
+            .to_string(),
+        )
+        .expect("write store with nested host unknown");
+
+        let loaded = load_from(&path).expect("load");
+        assert_eq!(loaded.host.network.web_port, 9191);
+        assert_eq!(
+            loaded.host.unknown.get("some_future_host_key"),
+            Some(&serde_json::json!({"x": 1}))
+        );
+
+        save_to(&path, &loaded).expect("save");
+        let reloaded = load_from(&path).expect("reload");
+        assert_eq!(
+            reloaded.host.unknown.get("some_future_host_key"),
+            Some(&serde_json::json!({"x": 1})),
+            "nested host unknown key survives a full save round trip"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_store_missing_role_and_host_defaults_client() {
+        // Backward compatibility: a store predating G005 has no
+        // "role"/"host" keys at all — it must still parse (not a hard
+        // failure) and fall back to Role::Client + HostSettings::default,
+        // while any of *its* unknown top-level keys are still preserved.
+        let path = tmp_path("legacy-no-role-host");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema": 1,
+                "client": {"mode": "fast"},
+                "some_future_top_level_key": 42
+            })
+            .to_string(),
+        )
+        .expect("write legacy store");
+
+        let loaded = load_from(&path).expect("legacy store parses");
+        assert_eq!(loaded.role, Role::Client);
+        assert_eq!(loaded.host, HostSettings::default());
+        assert_eq!(loaded.client.mode, StreamMode::Fast);
+        assert_eq!(
+            loaded.unknown.get("some_future_top_level_key"),
+            Some(&serde_json::json!(42))
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn role_serializes_as_lowercase_strings() {
+        let json = serde_json::to_value(Role::Host).expect("serialize");
+        assert_eq!(json, serde_json::json!("host"));
+        let json = serde_json::to_value(Role::Both).expect("serialize");
+        assert_eq!(json, serde_json::json!("both"));
+        let parsed: Role = serde_json::from_value(serde_json::json!("both")).expect("parse");
+        assert_eq!(parsed, Role::Both);
+    }
+
+    #[test]
+    fn generated_child_config_is_deterministic() {
+        // G005 S1c: same settings in, byte-identical text out, every
+        // time — no timestamps/randomness allowed in generated content.
+        let mut settings = Settings::default();
+        settings.host.network.moonlight_port = 47123;
+        settings.host.network.web_port = 8123;
+        settings.client.mode = StreamMode::Quality;
+
+        let a = generate_child_config(&settings);
+        let b = generate_child_config(&settings);
+        assert_eq!(a, b);
+        assert!(a.contains("port = 47123"));
+        assert!(a.contains("web_port = 8123"));
+
+        let knobs = knobs_for(StreamMode::Quality, UserTradeoffs::default());
+        assert!(a.contains(&format!("bitrate_kbps = {}", knobs.bitrate_kbps)));
+    }
+
+    #[test]
+    fn write_child_config_atomic_writes_content_and_leaves_no_temp_file() {
+        let dir = tmp_path("child-config-dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let target = dir.join("sunshine.conf");
+
+        let settings = Settings::default();
+        let content = generate_child_config(&settings);
+        write_child_config_atomic(&target, &content).expect("write atomic");
+
+        let on_disk = std::fs::read_to_string(&target).expect("read written config");
+        assert_eq!(on_disk, content);
+
+        // No stray temp sibling left behind after a successful rename.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file must be cleaned up");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_child_config_atomic_regeneration_is_idempotent() {
+        let dir = tmp_path("child-config-regen");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let target = dir.join("sunshine.conf");
+
+        let settings = Settings::default();
+        let content = generate_child_config(&settings);
+        write_child_config_atomic(&target, &content).expect("first write");
+        write_child_config_atomic(&target, &content).expect("second write (regeneration)");
+
+        let on_disk = std::fs::read_to_string(&target).expect("read written config");
+        assert_eq!(on_disk, content, "regeneration is idempotent");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

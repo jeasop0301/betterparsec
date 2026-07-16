@@ -45,6 +45,18 @@ function gfCoeff(repairSeq: number, srcSeq: number): number {
     const c = ((h >>> 24) ^ (h >>> 16) ^ (h >>> 8) ^ h) & 0xFF;
     return c === 0 ? 0x01 : c;
 }
+/**
+ * RFC 1982 ordering for u32 serial numbers.
+ *
+ * `1` means `a` is newer than `b`, `-1` means older, and `null` is the
+ * deliberately unordered exact half-range case.
+ */
+export function compareU32Serial(a: number, b: number): -1 | 0 | 1 | null {
+    const distance = ((a >>> 0) - (b >>> 0)) >>> 0;
+    if (distance === 0) return 0;
+    if (distance === 0x80000000) return null;
+    return distance < 0x80000000 ? 1 : -1;
+}
 
 // ── FecConfig ─────────────────────────────────────────────────────────────
 
@@ -106,7 +118,13 @@ export type LossSpanEvent = {
     toSeqExclusive: number;   // u32
 };
 
-export type DecoderEvent = RecoveredEvent | LossSpanEvent;
+export type EvictedEvent = {
+    kind: 'evicted';
+    fromSeq: number;
+    toSeqExclusive: number;
+};
+
+export type DecoderEvent = RecoveredEvent | LossSpanEvent | EvictedEvent;
 
 // ── FecEncoder ────────────────────────────────────────────────────────────
 
@@ -178,9 +196,16 @@ export class FecEncoder {
         const hfd = highestFullyDecoded >>> 0;
         if (this.window.length === 0) return;
         const backSeq = this.window[this.window.length - 1].seq;
-        // Future-seq guard: ignore acks beyond the highest seq we have emitted
-        if (hfd > backSeq) return;
-        while (this.window.length > 0 && this.window[0].seq <= hfd) {
+        // An ACK after the newest emitted serial, or exactly half a serial
+        // space away (RFC 1982 undefined ordering), cannot slide this window.
+        const ackVsBack = compareU32Serial(hfd, backSeq);
+        if (ackVsBack === 1 || ackVsBack === null) return;
+
+        // The FEC window is insertion ordered, including across u32 wrap.
+        // Remove only its acknowledged prefix; never use numeric ordering here.
+        while (this.window.length > 0) {
+            const entryVsAck = compareU32Serial(this.window[0].seq, hfd);
+            if (entryVsAck !== -1 && entryVsAck !== 0) break;
             this.evictOldest();
         }
     }
@@ -261,6 +286,17 @@ export interface FecDecoderStats {
     lossSpansRecovered: number;
 }
 
+/** Exact persistent-state accounting. `retainedBytes` is source payload bytes
+ * + 8/source, repair payload bytes + 16/repair, and 8/dedup key. */
+export interface FecDecoderAccounting {
+    sourceSymbols: number;
+    repairSymbols: number;
+    dedupKeys: number;
+    /** Largest active matrix dimension; source and repair dimensions are individually capped. */
+    algebraSymbols: number;
+    retainedBytes: number;
+}
+
 // ── FecDecoder ────────────────────────────────────────────────────────────
 
 type SourceState =
@@ -276,7 +312,7 @@ interface StoredRepair {
 }
 
 export class FecDecoder {
-    private readonly maxSymbols: number; // stored for reference; not enforced as eviction
+    private readonly maxSymbols: number;
     private readonly maxBytes: number;
     private sources = new Map<number, SourceState>();
     private repairs: StoredRepair[] = [];
@@ -299,10 +335,19 @@ export class FecDecoder {
     // genuine FEC recovery ('recovered') rather than a late direct arrival
     // ('received').
     private openLossSpanHasRecovery = false;
+    private newestSeq: number | null = null;
+    // `(windowBase, windowEnd)` of the most recently committed forward repair,
+    // i.e. the active retained/frontier horizon that admission has already
+    // rolled state up to. `null` until the first repair commits — before that,
+    // nothing has been retired, so any window is trivially forward. Tracking
+    // both endpoints (not just windowBase) rejects a delayed, same-or-earlier
+    // -base repair whose windowEnd does not extend past what has already been
+    // committed, e.g. a stale [50, 60) arriving after [50, 110) has committed.
+    private rollHorizon: [number, number] | null = null;
 
     constructor(maxSymbols: number, maxBytes: number) {
         this.maxSymbols = Math.min(Math.max(maxSymbols, 1), 128);
-        this.maxBytes = Math.max(maxBytes, 1);
+        this.maxBytes = Math.min(Math.max(maxBytes, 1), 16 * 1024 * 1024);
     }
 
     pushSymbol(symbol: FecSymbol): DecoderEvent[] {
@@ -325,16 +370,141 @@ export class FecDecoder {
         return { ...this.stats };
     }
 
+    getAccounting(): FecDecoderAccounting {
+        let sourceBytes = 0;
+        for (const state of this.sources.values()) {
+            sourceBytes += state.kind === 'missing' ? 8 : state.payload.byteLength + 8;
+        }
+        let repairBytes = 0;
+        for (const repair of this.repairs) repairBytes += repair.payload.byteLength + 16;
+        return {
+            sourceSymbols: this.sources.size,
+            repairSymbols: this.repairs.length,
+            dedupKeys: this.seenRepairKeys.size,
+            algebraSymbols: Math.max(this.sources.size, this.repairs.length),
+            retainedBytes: sourceBytes + repairBytes + this.seenRepairKeys.size * 8,
+        };
+    }
+
+    private noteNewest(seq: number): void {
+        if (this.newestSeq === null || (((seq - this.newestSeq) >>> 0) < 0x80000000)) {
+            this.newestSeq = seq >>> 0;
+        }
+    }
+
+    /**
+     * Evict retained state until adding the specified accounting deltas fits.
+     * `protectedSources` are part of the pending admission and must not be
+     * selected: otherwise an at-cap arrival at the contiguous frontier can be
+     * deleted before advanceContiguous observes it.
+     */
+    private makeRoom(
+        addedSources: number,
+        addedRepairs: number,
+        addedKeys: number,
+        addedBytes: number,
+        protectedSources: ReadonlySet<number>,
+    ): DecoderEvent[] {
+        const events: DecoderEvent[] = [];
+        for (;;) {
+            const accounting = this.getAccounting();
+            const overSymbols = accounting.sourceSymbols + addedSources > this.maxSymbols
+                || accounting.repairSymbols + addedRepairs > this.maxSymbols;
+            const overBytes = accounting.retainedBytes + addedBytes + addedKeys * 8 > this.maxBytes;
+            if (!overSymbols && !overBytes) break;
+            if (this.repairs.length > 0
+                && (accounting.repairSymbols + addedRepairs > this.maxSymbols || overBytes)) {
+                this.repairs.shift();
+                this.seenRepairKeys.clear();
+                for (const repair of this.repairs) {
+                    this.seenRepairKeys.set(`${repair.repairSeq},${repair.windowBase}`, repair.windowBase);
+                }
+                continue;
+            }
+            const newest = this.newestSeq;
+            if (newest === null) break;
+            const frontier = this.highestContiguous ?? newest;
+            let oldest: number | null = null;
+            let oldestAge = -1;
+            // Prefer entries behind the contiguous frontier; all serial
+            // comparisons use RFC1982 half-range arithmetic.
+            for (const seq of this.sources.keys()) {
+                if (protectedSources.has(seq)) continue;
+                const age = (frontier - seq) >>> 0;
+                if (age < 0x80000000 && age > oldestAge) {
+                    oldest = seq;
+                    oldestAge = age;
+                }
+            }
+            if (oldest === null) {
+                for (const seq of this.sources.keys()) {
+                    if (protectedSources.has(seq)) continue;
+                    const age = (newest - seq) >>> 0;
+                    if (age > oldestAge) {
+                        oldest = seq;
+                        oldestAge = age;
+                    }
+                }
+            }
+            if (oldest === null) break;
+            const state = this.sources.get(oldest);
+            this.sources.delete(oldest);
+            if (state?.kind === 'missing') {
+                this.advanceLossFloor(oldest);
+                events.push({ kind: 'evicted', fromSeq: oldest, toSeqExclusive: (oldest + 1) >>> 0 });
+            }
+        }
+        return events;
+    }
+
+    /** Whether eviction of all non-protected state could admit the deltas. */
+    private canMakeRoom(
+        addedSources: number,
+        addedRepairs: number,
+        addedKeys: number,
+        addedBytes: number,
+        protectedSources: ReadonlySet<number>,
+    ): boolean {
+        const accounting = this.getAccounting();
+        let sourceSymbols = accounting.sourceSymbols;
+        let retainedBytes = accounting.retainedBytes;
+        for (const repair of this.repairs) {
+            retainedBytes -= repair.payload.byteLength + 16;
+        }
+        retainedBytes -= this.seenRepairKeys.size * 8;
+        for (const [seq, state] of this.sources) {
+            if (protectedSources.has(seq)) continue;
+            sourceSymbols--;
+            retainedBytes -= state.kind === 'missing' ? 8 : state.payload.byteLength + 8;
+        }
+        return sourceSymbols + addedSources <= this.maxSymbols
+            && addedRepairs <= this.maxSymbols
+            && retainedBytes + addedBytes + addedKeys * 8 <= this.maxBytes;
+    }
+
     private pushSource(seq: number, payload: Uint8Array): DecoderEvent[] {
         const s = seq >>> 0;
+        if (payload.byteLength + 8 > this.maxBytes) {
+            return [{ kind: 'recovered', seq: s, payload, viaFec: false }];
+        }
         const existing = this.sources.get(s);
         if (existing !== undefined && existing.kind !== 'missing') {
             return []; // already Received or Recovered
         }
+
+        const addedSources = existing === undefined ? 1 : 0;
+        const addedBytes = existing === undefined ? payload.byteLength + 8 : payload.byteLength;
+        const protectedSources = new Set([s]);
+        if (!this.canMakeRoom(addedSources, 0, 0, addedBytes, protectedSources)) {
+            return [{ kind: 'recovered', seq: s, payload, viaFec: false }];
+        }
+
+        this.noteNewest(s);
+        const events = this.makeRoom(addedSources, 0, 0, addedBytes, protectedSources);
         this.noteOpenSpanAtFrontier();
         this.sources.set(s, { kind: 'received', payload });
         this.stats.sourceSymbolsReceived++;
-        const events: DecoderEvent[] = [{ kind: 'recovered', seq: s, payload, viaFec: false }];
+        events.push({ kind: 'recovered', seq: s, payload, viaFec: false });
         const recovered = this.tryRecover();
         for (const [rs, rp] of recovered) {
             events.push({ kind: 'recovered', seq: rs, payload: rp, viaFec: true });
@@ -343,14 +513,32 @@ export class FecDecoder {
         return events;
     }
 
+    /** Classify a repair against `rollHorizon` before touching any state.
+     * 'stale': windowEnd is serially older than the committed end, or equal
+     * to it with a different windowBase (a same-or-narrower sub-window that
+     * gains no new coverage).
+     * 'forward': windowEnd is serially newer than the committed end AND
+     * windowBase is not serially older than the committed base, or the
+     * window is identical to the committed one.
+     * 'overlapping': windowEnd is serially newer but windowBase is serially
+     * older than the committed base — would need equations for
+     * already-retired state, so it cannot be admitted. */
+    private repairHorizonRelation(windowBase: number, windowEnd: number): 'stale' | 'overlapping' | 'forward' {
+        if (this.rollHorizon === null) return 'forward';
+        const [horizonBase, horizonEnd] = this.rollHorizon;
+        const endCmp = compareU32Serial(windowEnd, horizonEnd);
+        if (endCmp === null || endCmp === -1) return 'stale';
+        if (endCmp === 0) return windowBase === horizonBase ? 'forward' : 'stale';
+        const baseCmp = compareU32Serial(windowBase, horizonBase);
+        return (baseCmp === 1 || baseCmp === 0) ? 'forward' : 'overlapping';
+    }
+
     private pushRepair(
         repairSeq: number, windowBase: number, windowEnd: number, payload: Uint8Array,
     ): DecoderEvent[] {
-        // Deduplicate by (repairSeq, windowBase) — full u16 repairSeq (Bug-3 fix)
-        const key = `${repairSeq & 0xFFFF},${windowBase >>> 0}`;
-        if (this.seenRepairKeys.has(key)) return [];
         const wb = windowBase >>> 0;
         const we = windowEnd >>> 0;
+        if (payload.byteLength + 16 > this.maxBytes) return [];
 
         // Guard: reject repair symbols with windows larger than the design cap of
         // 128 symbols (design §4).  A window of e.g. 100 000 would insert 100 000
@@ -359,12 +547,37 @@ export class FecDecoder {
         const windowLen = (we - wb + 0x100000000) >>> 0;
         if (windowLen > 128) return [];
 
-        // Commit dedup key now that the window has been validated.
-        // Stored value is windowBase so the pruning pass can identify stale entries.
+        // Do not let an unseen historical equation roll the retained horizon
+        // backward. An overlap whose prefix has already been retired cannot be
+        // used safely: elimination would otherwise treat that prefix as zero.
+        if (this.repairHorizonRelation(wb, we) !== 'forward') return [];
+
+        // Deduplicate by (repairSeq, windowBase) — full u16 repairSeq (Bug-3 fix)
+        const key = `${repairSeq & 0xFFFF},${wb}`;
+        if (this.seenRepairKeys.has(key)) return [];
+
+        const protectedSources = new Set<number>();
+        let addedSources = 0;
+        for (let seq = wb; seq !== we; seq = (seq + 1) >>> 0) {
+            protectedSources.add(seq);
+            if (!this.sources.has(seq)) addedSources++;
+        }
+        const addedBytes = addedSources * 8 + payload.byteLength + 16;
+        if (!this.canMakeRoom(addedSources, 1, 1, addedBytes, protectedSources)) return [];
+
+        if (windowLen !== 0) {
+            this.noteNewest((we - 1 + 0x100000000) >>> 0);
+            // Advance the declared rolling horizon to this repair's base/end
+            // now that admission is known to fit.
+            this.rollHorizon = [wb, we];
+        }
+        const events = this.makeRoom(addedSources, 1, 1, addedBytes, protectedSources);
+
+        // Commit dedup key only after the complete repair admission is known to fit.
         this.seenRepairKeys.set(key, wb);
         this.stats.repairSymbolsReceived++;
 
-        // Register all seqs in this repair's window as at least Missing
+        // Register all seqs in this repair's window as at least Missing.
         for (let seq = wb; seq !== we; seq = (seq + 1) >>> 0) {
             if (!this.sources.has(seq)) {
                 this.sources.set(seq, { kind: 'missing' });
@@ -372,30 +585,13 @@ export class FecDecoder {
         }
 
         this.noteOpenSpanAtFrontier();
-
         this.repairs.push({ repairSeq: repairSeq & 0xFFFF, windowBase: wb, windowEnd: we, payload });
 
         const recovered = this.tryRecover();
-        const events: DecoderEvent[] = recovered.map(
+        events.push(...recovered.map(
             ([s, p]) => ({ kind: 'recovered' as const, seq: s, payload: p, viaFec: true }),
-        );
+        ));
         events.push(...this.advanceContiguous());
-
-        // Lazily prune seenRepairKeys when it grows large.  At 60 fps / 1/8 ratio
-        // the map grows at ~22.5 entries/sec; pruning at >256 keeps the long-term
-        // footprint bounded without paying O(n) on every symbol.
-        if (this.seenRepairKeys.size > 256 && this.highestContiguous !== null) {
-            // Entries with windowBase more than 128 symbols behind highestContiguous
-            // can never contribute to recovery — the whole window has been resolved.
-            // Integer subtraction without u32 wrap guard; safe for sessions shorter
-            // than ~276 days at 180 sym/sec (u32::MAX).
-            const pruneThreshold = this.highestContiguous - 128;
-            for (const [k, base] of this.seenRepairKeys) {
-                if (base <= pruneThreshold) {
-                    this.seenRepairKeys.delete(k);
-                }
-            }
-        }
 
         return events;
     }
@@ -406,6 +602,8 @@ export class FecDecoder {
         for (;;) {
             const batch = this.oneElimPass();
             if (batch.length === 0) break;
+            const recoveredBytes = batch.reduce((total, [, payload]) => total + payload.byteLength, 0);
+            if (this.getAccounting().retainedBytes + recoveredBytes > this.maxBytes) break;
             this.stats.symbolsRecovered += batch.length;
             for (const [seq, payload] of batch) {
                 this.sources.set(seq, { kind: 'recovered', payload });
@@ -435,6 +633,10 @@ export class FecDecoder {
         if (maxEffLen === 0) return [];
 
         const nUnknowns = missingSeqs.length;
+        if (nUnknowns > 128 || this.repairs.length > 128) return [];
+        const scratch = this.repairs.length * (nUnknowns + maxEffLen)
+            + 2 * nUnknowns + 2 * maxEffLen;
+        if (this.getAccounting().retainedBytes + scratch > this.maxBytes) return [];
         const coeffMatrix: Uint8Array[] = [];
         const rhsMatrix: Uint8Array[] = [];
 
@@ -500,8 +702,8 @@ export class FecDecoder {
      *
      * Loss-span counter approximation (U2 P2 groundwork, mirrors fec.rs):
      * this decoder has no independent structure tracking arbitrary loss
-     * episodes, and `sources` entries are never evicted, so the only place
-     * a gap is ever truly discovered is right here (plus
+     * episodes. Bounded Missing eviction is instead recorded as an explicit
+     * loss-floor transition; other gaps are discovered here (plus
      * noteOpenSpanAtFrontier for the instant-resolution case — see below).
      * Spans are counted lazily, at the moment the contiguous frontier
      * reaches them, not the instant a repair's window first registers a seq
@@ -553,6 +755,22 @@ export class FecDecoder {
             }
         }
         return events;
+    }
+    /**
+     * A forced Missing eviction is an irreversible loss decision. Move the
+     * acknowledgement floor through it so a deleted frontier cannot leave
+     * advanceContiguous waiting for a source that will never reappear.
+     */
+    private advanceLossFloor(seq: number): void {
+        const lossSeq = seq >>> 0;
+        if (this.openLossSpan === null) this.stats.lossSpans++;
+        this.openLossSpan = null;
+        this.openLossSpanHasRecovery = false;
+
+        if (this.highestContiguous === null
+            || compareU32Serial(lossSeq, this.highestContiguous) === 1) {
+            this.highestContiguous = lossSeq;
+        }
     }
 
     /**

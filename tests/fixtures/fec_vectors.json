@@ -78,5 +78,25 @@
       "seed": "0x00c0ffee",
       "state_bits": 32
     }
-  }
+  },
+  "v2_symbols": [
+    {
+      "encoded_hex": "0204030201d0c0b0a016005627c56f04030201000001000108070605010000007ba501e4aa",
+      "epoch": 16909060,
+      "kind": "source",
+      "payload_crc32": 1875191638,
+      "payload_hex": "04030201000001000108070605010000007ba501e4aa",
+      "seq": 2695938256
+    },
+    {
+      "encoded_hex": "03443322116655aa99887700ffeedd03001d80bc55010203",
+      "epoch": 287454020,
+      "kind": "repair",
+      "payload_crc32": 1438416925,
+      "payload_hex": "010203",
+      "repair_seq": 21862,
+      "window_base": 2005440938,
+      "window_end": 3723427584
+    }
+  ]
 }

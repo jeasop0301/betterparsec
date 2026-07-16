@@ -9,6 +9,8 @@
 //! embedding — web clients keep working against the embedded instance.
 
 use std::net::SocketAddr;
+use std::process::Stdio;
+use std::sync::Arc;
 
 use actix_web::{
     App as ActixApp, HttpServer,
@@ -33,6 +35,79 @@ mod api;
 mod app;
 pub mod human_json;
 mod web;
+/// A launched streamer child with stdin/stdout already taken — exactly
+/// what `src/api/stream.rs`'s ipc wiring needs, decoupled from *how* the
+/// child was spawned so an embedding host (G005 supervision) can
+/// intercept the spawn (job-object containment, restart bookkeeping)
+/// without `src/api/stream.rs` knowing. `child` keeps stderr available
+/// for `create_child_ipc` and is used for `kill()`.
+pub struct LaunchedStreamer {
+    pub pid: u32,
+    pub stdin: tokio::process::ChildStdin,
+    pub stdout: tokio::process::ChildStdout,
+    pub child: tokio::process::Child,
+}
+
+/// Per-session streamer launch, injected by the embedding host (G005).
+/// `src/api/stream.rs` calls the injected launcher instead of resolving
+/// + spawning `streamer.exe` directly; [`DefaultStreamerLauncher`] is
+/// exactly the spawn it used to do inline, so the standalone binary's
+/// behavior is unchanged.
+#[async_trait::async_trait]
+pub trait StreamerLauncher: Send + Sync {
+    async fn launch(&self, streamer_path: &std::path::Path) -> Result<LaunchedStreamer, String>;
+}
+
+/// Handle type stored in actix `Data` and passed around by embedders.
+pub type LauncherHandle = Arc<dyn StreamerLauncher>;
+
+/// The standalone binary's default: spawn `streamer_path` with piped
+/// stdin/stdout/stderr, `kill_on_drop(true)` — identical to what
+/// `src/api/stream.rs` did before the G005 seam existed.
+pub struct DefaultStreamerLauncher;
+
+#[async_trait::async_trait]
+impl StreamerLauncher for DefaultStreamerLauncher {
+    async fn launch(&self, streamer_path: &std::path::Path) -> Result<LaunchedStreamer, String> {
+        let mut child = tokio::process::Command::new(streamer_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("spawn {}: {e}", streamer_path.display()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "streamer process didn't include a stdin".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "streamer process didn't include a stdout".to_string())?;
+        let pid = child.id().unwrap_or(0);
+        Ok(LaunchedStreamer {
+            pid,
+            stdin,
+            stdout,
+            child,
+        })
+    }
+}
+
+/// One per-session streamer lifecycle event, surfaced to an embedding
+/// host through a typed sink instead of the host polling. `Terminated`
+/// mirrors the existing `common::api_bindings::StreamServerMessage::
+/// ConnectionTerminated` seam (same error codes) — not a new vocabulary.
+#[derive(Debug, Clone, Copy)]
+pub enum StreamerLifecycleEvent {
+    Spawned { pid: u32 },
+    Terminated { error_code: i32 },
+    Exited { pid: u32 },
+}
+
+/// Where lifecycle events go; `None` (the standalone binary's default)
+/// costs nothing beyond an `Option` check.
+pub type LifecycleSink = Arc<dyn Fn(StreamerLifecycleEvent) + Send + Sync>;
 
 /// Read and parse a config file in the human-json format the CLI accepts.
 /// `Ok(None)` when the file does not exist (caller decides the default).
@@ -115,16 +190,34 @@ pub struct BoundServer {
 }
 
 /// Construct app state and bind the HTTP(S) server without running it.
+/// Standalone `web-server` binary path — no injected launcher/lifecycle
+/// sink (see [`build_with`] for the embedding-host seam).
 pub async fn build(config: Config) -> Result<BoundServer, anyhow::Error> {
+    build_with(config, None, None).await
+}
+
+/// [`build`], plus the G005 injection seam: an embedding host's
+/// [`StreamerLauncher`] (defaults to [`DefaultStreamerLauncher`]) and
+/// [`LifecycleSink`] (defaults to nothing listening).
+pub async fn build_with(
+    config: Config,
+    launcher: Option<LauncherHandle>,
+    lifecycle: Option<LifecycleSink>,
+) -> Result<BoundServer, anyhow::Error> {
     let app = App::new(config.clone()).await?;
     let app = Data::new(app);
     let limiter = Data::new(LoginLimiter::new());
+    let launcher: LauncherHandle = launcher.unwrap_or_else(|| Arc::new(DefaultStreamerLauncher));
+    let launcher = Data::new(launcher);
+    let lifecycle = Data::new(lifecycle);
 
     let bind_address = app.config().web_server.bind_address;
     let server = HttpServer::new({
         let url_path_prefix = config.web_server.url_path_prefix.clone();
         let app = app.clone();
         let limiter = limiter.clone();
+        let launcher = launcher.clone();
+        let lifecycle = lifecycle.clone();
 
         move || {
             ActixApp::new()
@@ -133,6 +226,8 @@ pub async fn build(config: Config) -> Result<BoundServer, anyhow::Error> {
                     scope(&url_path_prefix)
                         .app_data(app.clone())
                         .app_data(limiter.clone())
+                        .app_data(launcher.clone())
+                        .app_data(lifecycle.clone())
                         .wrap(
                             middleware::DefaultHeaders::new()
                                 .add((
@@ -218,13 +313,22 @@ impl Drop for EmbeddedServer {
 /// Bind and run the server on a dedicated thread. Returns once the bind
 /// completed (or failed) — the caller thread never touches actix.
 pub fn spawn_embedded(config: Config) -> Result<EmbeddedServer, anyhow::Error> {
+    spawn_embedded_with(config, None, None)
+}
+
+/// [`spawn_embedded`], plus the G005 injection seam — see [`build_with`].
+pub fn spawn_embedded_with(
+    config: Config,
+    launcher: Option<LauncherHandle>,
+    lifecycle: Option<LifecycleSink>,
+) -> Result<EmbeddedServer, anyhow::Error> {
     ensure_rustls_crypto_provider();
     let (tx, rx) = std::sync::mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("bp-web-server".into())
         .spawn(move || {
             actix_web::rt::System::new().block_on(async move {
-                match build(config).await {
+                match build_with(config, launcher, lifecycle).await {
                     Ok(bound) => {
                         let handle = bound.server.handle();
                         let _ = tx.send(Ok((bound.addrs, handle)));

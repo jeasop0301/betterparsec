@@ -20,8 +20,9 @@ import { WebRTCTransport } from "./transport/webrtc.js"
 import { allVideoCodecs, andVideoCodecs, createSupportedVideoFormatsBits, emptyVideoCodecs, getSelectedVideoCodec, hasAnyCodec, VideoCodecSupport } from "./video.js"
 import { VideoRenderer } from "./video/index.js"
 import { buildFecVideoPipeline, buildVideoPipeline, VideoPipelineOptions } from "./video/pipeline.js"
-import { FecDecodePipe } from "./video/fec_decode_pipe.js"
-import { encodeAck, SUBSCRIBE_MESSAGE, NEEDS_IDR_MESSAGE } from "./video/fec_wire.js"
+import { FecDecodePipe, FecPipeConfig } from "./video/fec_decode_pipe.js"
+import { resolveFecCapability, handleFecDataMessage } from "./video/fec_session.js"
+import { encodeAck, encodeNeedsIdrV2, encodeSubscribeV2, SUBSCRIBE_MESSAGE, NEEDS_IDR_MESSAGE } from "./video/fec_wire.js"
 import { QuOverlayDom } from "./video/qu_overlay.js"
 import { parseQuMessage, encodeSubscribe } from "./video/qu_wire.js"
 
@@ -139,6 +140,9 @@ export class Stream implements Component {
 
     private videoRenderer: VideoRenderer | null = null
     private audioPlayer: AudioPlayer | null = null
+    private fecPipe: FecDecodePipe | null = null
+    private fecAckChannel: RTCDataChannel | null = null
+    private fecConfig: FecPipeConfig | null = null
     // M4 cursor P1: only set when settings.mouseMode == "auto" and the
     // transport exposes a cursor channel — non-auto sessions never allocate
     // this (#5: no behavior change otherwise). Recreated in
@@ -301,6 +305,34 @@ export class Stream implements Component {
         this.eventTarget.dispatchEvent(event)
         this.startWatchdog()
     }
+    private configureFecFromCapabilities(capabilities: StreamCapabilities): boolean {
+        const resolution = resolveFecCapability(capabilities, this.fecPipe !== null)
+        if (resolution.kind === "fatal") {
+            this.debugLog(resolution.reason, { type: "fatal" })
+            return false
+        }
+        this.fecConfig = resolution.config
+        if (resolution.kind === "fallback") {
+            // Legacy/v1 (or capability omitted) with no local FEC pipe: createVideoRenderer()
+            // already fell back to the plain videotrack pipeline because video_fec channels
+            // were absent — that fallback is intentional and does not require FEC wiring.
+            return true
+        }
+        if (this.fecPipe) {
+            if (!this.fecPipe.configure(resolution.config)) {
+                this.debugLog("FEC pipeline rejected negotiated configuration", { type: "fatal" })
+                return false
+            }
+            this.sendFecSubscribe()
+        }
+        return true
+    }
+    private sendFecSubscribe() {
+        if (!this.fecAckChannel || this.fecAckChannel.readyState !== "open" || !this.fecConfig) return
+        this.fecAckChannel.send(this.fecConfig.version === 2
+            ? encodeSubscribeV2(this.fecConfig.epoch)
+            : SUBSCRIBE_MESSAGE)
+    }
 
     private async onMessage(message: StreamServerMessage) {
         if ("DebugLog" in message) {
@@ -321,6 +353,9 @@ export class Stream implements Component {
             const width = message.ConnectionComplete.width
             const height = message.ConnectionComplete.height
             const fps = message.ConnectionComplete.fps
+            if (this.settings.enableVideoFec && !this.configureFecFromCapabilities(capabilities)) {
+                return
+            }
 
             const audioSampleRate = message.ConnectionComplete.audio_sample_rate
             const audioChannelCount = message.ConnectionComplete.audio_channel_count
@@ -1126,6 +1161,9 @@ export class Stream implements Component {
             this.videoRenderer.cleanup()
             this.videoRenderer = null
         }
+        this.fecPipe = null
+        this.fecAckChannel = null
+        this.fecConfig = null
         if (!this.transport) {
             this.debugLog("Failed to setup video without transport")
             return null
@@ -1181,38 +1219,50 @@ export class Stream implements Component {
                     }
 
                     if (fecPipe) {
-                        // Wire ack: send encodeAck on the ack channel
+                        this.fecPipe = fecPipe
                         fecPipe.setOnAck((highest: number) => {
-                            fecAck.send(encodeAck(highest))
+                            const config = this.fecConfig
+                            if (config && fecAck.readyState === "open") {
+                                fecAck.send(config.version === 2 ? encodeAck(highest, config.epoch) : encodeAck(highest))
+                            }
                         })
                     }
 
                     videoRenderer.mount(this.divElement)
 
-                    // Send SUBSCRIBE to activate the host FEC sender.
-                    // Guard: check readyState in addition to the open event so
-                    // that re-setup calls (e.g. codec renegotiation) also send
-                    // SUBSCRIBE when the channel is already open.
-                    fecAck.addEventListener("open", () => {
-                        fecAck.send(SUBSCRIBE_MESSAGE)
-                    })
-                    if (fecAck.readyState === "open") {
-                        fecAck.send(SUBSCRIBE_MESSAGE)
-                    }
+                    this.fecAckChannel = fecAck
+                    fecAck.addEventListener("open", () => this.sendFecSubscribe())
+                    this.sendFecSubscribe()
 
                     // Receive FEC symbols from video_fec DataChannel
                     fecData.addEventListener("message", (event: MessageEvent) => {
-                        const buf: ArrayBuffer = event.data instanceof ArrayBuffer
-                            ? event.data
-                            : event.data.buffer
-                        this.markVideoReady()
-                        this.watchdogFrameReceived()
-                        videoRenderer.submitPacket(buf)
+                        // Only mark media-ready/watchdog heartbeat once the FEC pipe
+                        // has actually accepted and parsed this packet — not merely
+                        // received bytes. Blob-typed DataChannel payloads (or any
+                        // malformed/rejected symbol) must never count as a live
+                        // frame heartbeat, or the watchdog is fed through a black
+                        // screen (finding: fec_decode_pipe.ts submitPacket accepted
+                        // result / webrtc.ts binaryType).
+                        void (async () => {
+                            await handleFecDataMessage(
+                                event.data,
+                                (buf) => {
+                                    if (fecPipe) return fecPipe.submitPacket(buf)
+                                    videoRenderer.submitPacket(buf)
+                                    return true
+                                },
+                                () => {
+                                    this.markVideoReady()
+                                    this.watchdogFrameReceived()
+                                },
+                            )
 
-                        // After each symbol, check if IDR is needed
-                        if (videoRenderer.pollRequestIdr()) {
-                            fecAck.send(NEEDS_IDR_MESSAGE)
-                        }
+                            if (videoRenderer.pollRequestIdr() && fecAck.readyState === "open" && this.fecConfig) {
+                                fecAck.send(this.fecConfig.version === 2
+                                    ? encodeNeedsIdrV2(this.fecConfig.epoch, 1)
+                                    : NEEDS_IDR_MESSAGE)
+                            }
+                        })()
                     })
 
                     this.videoRenderer = videoRenderer
@@ -1391,6 +1441,7 @@ export class Stream implements Component {
             // Web keeps the RTP track as the primary video path (FEC is a
             // recovery aid) — never ask the streamer to skip the track.
             video_over_fec_only: false,
+            requested_fec_protocol_version: this.settings.enableVideoFec ? 2 : undefined,
         }
 
         const message: StreamClientMessage = {

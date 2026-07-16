@@ -16,6 +16,7 @@ mod audio;
 #[cfg(all(windows, feature = "video"))]
 mod cursor_icon;
 mod host;
+mod identity;
 #[cfg(all(windows, feature = "video"))]
 mod immersive;
 #[cfg(all(windows, feature = "video"))]
@@ -24,17 +25,20 @@ mod input;
 mod present;
 mod settings;
 mod sunshine;
+mod supervisor;
+mod update;
 #[cfg(feature = "video")]
 mod video;
 
 #[cfg(feature = "video")]
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use client_transport::capi::RxCore;
 use client_transport::flow::FlowConfig;
+use client_transport::frame_queue::VideoEvent;
 use client_transport::session::{Session, SessionConfig, SessionState};
 use client_transport::tls::ServerTrust;
 #[cfg(feature = "video")]
@@ -150,6 +154,16 @@ struct VideoShared {
     /// Live toggle from the shell UI; only takes effect while the raw D3D11
     /// present and hardware decode are both active. Default off (RGBA).
     nv12: AtomicBool,
+    /// G004: UI thread sets this when `Session::watchdog().decode_stall()`
+    /// latches; the frame-pump thread swaps it back to `false` and applies
+    /// [`DecodeState::on_decode_stall`] on the next loop iteration (cross-
+    /// thread signal — the pump owns the live FFmpeg `Decoder`, the UI
+    /// thread owns the watchdog readback).
+    decode_stall_pending: AtomicBool,
+    /// G004: same signal shape as `decode_stall_pending`, consumed by the
+    /// raw D3D11 present thread via the bounded `PresentStallLadder`
+    /// (`present.rs`).
+    present_stall_pending: AtomicBool,
 }
 
 #[cfg(feature = "video")]
@@ -160,13 +174,38 @@ impl VideoShared {
     }
 }
 
-/// Per-pump decoder state: FFmpeg decoder + IDR gating.
+/// Per-pump decoder state: FFmpeg decoder + generation-scoped key-frame
+/// recovery.
 #[cfg(feature = "video")]
 struct DecodeState {
     decoder: Option<video::Decoder>,
-    /// Skip deltas until the first IDR (re-armed after a decode error) so
-    /// the decoder never chews frames whose references it cannot have.
-    wait_for_key: bool,
+    /// Armed while waiting for a decoded key to clear recovery, `None` once
+    /// a real matching-epoch decoded key has cleared it. Armed on every
+    /// `VideoEvent::Discontinuity` (which also flushes the decoder) and
+    /// re-armed on a decode error; cleared *only* by [`Self::clears_recovery`]
+    /// — a real matching-epoch decoded key — never by packet submission or
+    /// presentation. A failed key packet, or a key packet FFmpeg swallows
+    /// without emitting a picture, never produces a `DecodeMeta` and so can
+    /// never reach that clear. The armed value is an epoch (see `epoch`
+    /// below); the RxCore recovery this is meant to ack is additionally
+    /// keyed by `recovery_generation`.
+    wait_for_key: Option<u32>,
+    /// RxCore recovery-generation this instance is currently tracking, or
+    /// `None` before any transport discontinuity has ever fired (the
+    /// initial mid-GOP-join gate has nothing to ack — see `on_meta`). Set
+    /// alongside `wait_for_key` by [`Self::on_discontinuity`]; acking by
+    /// generation (not epoch alone) is what stops an earlier same-epoch
+    /// discontinuity's key from closing a later one's recovery.
+    recovery_generation: Option<u64>,
+    /// Latest known transport epoch, or `None` before the very first unit
+    /// is ever admitted. Adopted from that first unit's epoch (mid-GOP
+    /// join, or a v2 negotiated session's first nonzero epoch — both arrive
+    /// with no preceding discontinuity, so `0` can't be assumed) rather than
+    /// hardcoded, then bumped by every later discontinuity. Units/decoder
+    /// output whose epoch doesn't match this predate the last reset and
+    /// must never reach the present path or the recovery-ack call — the
+    /// guard against stale output surviving a reset.
+    epoch: Option<u32>,
 }
 
 #[cfg(feature = "video")]
@@ -185,7 +224,90 @@ impl DecodeState {
         };
         Self {
             decoder,
-            wait_for_key: true,
+            // Mid-GOP join (reconnect onto a resumed Sunshine session, or a
+            // v2 negotiated session's first admitted unit): deltas keep
+            // flowing and nothing else ever asks for a key, so without this
+            // latch the session shows white forever (field report
+            // 2026-07-15) — armed from the very first unit, whatever its
+            // epoch turns out to be (see `admit_epoch`), same as before any
+            // transport discontinuity has ever fired.
+            wait_for_key: Some(0),
+            recovery_generation: None,
+            epoch: None,
+        }
+    }
+
+    /// A `VideoEvent::Discontinuity` arrived: flush the FFmpeg reference
+    /// chain (and any pending/drain output) and arm wait-for-key + the
+    /// tracked recovery generation for the new epoch. Must be applied — in
+    /// event order — before any later-queued frame is decoded, so a
+    /// stale-epoch frame already in-flight in the backlog never reaches
+    /// FFmpeg after the reset it predates.
+    fn on_discontinuity(&mut self, generation: u64, epoch: u32) {
+        self.epoch = Some(epoch);
+        if let Some(dec) = self.decoder.as_mut() {
+            dec.flush();
+        }
+        self.wait_for_key = Some(epoch);
+        self.recovery_generation = Some(generation);
+    }
+
+    /// Adopts `epoch` as the working epoch on the very first admitted unit
+    /// (mid-GOP join, or a v2 session's first nonzero epoch — both arrive
+    /// with no preceding discontinuity), re-keying an already-armed
+    /// `wait_for_key` to the adopted epoch so a real decoded key at that
+    /// epoch can actually clear it (a mismatched hardcoded epoch would
+    /// otherwise leave the gate latched forever). Returns `false` when
+    /// `epoch` predates the last reset (backlog to skip), `true` otherwise.
+    fn admit_epoch(&mut self, epoch: u32) -> bool {
+        match self.epoch {
+            None => {
+                self.epoch = Some(epoch);
+                if self.wait_for_key.is_some() {
+                    self.wait_for_key = Some(epoch);
+                }
+                true
+            }
+            Some(current) => current == epoch,
+        }
+    }
+
+    /// Pure decision, isolated from the RxCore/FFmpeg calls that act on
+    /// it: does this decoder output clear wait-for-key recovery? Only a
+    /// real decoded key (`meta.is_key`, derived from the AVFrame — never
+    /// the submitted packet's own flag) matching the currently armed
+    /// epoch qualifies. A failed key packet or a key packet that produced
+    /// no output never reaches this call at all (there is no `DecodeMeta`
+    /// to pass), so recovery stays latched by construction — this
+    /// function only ever sees real decoded output.
+    fn clears_recovery(armed: Option<u32>, meta: video::DecodeMeta) -> bool {
+        armed == Some(meta.epoch) && meta.is_key
+    }
+
+    /// Apply a real decoded-output [`video::DecodeMeta`] to recovery
+    /// state. When RxCore has an open recovery matching this instance's
+    /// tracked `(recovery_generation, epoch)`, only its
+    /// `acknowledge_decoded_key` succeeding clears the local latch —
+    /// matching stale/wrong-generation double-checks on the RxCore side.
+    /// When RxCore has no matching recovery open (the initial mid-GOP-join
+    /// gate, before any transport discontinuity has ever fired), there is
+    /// nothing to ack; the real decoded key still clears the local latch
+    /// directly.
+    fn on_meta(&mut self, core: &RxCore, meta: video::DecodeMeta) {
+        if !Self::clears_recovery(self.wait_for_key, meta) {
+            return;
+        }
+        match self.recovery_generation {
+            Some(generation) if core.recovery() == Some((generation, meta.epoch)) => {
+                if core.acknowledge_decoded_key(generation, meta.epoch, meta.frame_id) {
+                    self.wait_for_key = None;
+                    self.recovery_generation = None;
+                }
+            }
+            _ => {
+                self.wait_for_key = None;
+                self.recovery_generation = None;
+            }
         }
     }
 
@@ -196,19 +318,20 @@ impl DecodeState {
         egui_ctx: &eframe::egui::Context,
         unit: &DecodeUnit,
     ) {
-        let Some(dec) = self.decoder.as_mut() else {
+        if self.decoder.is_none() {
             return;
-        };
-        if self.wait_for_key && !unit.is_key {
-            // Mid-GOP join (reconnect onto a resumed Sunshine session):
-            // deltas keep flowing and nothing else ever asks for a key, so
-            // without this latch the session shows white forever (field
-            // report 2026-07-15). request_idr collapses into the next
-            // session tick's needs-IDR ack — safe to latch per skipped unit.
+        }
+        if !self.admit_epoch(unit.epoch) {
+            // Backlog left over from before the last reset — never
+            // decode/present it.
+            return;
+        }
+        if self.wait_for_key.is_some() && !unit.is_key {
+            // Deltas while armed are dropped and request a key, never fed
+            // to the decoder.
             core.request_idr();
             return;
         }
-        self.wait_for_key = false;
         // Opt-in GPU NV12 present: only when the raw D3D11 path and hardware
         // decode are active (software decode yields YUV420P, not NV12). Any
         // decode error falls through to the shared IDR-request handling.
@@ -221,15 +344,23 @@ impl DecodeState {
             && shared.raw_present_active()
             && shared.hw_device.load(Ordering::Relaxed)
             && shared.sharpen_pct.load(Ordering::Relaxed) == 0;
+        let dec = self.decoder.as_mut().expect("checked above");
         let decoded = if want_nv12 {
-            dec.decode_nv12(&unit.data)
-                .map(|o| o.map(video::DecodedFrame::Nv12))
+            dec.decode_nv12(unit.epoch, unit.frame_id, &unit.data)
+                .map(|o| o.map(|d| (d.frame, d.meta)))
         } else {
-            dec.decode(&unit.data)
-                .map(|o| o.map(video::DecodedFrame::Rgba))
+            dec.decode(unit.epoch, unit.frame_id, &unit.data)
+                .map(|o| o.map(|d| (video::DecodedFrame::Rgba(d.frame), d.meta)))
         };
         match decoded {
-            Ok(Some(frame)) => {
+            Ok(Some((frame, meta))) if Some(meta.epoch) == self.epoch => {
+                // G004 decoded-output heartbeat: fed exactly here, at the
+                // point FFmpeg actually produced a picture — never on
+                // packet submission (the `unit` this call received), so a
+                // stuck decoder that keeps accepting units but stops
+                // emitting pictures cannot fake liveness.
+                core.note_decoded_output();
+                self.on_meta(core, meta);
                 let (w, h) = frame.dims();
                 shared
                     .dims
@@ -244,10 +375,16 @@ impl DecodeState {
                     egui_ctx.request_repaint();
                 }
             }
-            Ok(None) => {}
+            // meta.epoch always equals unit.epoch (Decoder attaches the
+            // input unit's epoch verbatim, never derived from decoder
+            // state), and unit.epoch was already gated by `admit_epoch`
+            // above in this same synchronous call — this arm is defensive
+            // redundancy against that invariant changing, not a live race
+            // the single-threaded pump can actually hit.
+            Ok(Some(_)) | Ok(None) => {}
             Err(e) => {
                 shared.decode_errors.fetch_add(1, Ordering::Relaxed);
-                self.wait_for_key = true;
+                self.wait_for_key = self.epoch;
                 core.request_idr();
                 tracing::warn!(err = %e, frame_id = unit.frame_id, "decode failed — requesting IDR");
             }
@@ -255,23 +392,129 @@ impl DecodeState {
     }
 
     /// Advance the decoder over a stale unit without presenting it (skip
-    /// backlog): same IDR gating as [`Self::on_unit`], but the picture is
-    /// decoded and dropped instead of converted + published.
+    /// backlog): same epoch/IDR gating as [`Self::on_unit`], but the
+    /// picture is decoded and dropped instead of converted + published —
+    /// still reports its [`video::DecodeMeta`] so a real decoded key
+    /// hiding in the backlog still clears recovery.
     fn drop_unit(&mut self, core: &RxCore, shared: &VideoShared, unit: &DecodeUnit) {
-        let Some(dec) = self.decoder.as_mut() else {
+        if self.decoder.is_none() {
             return;
-        };
-        if self.wait_for_key && !unit.is_key {
+        }
+        if !self.admit_epoch(unit.epoch) {
+            return;
+        }
+        if self.wait_for_key.is_some() && !unit.is_key {
             core.request_idr();
             return;
         }
-        self.wait_for_key = false;
-        if let Err(e) = dec.decode_drop(&unit.data) {
-            shared.decode_errors.fetch_add(1, Ordering::Relaxed);
-            self.wait_for_key = true;
-            core.request_idr();
-            tracing::warn!(err = %e, frame_id = unit.frame_id, "decode(drop) failed — requesting IDR");
+        let dec = self.decoder.as_mut().expect("checked above");
+        match dec.decode_drop(unit.epoch, unit.frame_id, &unit.data) {
+            // Same defensive-redundancy note as `on_unit`: meta.epoch is
+            // always unit.epoch, already gated above.
+            Ok(Some(meta)) if Some(meta.epoch) == self.epoch => {
+                // Same heartbeat contract as `on_unit`: only a real
+                // decoded picture (backlog-drain path still decodes,
+                // never presents) feeds it.
+                core.note_decoded_output();
+                self.on_meta(core, meta);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                shared.decode_errors.fetch_add(1, Ordering::Relaxed);
+                self.wait_for_key = self.epoch;
+                core.request_idr();
+                tracing::warn!(err = %e, frame_id = unit.frame_id, "decode(drop) failed — requesting IDR");
+            }
         }
+    }
+
+    /// G004 `DecodeStall` consumption: the watchdog decided the decode
+    /// stage has stopped producing pictures despite units still flowing
+    /// (native decode wedged, or the reference chain corrupted). Reuses
+    /// the exact G002 flush+arm machinery `on_discontinuity` uses — flush
+    /// the FFmpeg reference chain and arm `wait_for_key` — but keyed off
+    /// the decode-side stall signal rather than a transport reset, so it
+    /// never bumps `recovery_generation` (there is no RxCore recovery to
+    /// open/ack for a purely decode-local stall) and requests an IDR
+    /// directly instead of waiting for the next delta packet to trigger
+    /// one via the existing `wait_for_key` gate in `on_unit`/`drop_unit`.
+    fn on_decode_stall(&mut self, core: &RxCore) {
+        if let Some(dec) = self.decoder.as_mut() {
+            dec.flush();
+        }
+        self.wait_for_key = self.epoch;
+        core.request_idr();
+    }
+}
+
+/// A step [`drain_newest`] fires while draining the backlog: either the
+/// unit that was `newest` before a later frame superseded it (to be
+/// decoded-and-dropped), or a discontinuity's `(generation, epoch)` (to be
+/// flushed/armed). One `on_event` closure carries both so callers needing a
+/// single `&mut` capture (the production pump, which mutates the same
+/// `DecodeState` either way) don't need two simultaneous closures over
+/// it.
+#[cfg(feature = "video")]
+enum DrainStep<'a> {
+    Dropped(&'a DecodeUnit),
+    /// A pre-reset unit abandoned by a poisoning reset: accounting-only —
+    /// it must never be decoded (unlike [`DrainStep::Dropped`]).
+    Poisoned(&'a DecodeUnit),
+    Reset(u64, u32),
+}
+
+/// Pure backlog-drain ordering used by the frame pump: given the just
+/// dequeued `first` frame and a pull-more-events closure, drains strictly
+/// in arrival order. A `Discontinuity` found mid-drain fires
+/// `on_event(DrainStep::Reset(generation, epoch))` (flush + re-arm)
+/// *before* any later frame is considered — the "process reset before later
+/// retained frame" contract. Critically, whatever was `newest` at that
+/// point is *poisoned*: it predates the reset and must never reach
+/// `on_event(DrainStep::Dropped(_))` (decode-and-drop) afterwards, even when
+/// the reset shares its epoch (most discontinuity reasons other than
+/// `EpochTransition` do) — decoding it now could otherwise let a pre-reset
+/// key wrongly ack the post-reset recovery generation, since the epoch gate
+/// alone can't tell the two apart. Poisoned units surface as
+/// `on_event(DrainStep::Poisoned(_))` (accounting-only, never decoded); the
+/// next frame after a reset becomes the new baseline outright. When the
+/// reset is the *last* drained event, no post-reset frame exists yet, so
+/// the function returns `None` and the caller decodes nothing this tick —
+/// the retained/next frame arrives as its own queue event. Free of
+/// FFmpeg/RxCore I/O — only closures — so the ordering is provable in a
+/// unit test without a live queue.
+#[cfg(feature = "video")]
+fn drain_newest(
+    first: DecodeUnit,
+    mut next_event: impl FnMut() -> Option<VideoEvent>,
+    mut on_event: impl FnMut(DrainStep<'_>),
+) -> Option<DecodeUnit> {
+    let mut newest = first;
+    let mut poisoned = false;
+    loop {
+        match next_event() {
+            Some(VideoEvent::Frame(next)) => {
+                if poisoned {
+                    on_event(DrainStep::Poisoned(&newest));
+                    poisoned = false;
+                } else {
+                    on_event(DrainStep::Dropped(&newest));
+                }
+                newest = next;
+            }
+            Some(VideoEvent::Discontinuity {
+                generation, epoch, ..
+            }) => {
+                on_event(DrainStep::Reset(generation, epoch));
+                poisoned = true;
+            }
+            None => break,
+        }
+    }
+    if poisoned {
+        on_event(DrainStep::Poisoned(&newest));
+        None
+    } else {
+        Some(newest)
     }
 }
 
@@ -360,8 +603,26 @@ impl Running {
                     #[cfg(not(feature = "video"))]
                     let _ = &egui_ctx;
                     loop {
-                        match core.wait_frame(Duration::from_millis(250)) {
-                            Some(unit) => {
+                        // G004 `DecodeStall` consumption: cross-thread
+                        // signal from the UI-thread watchdog readback (see
+                        // `VideoShared::decode_stall_pending`) — checked
+                        // every iteration, so at least every
+                        // `wait_event` timeout (250 ms) even with no unit
+                        // flowing.
+                        #[cfg(feature = "video")]
+                        if video.decode_stall_pending.swap(false, Ordering::AcqRel) {
+                            decode.on_decode_stall(&core);
+                        }
+                        match core.wait_event(Duration::from_millis(250)) {
+                            Some(VideoEvent::Discontinuity {
+                                generation, epoch, ..
+                            }) => {
+                                #[cfg(feature = "video")]
+                                decode.on_discontinuity(generation, epoch);
+                                #[cfg(not(feature = "video"))]
+                                let _ = (generation, epoch);
+                            }
+                            Some(VideoEvent::Frame(unit)) => {
                                 let now = Instant::now();
                                 #[cfg(feature = "video")]
                                 {
@@ -374,24 +635,48 @@ impl Running {
                                             .payload_bytes
                                             .fetch_add(u.data.len() as u64, Ordering::Relaxed);
                                     };
-                                    account(&unit);
                                     // Skip stale backlog: decode older queued
                                     // units to keep the reference chain current
                                     // but only convert + present the newest, so
                                     // presentation latency never accumulates when
                                     // download/convert briefly falls behind 60 fps.
-                                    let mut newest = unit;
-                                    while let Some(next) = core.try_frame() {
-                                        account(&next);
-                                        decode.drop_unit(&core, &video, &newest);
-                                        newest = next;
-                                    }
-                                    stats.last_frame_ms.store(
-                                        now.duration_since(started).as_millis() as u64,
-                                        Ordering::Relaxed,
+                                    // Ordered: a Discontinuity found mid-drain
+                                    // flushes+arms immediately, before any later
+                                    // frame in the backlog is considered — never
+                                    // skipped/coalesced across the reset.
+                                    // `account` runs exactly once per frame: in
+                                    // `Dropped`/`Poisoned` for every superseded
+                                    // or abandoned unit, and once more here for
+                                    // whichever unit survives as `newest` —
+                                    // accounting it up front instead would
+                                    // double-count it if it later got superseded
+                                    // while the frame that actually presents
+                                    // would never be accounted at all.
+                                    let newest = drain_newest(
+                                        unit,
+                                        || core.try_event(),
+                                        |step| match step {
+                                            DrainStep::Reset(generation, epoch) => {
+                                                decode.on_discontinuity(generation, epoch);
+                                            }
+                                            DrainStep::Dropped(u) => {
+                                                account(u);
+                                                decode.drop_unit(&core, &video, u);
+                                            }
+                                            // Pre-reset unit killed by a reset:
+                                            // accounted but never decoded.
+                                            DrainStep::Poisoned(u) => account(u),
+                                        },
                                     );
-                                    fps.push(now);
-                                    decode.on_unit(&core, &video, &egui_ctx, &newest);
+                                    if let Some(newest) = newest {
+                                        stats.last_frame_ms.store(
+                                            now.duration_since(started).as_millis() as u64,
+                                            Ordering::Relaxed,
+                                        );
+                                        fps.push(now);
+                                        account(&newest);
+                                        decode.on_unit(&core, &video, &egui_ctx, &newest);
+                                    }
                                 }
                                 #[cfg(not(feature = "video"))]
                                 {
@@ -549,6 +834,13 @@ struct App {
     /// session ("both" is the LAN-party topology).
     host: Option<host::Host>,
     host_error: Option<String>,
+    /// G006 fix: background host-boot in progress. `App::new`, the role
+    /// switch, and "Restart host" spawn `host::start` on a worker thread
+    /// (`App::start_host`) instead of blocking the UI thread for up to
+    /// 20s (see `host::start`/supervisor ready-wait docs); each frame
+    /// polls this receiver non-blockingly (`App::poll_host_starting`) and
+    /// applies the result once it lands.
+    host_starting: Option<mpsc::Receiver<Result<host::Host, String>>>,
     /// Uploaded stream texture (egui fallback present, slice 2).
     #[cfg(feature = "video")]
     video_tex: Option<eframe::egui::TextureHandle>,
@@ -594,7 +886,7 @@ impl App {
         #[cfg(all(windows, feature = "video"))]
         let client_cursor_pref = std::env::var("BP_CLIENT_CURSOR").is_ok_and(|v| v == "1")
             || settings.client.client_cursor;
-        Self {
+        let mut app = Self {
             host_id_text: form.host_id.to_string(),
             app_id_text: form.app_id.to_string(),
             form,
@@ -602,6 +894,7 @@ impl App {
             running: None,
             host: None,
             host_error: None,
+            host_starting: None,
             #[cfg(feature = "video")]
             video_tex: None,
             #[cfg(feature = "video")]
@@ -626,6 +919,81 @@ impl App {
                 .min(100),
             #[cfg(all(windows, feature = "video"))]
             audio_exclusive: std::env::var("BP_AUDIO_EXCLUSIVE").as_deref() == Ok("1"),
+        };
+        // G006 fix: role=host/both makes the host role automatic/always-on
+        // — boot it here instead of waiting for a manual click. The boot
+        // itself runs on a background thread (`App::start_host` spawns
+        // it), so this never blocks the client shell's first frame; a
+        // boot failure surfaces through the existing `host_error` banner
+        // once the worker thread's result lands (`poll_host_starting`),
+        // exactly like a manual start failure.
+        if host::role_wants_host(app.settings.role) {
+            app.start_host();
+        }
+        app
+    }
+
+    /// Start the host role on a background thread and stash the result
+    /// receiver in `host_starting` — the one seam both the automatic
+    /// role-driven boot ([`App::new`]) and the manual restart control
+    /// ([`App::host_section`]) call through, so they can never drift.
+    /// `host::start` can block for up to ~20s (Foundation ready-wait), so
+    /// this must never run on the UI thread; [`App::poll_host_starting`]
+    /// (called every frame) is what actually applies the outcome to
+    /// `self.host`/`self.host_error`.
+    fn start_host(&mut self) {
+        if self.host_starting.is_some() {
+            // A boot is already in flight. Replacing the receiver would
+            // orphan the first boot's Host once it lands (bound port plus
+            // server/monitor threads with nothing left to stop them) and
+            // the second boot would then fail its port bind. The pending
+            // delivery is applied — or stopped, if the role has flipped
+            // away meanwhile — by `poll_host_starting`.
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.host_starting = Some(rx);
+        let settings = self.settings.clone();
+        let spawned = std::thread::Builder::new()
+            .name("bp-host-boot".into())
+            .spawn(move || {
+                let result = host::start(std::path::Path::new(host::DEFAULT_CONFIG_PATH), &settings);
+                let _ = tx.send(result);
+            });
+        if let Err(e) = spawned {
+            tracing::error!(err = %e, "failed to spawn host boot thread");
+            self.host_error = Some(format!("failed to spawn host boot thread: {e}"));
+            self.host_starting = None;
+        }
+    }
+
+    /// Non-blocking poll of an in-flight background host boot (if any),
+    /// applying the result to `self.host`/`self.host_error` exactly once
+    /// it lands — called every frame from [`eframe::App::update`].
+    fn poll_host_starting(&mut self) {
+        let Some(rx) = &self.host_starting else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(h)) => {
+                self.host_starting = None;
+                let install = host::role_wants_host(self.settings.role) && self.host.is_none();
+                if install {
+                    self.host_error = None;
+                }
+                apply_host_delivery(install, h, &mut self.host, host::Host::stop);
+            }
+            Ok(Err(e)) => {
+                tracing::error!(err = %e, "host role start failed");
+                self.host_error = Some(e);
+                self.host_starting = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                tracing::error!("host boot thread vanished without a result");
+                self.host_error = Some("host boot thread vanished without a result".into());
+                self.host_starting = None;
+            }
         }
     }
 
@@ -763,31 +1131,84 @@ impl App {
         }
     }
 
-    /// Host role strip (D1): start/stop the embedded web-server. Rendered
-    /// on every screen — hosting and a client session may run together.
+    /// Role selector (G006): client/host/both, persisted to
+    /// `settings.role`. Selecting host/both is what makes the host role
+    /// automatic — the actual boot/stop happens via
+    /// [`host::role_transition`]'s decision, applied right after the
+    /// combo box, never touching `self.running` (the client session).
+    fn role_label(role: settings::Role) -> &'static str {
+        match role {
+            settings::Role::Client => "Client",
+            settings::Role::Host => "Host",
+            settings::Role::Both => "Both",
+        }
+    }
+
+    /// Host role strip (D1) + G006 status panel. Rendered on every
+    /// screen — hosting and a client session may run together (role
+    /// "both" is the LAN-party topology); the role switch never reaches
+    /// into `self.running`.
     fn host_section(&mut self, ui: &mut eframe::egui::Ui) {
-        let mut start_clicked = false;
-        let mut stop_clicked = false;
-        ui.horizontal(|ui| match &mut self.host {
+        use eframe::egui;
+
+        let old_role = self.settings.role;
+        let mut new_role = old_role;
+        ui.horizontal(|ui| {
+            ui.label("Role");
+            egui::ComboBox::from_id_salt("role-select")
+                .selected_text(Self::role_label(new_role))
+                .show_ui(ui, |ui| {
+                    for role in [settings::Role::Client, settings::Role::Host, settings::Role::Both]
+                    {
+                        ui.selectable_value(&mut new_role, role, Self::role_label(role));
+                    }
+                });
+        });
+        if new_role != old_role {
+            self.settings.role = new_role;
+            if let Err(e) = settings::save(&self.settings) {
+                tracing::warn!(err = %e, "settings store save failed");
+                self.host_error = Some(format!("settings store save failed: {e}"));
+            }
+            apply_role_action(
+                host::role_transition(old_role, new_role),
+                self,
+                |app| app.start_host(),
+                |app| {
+                    if let Some(h) = app.host.take() {
+                        h.stop();
+                    }
+                },
+            );
+        }
+
+        let wants_host = host::role_wants_host(self.settings.role);
+        let mut restart_clicked = false;
+        match &self.host {
             None => {
-                start_clicked = ui.button("Start host").clicked();
-                ui.small("embedded web-server (accounts/pairing/signaling)");
+                if self.host_starting.is_some() {
+                    if wants_host {
+                        ui.small("host starting…");
+                    } else {
+                        // Role flipped away mid-boot; the delivery will be
+                        // stopped by poll_host_starting when it lands.
+                        ui.small("winding down a pending host boot…");
+                    }
+                } else if wants_host {
+                    // Automatic boot failed or hasn't run yet this tick
+                    // — the manual restart control the spec asks for.
+                    restart_clicked = ui.button("Retry host start").clicked();
+                } else {
+                    ui.small("host role off (switch to Host or Both to enable)");
+                }
             }
             Some(h) => {
-                stop_clicked = ui.button("Stop host").clicked();
-                let sunshine = match (&mut h.sunshine, &h.sunshine_error) {
-                    (Some(s), _) => {
-                        if s.is_running() {
-                            format!("sunshine pid {} port {}", s.pid(), s.port)
-                        } else {
-                            "sunshine EXITED — stop/start host".into()
-                        }
-                    }
-                    (None, Some(_)) => "sunshine FAILED (see below)".into(),
-                    (None, None) => "no sunshine (set BP_SUNSHINE_STAGE)".into(),
-                };
+                restart_clicked = ui
+                    .add_enabled(self.host_starting.is_none(), egui::Button::new("Restart host"))
+                    .clicked();
+                let snapshot = h.foundation_health();
                 ui.label(format!(
-                    "hosting on {} ({}) — {}",
+                    "hosting on {} ({}) — sunshine: {} (restarts: {})",
                     h.server
                         .addrs()
                         .iter()
@@ -798,33 +1219,91 @@ impl App {
                         host::ConfigSource::File => format!("config: {}", h.config_path.display()),
                         host::ConfigSource::BuiltinDefault => "default config".into(),
                     },
-                    sunshine,
+                    host::health_state_label(snapshot.state),
+                    snapshot.restarts_in_window,
                 ));
-            }
-        });
-        if let Some(h) = &self.host
-            && let Some(e) = &h.sunshine_error
-        {
-            ui.colored_label(eframe::egui::Color32::YELLOW, format!("sunshine: {e}"));
-        }
-        if start_clicked {
-            match host::start(std::path::Path::new(host::DEFAULT_CONFIG_PATH)) {
-                Ok(h) => {
-                    self.host = Some(h);
-                    self.host_error = None;
+                if let Some(pid) = snapshot.foundation_pid {
+                    ui.small(format!("sunshine pid {pid}"));
                 }
-                Err(e) => {
-                    tracing::error!(err = %e, "host role start failed");
-                    self.host_error = Some(e);
+                if let Some(addr) = h.server.addrs().first() {
+                    ui.small(format!("pairing: {}", host::pairing_hint(*addr, h.https)));
+                }
+                ui.small(format!(
+                    "logs: {}",
+                    self.settings.host.paths.logs_dir.display()
+                ));
+                let update_status = update::cached_status(
+                    &update::staged_dir(&self.settings.host.paths.updates_dir),
+                    &update::manifest_path(&self.settings.host.paths.updates_dir),
+                );
+                if matches!(update_status, update::UpdateStatus::Checking) {
+                    // A background verify is in flight; keep repainting so
+                    // the settled result appears without input events.
+                    ui.ctx().request_repaint_after(Duration::from_millis(250));
+                }
+                ui.small(format!("update: {}", update_status.status_line()));
+                let session_events = h.recent_streamer_events();
+                if !session_events.is_empty() {
+                    ui.small("recent sessions:");
+                    for event in session_events.iter().rev().take(5) {
+                        ui.small(host::format_lifecycle_event(event));
+                    }
+                }
+                if let Some(e) = &snapshot.last_error {
+                    ui.colored_label(eframe::egui::Color32::YELLOW, format!("sunshine: {e}"));
                 }
             }
         }
-        if stop_clicked && let Some(h) = self.host.take() {
-            h.stop();
+        if restart_clicked {
+            if let Some(h) = self.host.take() {
+                h.stop();
+            }
+            self.start_host();
         }
         if let Some(e) = &self.host_error {
             ui.colored_label(eframe::egui::Color32::RED, format!("host: {e}"));
         }
+    }
+}
+/// G006 finding-2 fix: the one seam that turns a [`host::RoleAction`]
+/// into a mutation on whatever "host slot" a caller has — the production
+/// `App::host_section` role switch (`slot` = `&mut App`, mutating
+/// `App::host`/`App::host_starting` through `start_host`) and the
+/// `g006_role_tests::RoleHarness` isolation harness (`slot` = a bare
+/// `bool` stand-in) both call through this exact dispatch, so they
+/// cannot drift apart. `start`/`stop` are `FnOnce(&mut T)` rather than
+/// closures over `self`, precisely so two closures can be constructed at
+/// the call site without both trying to hold `self` mutably at once —
+/// only the one the `action` selects ever actually runs.
+fn apply_role_action<T>(
+    action: host::RoleAction,
+    slot: &mut T,
+    start: impl FnOnce(&mut T),
+    stop: impl FnOnce(&mut T),
+) {
+    match action {
+        host::RoleAction::StartHost => start(slot),
+        host::RoleAction::StopHost => stop(slot),
+        host::RoleAction::NoChange => {}
+    }
+}
+
+/// Applies a background host-boot delivery ([`App::poll_host_starting`]):
+/// the delivered instance is installed only when `install` is true (the
+/// current role still wants a host AND the slot is empty); otherwise it is
+/// stopped immediately, so a role flip during the boot window can never
+/// leave a host running under a client-only role and an occupied slot is
+/// never silently replaced (the late duplicate is torn down instead).
+fn apply_host_delivery<T>(
+    install: bool,
+    delivered: T,
+    slot: &mut Option<T>,
+    stop: impl FnOnce(T),
+) {
+    if install {
+        *slot = Some(delivered);
+    } else {
+        stop(delivered);
     }
 }
 
@@ -835,8 +1314,12 @@ impl eframe::App for App {
         #[cfg(not(all(windows, feature = "video")))]
         let _ = &frame;
 
-        // Live counters need continuous repaint while connected.
-        if self.running.is_some() {
+        self.poll_host_starting();
+
+        // Live counters need continuous repaint while connected; a
+        // pending host boot also needs it so the "host starting…" panel
+        // notices the background thread's result promptly.
+        if self.running.is_some() || self.host_starting.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
@@ -900,6 +1383,24 @@ impl eframe::App for App {
                     // with the web wiring's document-hidden pause).
                     run.session
                         .set_watchdog_paused(ctx.input(|i| i.viewport().minimized.unwrap_or(false)));
+                    // G004: propagate the typed decode/present stall
+                    // rungs to the threads that own the resources able to
+                    // act on them (the pump thread owns the live
+                    // `Decoder`, the raw present thread owns the D3D11
+                    // device) — the UI thread only reads the watchdog and
+                    // relays it, edge-triggered, via `VideoShared`.
+                    #[cfg(feature = "video")]
+                    if run.session.watchdog().poll_decode_stall().is_some() {
+                        run.video
+                            .decode_stall_pending
+                            .store(true, Ordering::Release);
+                    }
+                    #[cfg(all(windows, feature = "video"))]
+                    if run.session.watchdog().poll_present_stall().is_some() {
+                        run.video
+                            .present_stall_pending
+                            .store(true, Ordering::Release);
+                    }
                     // Terminal watchdog rung: the session ended itself
                     // after the full ladder — rebuild below (web parity).
                     let watchdog_reconnect = state == SessionState::Failed
@@ -1047,6 +1548,7 @@ impl eframe::App for App {
                                         Some(parent) => match present::StreamSurface::create(
                                             parent,
                                             run.video.clone(),
+                                            run.core.clone(),
                                             self.want_10bit_pref(),
                                         ) {
                                             Ok(mut s) => {
@@ -1260,6 +1762,15 @@ impl eframe::App for App {
                                         ),
                                         egui::Color32::WHITE,
                                     );
+                                    // G004 present-success heartbeat, egui
+                                    // fallback path: fed exactly here, at
+                                    // the actual paint call that puts
+                                    // pixels on screen — never at texture
+                                    // upload/conversion above, so a stuck
+                                    // egui repaint (window occluded,
+                                    // viewport not drawing) cannot fake
+                                    // present liveness either.
+                                    run.core.note_presented();
                                 }
                             }
                         }
@@ -1315,5 +1826,541 @@ fn parent_hwnd(frame: &eframe::Frame) -> Option<isize> {
     match frame.window_handle().ok()?.as_raw() {
         RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
         _ => None,
+    }
+}
+
+/// G002/G004 state-machine tests: pure/mockable, no FFmpeg I/O (RxCore
+/// itself is pure in-memory state, exercised directly). Cover the
+/// flush/reset, failed-or-no-output-key-never-clears, stale-epoch,
+/// successful-key-ack and overflow-reset-before-frame contracts directly
+/// against [`DecodeState`]'s decision functions and [`drain_newest`]'s
+/// ordering, plus G004's `DecodeStall` consumption
+/// ([`DecodeState::on_decode_stall`]) and the decoded-output heartbeat's
+/// submission-cannot-fake-it guarantee.
+#[cfg(all(test, feature = "video"))]
+mod g002_recovery_tests {
+    use super::*;
+
+    fn meta(epoch: u32, frame_id: u32, is_key: bool) -> video::DecodeMeta {
+        video::DecodeMeta {
+            epoch,
+            frame_id,
+            is_key,
+        }
+    }
+
+    fn unit(epoch: u32, frame_id: u32, is_key: bool) -> DecodeUnit {
+        DecodeUnit {
+            frame_id,
+            epoch,
+            is_key,
+            timestamp_us: 0,
+            duration_us: 0,
+            data: Vec::new(),
+        }
+    }
+
+    // ── successful key ack ──────────────────────────────────────────────
+
+    #[test]
+    fn clears_recovery_only_for_matching_epoch_real_key() {
+        assert!(DecodeState::clears_recovery(Some(3), meta(3, 10, true)));
+    }
+
+    #[test]
+    fn clears_recovery_false_when_not_armed() {
+        assert!(!DecodeState::clears_recovery(None, meta(3, 10, true)));
+    }
+
+    // ── stale epoch output ──────────────────────────────────────────────
+
+    #[test]
+    fn clears_recovery_false_for_stale_epoch() {
+        // Armed for epoch 3, but the decoded output is tagged epoch 2 (a
+        // reset raced the decode) — must never clear recovery for the
+        // *current* epoch based on stale-epoch output.
+        assert!(!DecodeState::clears_recovery(Some(3), meta(2, 10, true)));
+    }
+
+    // ── failed / no-output key never clears recovery ────────────────────
+
+    #[test]
+    fn on_meta_clears_local_latch_without_ack_when_no_recovery_open() {
+        // Fresh RxCore: recovery() is None (no Discontinuity ever fired) —
+        // a real decoded key still clears the local mid-GOP-join latch even
+        // though there is nothing for RxCore to ack.
+        let core = RxCore::new(0);
+        let mut st = DecodeState {
+            decoder: None,
+            wait_for_key: Some(0),
+            recovery_generation: None,
+            epoch: Some(0),
+        };
+        st.on_meta(&core, meta(0, 42, true));
+        assert_eq!(st.wait_for_key, None);
+    }
+
+    #[test]
+    fn on_meta_never_clears_latch_for_non_key_output() {
+        // `Decoder::decode`/`decode_drop` return `Ok(None)`/`Err` for a
+        // failed or output-less key packet — there is no `DecodeMeta` to
+        // construct in that case, so `on_meta` is never even called; the
+        // armed state is untouched by construction. This test exercises
+        // the adjacent case that *is* callable — a decoded delta output —
+        // to prove `on_meta` itself never clears the latch for non-key
+        // metadata either.
+        let core = RxCore::new(0);
+        let mut st = DecodeState {
+            decoder: None,
+            wait_for_key: Some(0),
+            recovery_generation: None,
+            epoch: Some(0),
+        };
+        st.on_meta(&core, meta(0, 42, false));
+        assert_eq!(
+            st.wait_for_key,
+            Some(0),
+            "non-key meta must never clear recovery"
+        );
+    }
+
+    #[test]
+    fn delta_is_key_false_never_clears_recovery_even_if_mislabelled() {
+        // A packet claiming `is_key: false` can never clear recovery
+        // regardless of epoch match — only real decoded-key metadata
+        // (`meta.is_key`) does, never the submitted packet's own flag.
+        assert!(!DecodeState::clears_recovery(Some(3), meta(3, 10, false)));
+    }
+
+    // ── flush/reset arms the new epoch + recovery generation ────────────
+
+    #[test]
+    fn discontinuity_arms_wait_for_key_for_new_epoch() {
+        // `on_discontinuity` needs a live `Decoder`, which needs FFmpeg;
+        // exercise the epoch/arm bookkeeping directly without one by
+        // constructing the struct fields it touches.
+        let mut st = DecodeState {
+            decoder: None,
+            wait_for_key: None,
+            recovery_generation: None,
+            epoch: Some(4),
+        };
+        st.on_discontinuity(11, 7);
+        assert_eq!(st.epoch, Some(7));
+        assert_eq!(st.wait_for_key, Some(7));
+        assert_eq!(st.recovery_generation, Some(11));
+    }
+
+    // ── G004: DecodeStall consumption ────────────────────────────────────
+
+    #[test]
+    fn on_decode_stall_arms_wait_for_key_and_requests_idr_without_a_generation() {
+        let core = RxCore::new(0);
+        let mut st = DecodeState {
+            decoder: None,
+            wait_for_key: None,
+            recovery_generation: Some(3), // pre-existing, must survive untouched
+            epoch: Some(7),
+        };
+        st.on_decode_stall(&core);
+        assert_eq!(
+            st.wait_for_key,
+            Some(7),
+            "armed for the current epoch, same shape as on_discontinuity's arm"
+        );
+        assert_eq!(
+            st.recovery_generation,
+            Some(3),
+            "a decode-local stall never opens/bumps an RxCore recovery generation \
+             — unlike on_discontinuity, there is no transport reset to track"
+        );
+        assert!(
+            core.poll_needs_idr(),
+            "must request an IDR directly rather than waiting for the next delta"
+        );
+    }
+
+    #[test]
+    fn on_decode_stall_arms_none_when_no_epoch_seen_yet() {
+        // Mirrors `on_meta`'s "nothing to ack" branch: before the first
+        // unit is ever admitted, `epoch` is `None` — arming stays `None`
+        // too (there is no epoch yet for a later real key to match), but
+        // the IDR request still fires so the stalled stream unwedges as
+        // soon as a key arrives.
+        let core = RxCore::new(0);
+        let mut st = DecodeState {
+            decoder: None,
+            wait_for_key: None,
+            recovery_generation: None,
+            epoch: None,
+        };
+        st.on_decode_stall(&core);
+        assert_eq!(st.wait_for_key, None);
+        assert!(core.poll_needs_idr());
+    }
+
+    // ── G004: decoded-output heartbeat cannot be faked by submission ────
+
+    #[test]
+    fn on_unit_never_feeds_decoded_heartbeat_without_reaching_the_decoder() {
+        // No live `Decoder` at all: `on_unit` returns before it could
+        // ever observe real FFmpeg output. Submitting a unit alone must
+        // never bump the heartbeat counter.
+        let core = RxCore::new(0);
+        let shared = VideoShared::default();
+        let egui_ctx = eframe::egui::Context::default();
+        let mut st = DecodeState {
+            decoder: None,
+            wait_for_key: None,
+            recovery_generation: None,
+            epoch: Some(0),
+        };
+        st.on_unit(&core, &shared, &egui_ctx, &unit(0, 1, true));
+        assert_eq!(core.decoded_output_count(), 0);
+    }
+
+    #[test]
+    fn on_unit_never_feeds_decoded_heartbeat_for_a_delta_gated_while_armed() {
+        // A delta packet while `wait_for_key` is armed is dropped and an
+        // IDR requested *before the decoder ever runs* (queueing/
+        // submission only) — the heartbeat must stay at zero. A live
+        // `Decoder` (FFmpeg links unconditionally, no `FFMPEG_DIR`
+        // needed — same as `video.rs`'s `decoder_initializes_hw_or_sw`)
+        // so this actually exercises the gate ahead of `decode()`,
+        // instead of short-circuiting on the "no decoder at all" case
+        // already covered by the sibling test above.
+        let core = RxCore::new(0);
+        let shared = VideoShared::default();
+        let egui_ctx = eframe::egui::Context::default();
+        let mut st = DecodeState {
+            decoder: Some(video::Decoder::new().expect("decoder init")),
+            wait_for_key: Some(0),
+            recovery_generation: None,
+            epoch: Some(0),
+        };
+        st.on_unit(&core, &shared, &egui_ctx, &unit(0, 2, false));
+        assert_eq!(core.decoded_output_count(), 0);
+        assert!(
+            core.poll_needs_idr(),
+            "still requests a key on the gated delta"
+        );
+    }
+
+    #[test]
+    fn drop_unit_never_feeds_decoded_heartbeat_for_stale_epoch_backlog() {
+        // `admit_epoch` rejects backlog predating the last reset before
+        // the decoder is touched — never-decoded backlog must never feed
+        // the heartbeat either.
+        let core = RxCore::new(0);
+        let shared = VideoShared::default();
+        let mut st = DecodeState {
+            decoder: None,
+            wait_for_key: None,
+            recovery_generation: None,
+            epoch: Some(5),
+        };
+        st.drop_unit(&core, &shared, &unit(4, 9, true));
+        assert_eq!(core.decoded_output_count(), 0);
+    }
+
+    // ── B1: adoptive first epoch (mid-GOP join / v2 nonzero first epoch) ──
+
+    #[test]
+    fn admit_epoch_adopts_first_unit_epoch_instead_of_assuming_zero() {
+        // A v2 negotiated session's first admitted unit can carry any
+        // nonzero epoch with no preceding discontinuity (VideoReceiver's
+        // own `active_epoch` starts unset and silently accepts the first
+        // epoch it sees — see `accept_epoch` in transport-core). DecodeState
+        // must adopt it, not assume 0, or every such unit is silently
+        // dropped forever by the stale-epoch guard in `on_unit`/`drop_unit`.
+        let mut st = DecodeState {
+            decoder: None,
+            wait_for_key: Some(0),
+            recovery_generation: None,
+            epoch: None,
+        };
+        assert!(st.admit_epoch(7), "first-ever unit is always admitted");
+        assert_eq!(st.epoch, Some(7));
+        assert_eq!(
+            st.wait_for_key,
+            Some(7),
+            "the mid-GOP-join gate must re-key to the adopted epoch, not stay latched at 0"
+        );
+        // A later unit at the same (adopted) epoch is admitted; one at a
+        // different epoch (backlog predating a reset not yet observed) is
+        // not.
+        assert!(st.admit_epoch(7));
+        assert!(!st.admit_epoch(8));
+    }
+
+    // ── B2: same-epoch reset poisons the pre-reset unit ──────────────────
+
+    #[test]
+    fn drain_newest_processes_reset_before_later_retained_frame() {
+        let mut order: Vec<String> = Vec::new();
+        let first = unit(0, 1, false);
+        let f2 = unit(0, 2, false);
+        let f3 = unit(1, 3, false);
+        let mut events: std::collections::VecDeque<VideoEvent> = [
+            VideoEvent::Frame(f2),
+            VideoEvent::Discontinuity {
+                generation: 1,
+                epoch: 1,
+                reason: transport_core::video_rx::DiscontinuityReason::EpochTransition,
+            },
+            VideoEvent::Frame(f3),
+        ]
+        .into();
+        let result = drain_newest(
+            first,
+            || events.pop_front(),
+            |step| match step {
+                DrainStep::Reset(generation, epoch) => {
+                    order.push(format!("reset:{generation}:{epoch}"))
+                }
+                DrainStep::Dropped(u) => order.push(format!("drop:{}", u.frame_id)),
+                DrainStep::Poisoned(u) => order.push(format!("poison:{}", u.frame_id)),
+            },
+        );
+        assert_eq!(
+            order,
+            vec![
+                "drop:1".to_string(),
+                "reset:1:1".to_string(),
+                "poison:2".to_string(),
+            ],
+            "unit 2 (newest when the reset arrived) is poisoned — accounted but never Dropped"
+        );
+        let result = result.expect("a post-reset frame survives");
+        assert_eq!(result.frame_id, 3);
+        assert_eq!(result.epoch, 1);
+    }
+
+    #[test]
+    fn drain_newest_poisons_the_pre_reset_unit_across_a_same_epoch_reset() {
+        // The aliasing case: a same-epoch reset (e.g. QueueOverflow —
+        // production never bumps the epoch for it) must still poison
+        // whatever was `newest` at that point. The epoch gate alone cannot
+        // tell a same-epoch pre-reset unit apart from a legitimate
+        // post-reset one, so without poisoning, unit 2 would wrongly reach
+        // `Dropped` (decode-and-drop) after the reset and could ack the
+        // post-reset recovery generation with a pre-reset key.
+        let mut order: Vec<String> = Vec::new();
+        let first = unit(0, 1, false);
+        let f2 = unit(0, 2, false);
+        let f3 = unit(0, 3, false); // same epoch as both `first` and the reset
+        let mut events: std::collections::VecDeque<VideoEvent> = [
+            VideoEvent::Frame(f2),
+            VideoEvent::Discontinuity {
+                generation: 5,
+                epoch: 0,
+                reason: transport_core::video_rx::DiscontinuityReason::QueueOverflow,
+            },
+            VideoEvent::Frame(f3),
+        ]
+        .into();
+        let result = drain_newest(
+            first,
+            || events.pop_front(),
+            |step| match step {
+                DrainStep::Reset(generation, epoch) => {
+                    order.push(format!("reset:{generation}:{epoch}"))
+                }
+                DrainStep::Dropped(u) => order.push(format!("drop:{}", u.frame_id)),
+                DrainStep::Poisoned(u) => order.push(format!("poison:{}", u.frame_id)),
+            },
+        );
+        assert_eq!(
+            order,
+            vec![
+                "drop:1".to_string(),
+                "reset:5:0".to_string(),
+                "poison:2".to_string(),
+            ],
+            "unit 2 must never be Dropped even though it shares the reset's epoch"
+        );
+        let result = result.expect("a post-reset frame survives");
+        assert_eq!(
+            result.frame_id, 3,
+            "unit 3 becomes the new baseline outright, not via Dropped-supersede"
+        );
+        assert_eq!(
+            result.epoch, 0,
+            "same epoch as the reset — the aliasing case"
+        );
+    }
+
+    #[test]
+    fn drain_newest_trailing_reset_abandons_the_pre_reset_unit_and_returns_none() {
+        // A transport-sourced same-epoch discontinuity can be the *last*
+        // drained event (push_discontinuity is a standalone push, unlike
+        // overflow's atomic reset+frame pair). The pre-reset unit must not
+        // survive as the returned baseline: it would decode post-flush and
+        // could ack the fresh recovery generation with a pre-reset key.
+        let mut order: Vec<String> = Vec::new();
+        let first = unit(0, 1, true);
+        let mut events: std::collections::VecDeque<VideoEvent> = [VideoEvent::Discontinuity {
+            generation: 9,
+            epoch: 0,
+            reason: transport_core::video_rx::DiscontinuityReason::ReorderGap,
+        }]
+        .into();
+        let result = drain_newest(
+            first,
+            || events.pop_front(),
+            |step| match step {
+                DrainStep::Reset(generation, epoch) => {
+                    order.push(format!("reset:{generation}:{epoch}"))
+                }
+                DrainStep::Dropped(u) => order.push(format!("drop:{}", u.frame_id)),
+                DrainStep::Poisoned(u) => order.push(format!("poison:{}", u.frame_id)),
+            },
+        );
+        assert_eq!(
+            order,
+            vec!["reset:9:0".to_string(), "poison:1".to_string()],
+            "the pre-reset key is accounted via Poisoned, never Dropped/decoded"
+        );
+        assert!(
+            result.is_none(),
+            "no frame survives a trailing reset — nothing decodes this tick"
+        );
+    }
+
+    #[test]
+    fn drain_newest_no_events_returns_first_unchanged() {
+        let first = unit(2, 9, true);
+        let out = drain_newest(first.clone(), || None, |_| {});
+        assert_eq!(out, Some(first));
+    }
+}
+
+/// G006 §3/§4: role-transition isolation + pure decision-logic tests.
+/// Unconditional (no `video`/`windows` gate) — these exercise
+/// `host::role_wants_host`/`role_transition` plus the App-level wiring
+/// contract, none of which touch platform-specific rendering.
+#[cfg(test)]
+mod g006_role_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// The review-flagged race: a role flip back to Client while a
+    /// background host boot is still in flight must stop the delivered
+    /// host instead of installing it — and an occupied slot must never
+    /// be silently replaced by a late duplicate delivery.
+    #[test]
+    fn a_host_delivered_after_flipping_back_to_client_is_stopped_not_installed() {
+        use std::cell::Cell;
+
+        // Role flipped to Client before the boot landed → not installed,
+        // fully stopped.
+        let stopped = Cell::new(false);
+        let mut slot: Option<&str> = None;
+        apply_host_delivery(false, "late-host", &mut slot, |_| stopped.set(true));
+        assert!(slot.is_none());
+        assert!(stopped.get());
+
+        // Role still wants a host and the slot is empty → installed,
+        // never stopped.
+        let stopped = Cell::new(false);
+        let mut slot: Option<&str> = None;
+        apply_host_delivery(true, "wanted-host", &mut slot, |_| stopped.set(true));
+        assert_eq!(slot, Some("wanted-host"));
+        assert!(!stopped.get());
+
+        // Slot already occupied → the late duplicate is torn down and the
+        // existing host is untouched (poll passes install=false then).
+        let stopped = Cell::new(false);
+        let mut slot = Some("existing");
+        apply_host_delivery(false, "duplicate", &mut slot, |_| stopped.set(true));
+        assert_eq!(slot, Some("existing"));
+        assert!(stopped.get());
+    }
+    /// Minimal role-driven host lifecycle harness mirroring exactly what
+    /// `App::host_section`'s role-switch wiring does to `App::host` —
+    /// without spinning a real `host::Host`. `host_up` stands in for
+    /// `App::host: Option<host::Host>` (Some ⇔ host role running);
+    /// `client_session` stands in for `App::running: Option<Running>`,
+    /// using an `Arc` so the test can prove the *same* handle survives
+    /// every role change (a real `Running` drop tears down the session's
+    /// threads/sockets — swapping or dropping the pointer here would be
+    /// the exact bug G006 §3 forbids).
+    struct RoleHarness {
+        role: settings::Role,
+        host_up: bool,
+        client_session: Option<Arc<()>>,
+    }
+
+    impl RoleHarness {
+        /// Applies a role change through the exact same
+        /// [`apply_role_action`] seam `App::host_section` calls —
+        /// mutating only `host_up`. Sharing the seam (rather than
+        /// re-deriving the match here) is what prevents this test from
+        /// drifting from production wiring; it does not by itself prove
+        /// isolation beyond "this dispatch has no `client_session`
+        /// parameter to touch".
+        fn apply_role(&mut self, new_role: settings::Role) {
+            apply_role_action(
+                host::role_transition(self.role, new_role),
+                &mut self.host_up,
+                |up| *up = true,
+                |up| *up = false,
+            );
+            self.role = new_role;
+        }
+    }
+
+    #[test]
+    fn role_transitions_never_disturb_an_active_client_session() {
+        let session = Arc::new(());
+        let mut h = RoleHarness {
+            role: settings::Role::Client,
+            host_up: false,
+            client_session: Some(session.clone()),
+        };
+        assert!(!h.host_up);
+
+        h.apply_role(settings::Role::Both);
+        assert!(h.host_up, "client->both must boot the host role");
+        assert!(
+            h.client_session
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, &session)),
+            "client session handle must survive client->both"
+        );
+
+        h.apply_role(settings::Role::Host);
+        assert!(
+            h.host_up,
+            "both->host keeps the host running (still host-wanting)"
+        );
+        assert!(
+            h.client_session
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, &session)),
+            "client session handle must survive both->host"
+        );
+
+        h.apply_role(settings::Role::Client);
+        assert!(!h.host_up, "host->client must stop the host role");
+        assert!(
+            h.client_session
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, &session)),
+            "client session handle must survive host->client"
+        );
+        assert_eq!(
+            Arc::strong_count(&session),
+            2,
+            "no extra clone or drop of the session handle across the whole cycle \
+             (one strong ref in `session`, one in `client_session`)"
+        );
+    }
+
+    #[test]
+    fn role_label_covers_every_role() {
+        assert_eq!(App::role_label(settings::Role::Client), "Client");
+        assert_eq!(App::role_label(settings::Role::Host), "Host");
+        assert_eq!(App::role_label(settings::Role::Both), "Both");
     }
 }

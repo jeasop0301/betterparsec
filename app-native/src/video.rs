@@ -54,6 +54,28 @@ impl DecodedFrame {
     }
 }
 
+/// Metadata about a decoder output, populated **only** when FFmpeg actually
+/// produced a picture. `is_key` reflects the decoded `AVFrame`'s real key
+/// status (`AV_FRAME_FLAG_KEY`), never the submitted packet's `is_key` flag:
+/// a submitted key packet that fails, or that FFmpeg swallows without
+/// emitting a picture (B-frame reorder / buffering), must never be reported
+/// as a decoded key. `epoch`/`frame_id` are the input `DecodeUnit`'s, passed
+/// through so the caller can match this output against the epoch it is
+/// currently waiting for recovery on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeMeta {
+    pub epoch: u32,
+    pub frame_id: u32,
+    pub is_key: bool,
+}
+
+/// A decoded picture paired with the [`DecodeMeta`] of the access unit that
+/// produced it.
+pub struct Decoded<T> {
+    pub frame: T,
+    pub meta: DecodeMeta,
+}
+
 /// Decode failure. The pump latches needs-IDR upstream and keeps going;
 /// nothing here is fatal to the session.
 #[derive(Debug)]
@@ -256,10 +278,32 @@ impl Decoder {
         }
     }
 
+    /// Discontinuity flush: drop the in-flight reference chain and any
+    /// buffered/pending output before decoding resumes on a new epoch.
+    /// Without this, `avcodec_receive_frame` can keep draining pictures
+    /// built from the pre-reset reference chain (stale decoder output
+    /// presenting after a reset). Call before the first `send_packet` of
+    /// the new epoch.
+    pub fn flush(&mut self) {
+        unsafe {
+            ff::avcodec_flush_buffers(self.ctx);
+            ff::av_frame_unref(self.frame);
+            ff::av_frame_unref(self.sw_frame);
+        }
+    }
+
     /// Feed one complete Annex-B access unit; returns the newest decoded
-    /// picture, if any. `Err` means the reference chain is suspect —
-    /// latch needs-IDR upstream and keep pumping.
-    pub fn decode(&mut self, data: &[u8]) -> Result<Option<RgbaFrame>, DecodeError> {
+    /// picture with its [`DecodeMeta`], if FFmpeg actually produced one.
+    /// `epoch`/`frame_id` come from the input `DecodeUnit` and are only
+    /// ever attached to output that FFmpeg emits in response to this call
+    /// — never inferred from the packet alone. `Err` means the reference
+    /// chain is suspect — latch needs-IDR upstream and keep pumping.
+    pub fn decode(
+        &mut self,
+        epoch: u32,
+        frame_id: u32,
+        data: &[u8],
+    ) -> Result<Option<Decoded<RgbaFrame>>, DecodeError> {
         if data.is_empty() {
             return Ok(None);
         }
@@ -284,8 +328,17 @@ impl Decoder {
                 if rc < 0 {
                     return Err(DecodeError(format!("receive_frame: {}", err_str(rc))));
                 }
-                out = Some(self.frame_to_rgba()?);
+                let is_key = (*self.frame).flags & ff::AV_FRAME_FLAG_KEY as i32 != 0;
+                let frame = self.frame_to_rgba()?;
                 ff::av_frame_unref(self.frame);
+                out = Some(Decoded {
+                    frame,
+                    meta: DecodeMeta {
+                        epoch,
+                        frame_id,
+                        is_key,
+                    },
+                });
             }
             Ok(out)
         }
@@ -296,10 +349,18 @@ impl Decoder {
     /// the expensive HW download + swscale that [`Decoder::decode`] does.
     /// Used to skip stale frames when the present side has fallen behind so
     /// only the newest picture is ever converted and shown (bounds
-    /// presentation latency under load).
-    pub fn decode_drop(&mut self, data: &[u8]) -> Result<(), DecodeError> {
+    /// presentation latency under load). Still reports [`DecodeMeta`] for
+    /// any picture FFmpeg actually produces — the backlog-drain path must
+    /// be able to recognize/ack a real decoded key even when the picture
+    /// itself is never presented.
+    pub fn decode_drop(
+        &mut self,
+        epoch: u32,
+        frame_id: u32,
+        data: &[u8],
+    ) -> Result<Option<DecodeMeta>, DecodeError> {
         if data.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         unsafe {
             let rc = ff::av_new_packet(self.pkt, data.len() as i32);
@@ -312,6 +373,7 @@ impl Decoder {
             if rc < 0 && rc != ff::AVERROR(libc::EAGAIN) {
                 return Err(DecodeError(format!("send_packet: {}", err_str(rc))));
             }
+            let mut out = None;
             loop {
                 let rc = ff::avcodec_receive_frame(self.ctx, self.frame);
                 if rc == ff::AVERROR(libc::EAGAIN) || rc == ff::AVERROR_EOF {
@@ -320,9 +382,15 @@ impl Decoder {
                 if rc < 0 {
                     return Err(DecodeError(format!("receive_frame: {}", err_str(rc))));
                 }
+                let is_key = (*self.frame).flags & ff::AV_FRAME_FLAG_KEY as i32 != 0;
                 ff::av_frame_unref(self.frame);
+                out = Some(DecodeMeta {
+                    epoch,
+                    frame_id,
+                    is_key,
+                });
             }
-            Ok(())
+            Ok(out)
         }
     }
 
@@ -435,11 +503,24 @@ impl Decoder {
         }
     }
 
-    /// Like [`Decoder::decode`] but returns the newest picture as NV12 planes
-    /// for the GPU present path (no CPU color conversion). `Err` on a
-    /// non-NV12 (software-decode YUV420P) frame so the caller falls back to
-    /// the RGBA path for that frame.
-    pub fn decode_nv12(&mut self, data: &[u8]) -> Result<Option<Nv12Frame>, DecodeError> {
+    /// Like [`Decoder::decode`] but prefers NV12 planes for the GPU present
+    /// path (no CPU color conversion): when the decoded picture is NV12,
+    /// returns [`DecodedFrame::Nv12`]. When it isn't (e.g. software decode
+    /// engaged mid-stream and yielded YUV420P), that is *not* a decode
+    /// failure — this falls back to the RGBA/swscale path for that one
+    /// picture and returns [`DecodedFrame::Rgba`] instead, exactly like
+    /// [`Decoder::decode`] would have. `Err` is reserved for a genuine
+    /// decode error (send/receive_packet failure, or the RGBA fallback
+    /// itself failing) — never for a merely-non-NV12 picture — so recovery
+    /// state/IDR requests upstream are never re-armed for a picture that
+    /// actually decoded fine. Same `epoch`/`frame_id`/real-key
+    /// [`DecodeMeta`] contract as [`Decoder::decode`].
+    pub fn decode_nv12(
+        &mut self,
+        epoch: u32,
+        frame_id: u32,
+        data: &[u8],
+    ) -> Result<Option<Decoded<DecodedFrame>>, DecodeError> {
         if data.is_empty() {
             return Ok(None);
         }
@@ -463,8 +544,25 @@ impl Decoder {
                 if rc < 0 {
                     return Err(DecodeError(format!("receive_frame: {}", err_str(rc))));
                 }
-                out = Some(self.frame_to_nv12()?);
+                let is_key = (*self.frame).flags & ff::AV_FRAME_FLAG_KEY as i32 != 0;
+                // Try the NV12 fast path first; a non-NV12 picture isn't a
+                // decode failure, so fall back to the RGBA/swscale path
+                // for this one picture (frame_to_rgba supports NV12,
+                // YUV420P, and YUVJ420P — frame_to_nv12 only accepts a
+                // literal NV12 copy) instead of propagating an error.
+                let frame = match self.frame_to_nv12() {
+                    Ok(nv12) => DecodedFrame::Nv12(nv12),
+                    Err(_) => DecodedFrame::Rgba(self.frame_to_rgba()?),
+                };
                 ff::av_frame_unref(self.frame);
+                out = Some(Decoded {
+                    frame,
+                    meta: DecodeMeta {
+                        epoch,
+                        frame_id,
+                        is_key,
+                    },
+                });
             }
             Ok(out)
         }
@@ -648,8 +746,8 @@ mod tests {
     #[test]
     fn garbage_input_never_yields_a_frame() {
         let mut d = Decoder::new().expect("decoder init");
-        for _ in 0..4 {
-            if let Ok(Some(_)) = d.decode(&[0x42u8; 512]) {
+        for i in 0..4 {
+            if let Ok(Some(_)) = d.decode(0, i, &[0x42u8; 512]) {
                 panic!("garbage produced a frame");
             }
         }
@@ -695,13 +793,24 @@ mod tests {
         let mut dec = Decoder::new().expect("decoder init");
         let mut frames = 0usize;
         let mut last: Option<RgbaFrame> = None;
-        for au in &aus {
-            if let Some(f) = dec.decode(au).expect("decode AU") {
+        let mut first_meta: Option<DecodeMeta> = None;
+        for (i, au) in aus.iter().enumerate() {
+            if let Some(d) = dec.decode(0, i as u32, au).expect("decode AU") {
                 frames += 1;
-                last = Some(f);
+                assert_eq!(d.meta.epoch, 0);
+                assert_eq!(d.meta.frame_id, i as u32);
+                first_meta.get_or_insert(d.meta);
+                last = Some(d.frame);
             }
         }
         assert!(frames >= 25, "decoded only {frames} of {} AUs", aus.len());
+        // Real AVFrame key status (not the packet's own header) must mark
+        // the GOP's first decoded picture as a key — the field this whole
+        // slice hangs the recovery-ack decision on.
+        assert!(
+            first_meta.expect("at least one picture").is_key,
+            "first decoded picture of a fresh GOP must report is_key from the real AVFrame"
+        );
         let f = last.expect("at least one picture");
         assert_eq!((f.width, f.height), (320, 240));
         assert_eq!(f.rgba.len(), 320 * 240 * 4);
@@ -740,5 +849,61 @@ mod tests {
         // Plain NV12 with unspecified/MPEG range → limited.
         assert!(!is_full_range(0, nv12));
         assert!(!is_full_range(1, nv12));
+    }
+    #[test]
+    fn flush_clears_reference_chain() {
+        let Some(cli) = ffmpeg_cli() else {
+            eprintln!("skip: pinned FFmpeg CLI not present (run tools/bootstrap-ffmpeg.ps1)");
+            return;
+        };
+        let fixture = std::env::temp_dir().join("betterparsec-a0-slice2-flush.h264");
+        let status = Command::new(cli)
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=30:duration=1",
+                "-c:v",
+                "libopenh264",
+                "-g",
+                "30",
+                "-f",
+                "h264",
+            ])
+            .arg(&fixture)
+            .status()
+            .expect("run ffmpeg CLI");
+        assert!(status.success(), "fixture encode failed");
+        let bs = std::fs::read(&fixture).expect("read fixture");
+        let aus = split_access_units(&bs);
+        assert!(
+            aus.len() >= 10,
+            "need at least a few AUs, got {}",
+            aus.len()
+        );
+
+        let mut dec = Decoder::new().expect("decoder init");
+        // Warm the reference chain: IDR plus a few deltas.
+        for (i, au) in aus.iter().take(5).enumerate() {
+            dec.decode(0, i as u32, au).expect("decode AU");
+        }
+        dec.flush();
+        // Post-flush, a delta access unit has no valid reference chain
+        // (avcodec_flush_buffers dropped it). FFmpeg must never hand back a
+        // picture built from the pre-flush references as if it were fresh
+        // output for the new epoch — the defect this flush call exists to
+        // close (stale decoder output presenting after a reset).
+        let post_flush_delta = &aus[5];
+        match dec.decode(1, 999, post_flush_delta) {
+            Ok(Some(_)) => panic!(
+                "a delta AU decoded immediately after flush must not yield a picture — \
+                 the reference chain was just dropped"
+            ),
+            Ok(None) | Err(_) => {}
+        }
     }
 }

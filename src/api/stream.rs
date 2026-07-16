@@ -1,6 +1,5 @@
 use std::{
     path::{Path, PathBuf},
-    process::Stdio,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
@@ -19,7 +18,8 @@ use common::{
     serialize_json,
 };
 use log::{debug, error, info, warn};
-use tokio::{process::Command, spawn, time::sleep};
+use tokio::{spawn, time::sleep};
+
 use tracing::{Level, instrument, span};
 
 use crate::app::{
@@ -29,12 +29,18 @@ use crate::app::{
 };
 
 #[get("/host/stream")]
-#[instrument(name = "start_host", skip(web_app, user, payload), fields(user_id = %user.id()))]
+#[instrument(
+    name = "start_host",
+    skip(web_app, user, payload, launcher, lifecycle),
+    fields(user_id = %user.id())
+)]
 pub async fn start_host(
     web_app: Data<App>,
     mut user: AuthenticatedUser,
     request: HttpRequest,
     payload: Payload,
+    launcher: Data<crate::LauncherHandle>,
+    lifecycle: Data<Option<crate::LifecycleSink>>,
 ) -> Result<HttpResponse, Error> {
     let (response, mut session, mut stream) = actix_ws::handle(&request, payload)?;
 
@@ -205,44 +211,16 @@ pub async fn start_host(
         )
         .await;
 
-        // Spawn child
+        // Spawn child (via the injected G005 launcher — the standalone
+        // binary's `crate::DefaultStreamerLauncher` behaves exactly like
+        // the inline spawn this replaced).
         let streamer_path = resolve_streamer_path(&web_app.config().streamer_path);
         debug!(
             "[Stream]: launching streamer from {}",
             streamer_path.display()
         );
-        let (mut child, stdin, stdout) = match Command::new(&streamer_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
-            Ok(mut child) => {
-                if let Some(stdin) = child.stdin.take()
-                    && let Some(stdout) = child.stdout.take()
-                {
-                    (child, stdin, stdout)
-                } else {
-                    error!("[Stream]: streamer process didn't include a stdin or stdout");
-
-                    let _ = send_ws_message(
-                        &mut session,
-                        StreamServerMessage::DebugLog {
-                            message: "Failed to start stream because of a server error".to_string(),
-                            ty: Some(LogMessageType::FatalDescription),
-                        },
-                    )
-                    .await;
-                    let _ = session.close(None).await;
-
-                    if let Err(err) = child.kill().await {
-                        warn!("[Stream]: failed to kill child: {err}");
-                    }
-
-                    return;
-                }
-            }
+        let launched = match launcher.launch(&streamer_path).await {
+            Ok(launched) => launched,
             Err(err) => {
                 error!("[Stream]: failed to spawn streamer process: {err}");
 
@@ -258,6 +236,13 @@ pub async fn start_host(
                 return;
             }
         };
+        let streamer_pid = launched.pid;
+        let mut child = launched.child;
+        let stdin = launched.stdin;
+        let stdout = launched.stdout;
+        if let Some(sink) = lifecycle.as_ref() {
+            sink(crate::StreamerLifecycleEvent::Spawned { pid: streamer_pid });
+        }
 
         // Create ipc
         static CHILD_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -273,11 +258,19 @@ pub async fn start_host(
         // Redirect ipc message into ws
         spawn({
             let mut ipc_sender = ipc_sender.clone();
+            let lifecycle = lifecycle.clone();
             async move {
                 let mut warned_closed = false;
+                let mut terminal_error_code: Option<i32> = None;
+                let mut graceful_stop = false;
                 while let Some(message) = ipc_receiver.recv().await {
                     match message {
                         StreamerIpcMessage::WebSocket(message) => {
+                            if let StreamServerMessage::ConnectionTerminated { error_code } =
+                                &message
+                            {
+                                terminal_error_code = Some(*error_code);
+                            }
                             if let Err(Closed) = send_ws_message(&mut session, message).await
                                 && !warned_closed
                             {
@@ -301,14 +294,27 @@ pub async fn start_host(
                         }
                         StreamerIpcMessage::Stop => {
                             debug!("[Ipc]: ipc receiver stopped by streamer");
+                            graceful_stop = true;
                             break;
                         }
                     }
                 }
                 info!("[Ipc]: ipc receiver is closed");
+                if let Some(error_code) = terminal_error_code {
+                    info!("[Ipc]: session ended with terminal error_code={error_code}");
+                }
 
-                // Wait for the child to shutdown
-                sleep(Duration::from_secs(10)).await;
+                // The streamer sends an explicit Stop once it has already
+                // shut down its own session (including, per G003, right
+                // after it surfaces a typed ConnectionTerminated) — there is
+                // nothing left to wait for, so close/kill immediately
+                // instead of letting the terminal reason sit behind a blind
+                // sleep. Only fall back to the grace period when the ipc
+                // channel closed without an explicit Stop (crash / dropped
+                // child), since that case has no shutdown signal to trust.
+                if !graceful_stop {
+                    sleep(Duration::from_secs(10)).await;
+                }
 
                 // close the websocket when the streamer crashed / disconnected / whatever
                 if let Err(err) = session.close(None).await {
@@ -318,6 +324,12 @@ pub async fn start_host(
                 // kill the streamer
                 if let Err(err) = child.kill().await {
                     warn!("failed to kill streamer child: {err}");
+                }
+                if let Some(sink) = lifecycle.as_ref() {
+                    if let Some(error_code) = terminal_error_code {
+                        sink(crate::StreamerLifecycleEvent::Terminated { error_code });
+                    }
+                    sink(crate::StreamerLifecycleEvent::Exited { pid: streamer_pid });
                 }
             }
         });

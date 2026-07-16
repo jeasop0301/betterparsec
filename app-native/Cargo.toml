@@ -28,6 +28,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # A2 input: wire-format field types (common::input_wire re-uses them).
 moonlight-common = { workspace = true, optional = true }
+# G005: injected StreamerLauncher trait (web-server) is an async_trait.
+async-trait = { workspace = true }
+# G006: complete-set manifest canonicalization/signature verify (update.rs
+# — verify-only, no network, no signing key material). Shared canon/
+# manifest/verify logic lives in tools/updater (bp_updater) so the app
+# and the packaging CLI never diverge on what "valid" means.
+ed25519-dalek = { workspace = true }
+bp_updater = { package = "betterparsec-updater", path = "../tools/updater" }
+
 
 # A0 shell: egui via eframe (glow backend — the stream surface will live on
 # its own raw D3D11 HWND per unified-app-architecture.md D5/D9, so the
@@ -73,6 +82,16 @@ windows = { version = "0.62", optional = true, features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Input_Ime",
     "Win32_UI_WindowsAndMessaging",
+] }
+
+# G005 S3: Job Object containment for the managed Foundation process
+# (and, via `supervisor::assign_to_app_job`, the streamer spawn path) —
+# always available on Windows, independent of the "video" feature.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
 ] }
 
 [features]

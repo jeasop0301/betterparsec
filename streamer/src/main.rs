@@ -1,7 +1,9 @@
 #![feature(async_fn_traits)]
 
 use std::{
-    io, panic,
+    io,
+    num::NonZeroU32,
+    panic,
     process::exit,
     sync::{
         Arc, Weak,
@@ -73,6 +75,50 @@ use crate::{
 pub type RequestClient = TokioHyperClient;
 
 pub const TIMEOUT_DURATION: Duration = Duration::from_secs(10);
+
+/// The only FEC versions this streamer can select on the signaling wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedFecProtocol {
+    V1,
+    V2,
+}
+
+/// The sender owns the v2 epoch; negotiation cannot invent one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FecCapabilitySelectionError {
+    SenderEpochRequired,
+}
+
+/// Pure protocol selection. Old clients omit the request and remain on v1.
+pub fn select_fec_protocol(requested_version: Option<u8>) -> SelectedFecProtocol {
+    if requested_version.unwrap_or(1) >= 2 {
+        SelectedFecProtocol::V2
+    } else {
+        SelectedFecProtocol::V1
+    }
+}
+
+/// Build the advertised capability only from a sender-provided epoch.
+pub fn selected_fec_capabilities(
+    touch: bool,
+    selection: SelectedFecProtocol,
+    sender_epoch: Option<NonZeroU32>,
+) -> Result<StreamCapabilities, FecCapabilitySelectionError> {
+    match selection {
+        SelectedFecProtocol::V1 => Ok(StreamCapabilities {
+            touch,
+            selected_fec_protocol_version: None,
+            fec_epoch: None,
+        }),
+        SelectedFecProtocol::V2 => sender_epoch
+            .map(|epoch| StreamCapabilities {
+                touch,
+                selected_fec_protocol_version: Some(2),
+                fec_epoch: Some(epoch.get()),
+            })
+            .ok_or(FecCapabilitySelectionError::SenderEpochRequired),
+    }
+}
 
 mod abr;
 mod audio;
@@ -358,7 +404,32 @@ impl StreamConnection {
 
                     match event {
                         Ok(TransportEvent::SendIpc(message)) => {
+                            // Sender fail-closed (G003): a typed FEC-sender
+                            // terminal reason surfaces here as
+                            // ConnectionTerminated. Forward it to the client
+                            // as usual, then stop the session cleanly so the
+                            // terminal reason isn't left hanging behind a
+                            // transport that's already dead — `stop()` is
+                            // idempotent (single is_terminating CAS), so a
+                            // concurrent stop from elsewhere cannot double it.
+                            let is_connection_terminated = matches!(
+                                message,
+                                StreamerIpcMessage::WebSocket(
+                                    StreamServerMessage::ConnectionTerminated { .. }
+                                )
+                            );
                             ipc_sender.send(message).await;
+                            if is_connection_terminated {
+                                let Some(this) = this.upgrade() else {
+                                    warn!(
+                                        "Failed to get stream connection, stopping listening to events"
+                                    );
+                                    return;
+                                };
+                                info!("Stopping stream: sender surfaced ConnectionTerminated");
+                                this.stop().await;
+                                break;
+                            }
                         }
                         Ok(TransportEvent::StartStream { settings }) => {
                             let Some(this) = this.upgrade() else {
@@ -724,6 +795,7 @@ impl StreamConnection {
 
     // Start Moonlight Stream
     async fn start_stream(self: &Arc<Self>, settings: StreamSettings) -> Result<(), anyhow::Error> {
+        let fec_selection = select_fec_protocol(settings.requested_fec_protocol_version);
         // We might already be streaming -> remove and wait for connection close firstly
         {
             let mut stream = self.stream.write().await;
@@ -857,6 +929,26 @@ impl StreamConnection {
             )
         })
         .await??;
+        let sender_epoch = if fec_selection == SelectedFecProtocol::V2 {
+            let sender_epoch = {
+                let sender = self.transport_sender.lock().await;
+                match sender.as_ref() {
+                    Some(sender) => sender.fec_v2_epoch().await,
+                    None => None,
+                }
+            };
+            let Some(sender_epoch) = sender_epoch else {
+                warn!("v2 FEC requested but sender has no epoch; terminating stream");
+                let _ = spawn_blocking(move || stream.stop()).await;
+                self.stop().await;
+                return Err(anyhow::anyhow!(
+                    "v2 FEC requested but sender did not provide an epoch"
+                ));
+            };
+            Some(sender_epoch)
+        } else {
+            None
+        };
 
         let host_features = stream.host_features().unwrap_or_else(|err| {
             warn!("[Stream]: failed to get host features: {err:?}");
@@ -879,9 +971,9 @@ impl StreamConnection {
             None
         };
 
-        let capabilities = StreamCapabilities {
-            touch: host_features.controller_touch,
-        };
+        let capabilities =
+            selected_fec_capabilities(host_features.controller_touch, fec_selection, sender_epoch)
+                .expect("selected v2 was rejected before capability construction");
 
         let (video_setup, audio_setup) = {
             let setup = self.stream_setup.lock().await;
@@ -1459,5 +1551,19 @@ impl ConnectionListenerC for StreamConnectionListener {
                 )
                 .await
         })
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_v2_without_sender_epoch_returns_error_without_v1_capabilities() {
+        let result = selected_fec_capabilities(true, SelectedFecProtocol::V2, None);
+
+        assert!(matches!(
+            result,
+            Err(FecCapabilitySelectionError::SenderEpochRequired)
+        ));
     }
 }

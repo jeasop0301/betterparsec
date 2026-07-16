@@ -432,6 +432,13 @@ pub fn handle(
         ctx.capture.request_exit();
         return None; // DefWindowProc still does its normal kill-focus work
     }
+    // Alt+Tab is deliberately owned by the client OS in immersive mode.
+    // Returning None lets DefWindowProc invoke the local task switcher while
+    // keeping Tab off the host wire. WM_KILLFOCUS above then releases any
+    // already-forwarded Alt edge and exits immersive safely.
+    if is_local_alt_tab(ctx.capture.keyboard_capture(), msg, wparam.0 as u16) {
+        return None;
+    }
     // Hook-independent escape (see is_wndproc_escape): works whenever the
     // captured child has focus, so a failed keyboard-hook install cannot
     // trap the user.
@@ -490,15 +497,22 @@ pub fn handle(
 }
 
 // ── Keyboard Lock (Phase B2, WH_KEYBOARD_LL) ────────────────────────────────
+/// True when an immersive Alt+Tab edge must remain local.
+///
+/// `WM_SYSKEY*` is the reliable window-message marker for a Tab event whose
+/// Alt context bit is set. The low-level hook intentionally passes this chord
+/// through to Windows; the wndproc uses this predicate only to keep Tab off the
+/// host input wire.
+fn is_local_alt_tab(captured: bool, msg: u32, vk: u16) -> bool {
+    captured && vk == VK_TAB.0 && matches!(msg, WM_SYSKEYDOWN | WM_SYSKEYUP)
+}
+
 //
 // Immersive relative capture clips the cursor to the stream child, so the
-// sidebar "Exit immersive" button is unreachable, and Windows would
-// otherwise steal the Win keys and Alt+Tab away from the host (Start
-// menu / task switcher) instead of forwarding them — the Keyboard Lock
-// analog (web `keyboard.lock()`; see docs/design/unified-app-architecture.md
-// §4-3). A WH_KEYBOARD_LL hook intercepts those keys ahead of any window
-// getting them and either forwards them onto the wire or fires the
-// Ctrl+Alt+Shift+Q escape hatch.
+// sidebar "Exit immersive" button is unreachable. A WH_KEYBOARD_LL hook
+// intercepts Win keys for the host and the explicit escape/disconnect chords.
+// Alt+Tab is intentionally left to the client OS and filtered from the host
+// wire by `is_local_alt_tab`.
 
 /// Outcome of [`hook_decision`] for one low-level keyboard event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -518,16 +532,14 @@ pub enum HookAction {
 /// Pure Keyboard Lock decision table (unit-tested, no Win32).
 ///
 /// `alt_down` carries whichever extra-modifier condition matters for
-/// `vk`: the literal Alt-down flag (`KBDLLHOOKSTRUCT` `LLKHF_ALTDOWN`)
-/// for `VK_TAB`, or the full Ctrl+Alt+Shift combo — tracked by the
-/// caller from the hook's own key stream or `GetAsyncKeyState`, since
-/// `GetKeyState` in a low-level hook can lag the event that is still
-/// in-flight — for the `VK_Q` escape hatch. Rules:
+/// `vk`: the full Ctrl+Alt+Shift combo for `VK_Q`, or Ctrl+Alt for
+/// `VK_OEM_3`. The caller combines the hook event's `LLKHF_ALTDOWN` with
+/// `GetAsyncKeyState`, since `GetKeyState` in a low-level hook can lag the
+/// event that is still in flight. Rules:
 /// - `capture_on == false` ⇒ [`HookAction::Pass`] (hook installed but
 ///   immersive not engaged — e.g. a race during teardown).
 /// - `VK_LWIN`/`VK_RWIN` ⇒ [`HookAction::SwallowForward`] (Start menu).
-/// - `VK_TAB` with `alt_down` ⇒ [`HookAction::SwallowForward`] (task
-///   switcher).
+/// - `VK_TAB` ⇒ [`HookAction::Pass`] so the client OS owns Alt+Tab.
 /// - `VK_Q` key-down with `alt_down` (Ctrl+Alt+Shift satisfied) ⇒
 ///   [`HookAction::ExitImmersive`].
 /// - Everything else ⇒ [`HookAction::Pass`] — the wndproc's WM_KEYDOWN
@@ -554,8 +566,7 @@ pub fn hook_decision(vk: u32, alt_down: bool, key_up: bool, capture_on: bool) ->
         };
     }
     let is_win = vk == VK_LWIN.0 as u32 || vk == VK_RWIN.0 as u32;
-    let is_alt_tab = vk == VK_TAB.0 as u32 && alt_down;
-    if is_win || is_alt_tab {
+    if is_win {
         HookAction::SwallowForward
     } else {
         HookAction::Pass
@@ -686,9 +697,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             let key_up = matches!(msg, WM_KEYUP | WM_SYSKEYUP);
             let ctrl_down = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0;
             let shift_down = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0;
-            let alt_down = if vk == VK_TAB.0 as u32 {
-                kb.flags.contains(LLKHF_ALTDOWN)
-            } else if vk == VK_OEM_3.0 as u32 {
+            let alt_down = if vk == VK_OEM_3.0 as u32 {
                 // Ctrl+Alt+` hard disconnect: Ctrl+Alt, shift-agnostic.
                 kb.flags.contains(LLKHF_ALTDOWN) && ctrl_down
             } else {
@@ -972,16 +981,24 @@ mod tests {
     }
 
     #[test]
-    fn hook_decision_alt_tab_needs_alt_flag() {
+    fn hook_decision_alt_tab_always_passes_to_client_os() {
         assert_eq!(
             hook_decision(VK_TAB.0 as u32, true, false, true),
-            HookAction::SwallowForward
-        );
-        // Plain Tab (no Alt) is not the task-switcher combo.
-        assert_eq!(
-            hook_decision(VK_TAB.0 as u32, false, false, true),
             HookAction::Pass
         );
+        assert_eq!(
+            hook_decision(VK_TAB.0 as u32, true, true, true),
+            HookAction::Pass
+        );
+    }
+
+    #[test]
+    fn local_alt_tab_filters_only_immersive_syskey_tab_edges() {
+        assert!(is_local_alt_tab(true, WM_SYSKEYDOWN, VK_TAB.0));
+        assert!(is_local_alt_tab(true, WM_SYSKEYUP, VK_TAB.0));
+        assert!(!is_local_alt_tab(false, WM_SYSKEYDOWN, VK_TAB.0));
+        assert!(!is_local_alt_tab(true, WM_KEYDOWN, VK_TAB.0));
+        assert!(!is_local_alt_tab(true, WM_SYSKEYDOWN, 0x41));
     }
 
     #[test]

@@ -54,6 +54,12 @@ pub struct AudioShared {
     pub decode_errors: AtomicU64,
     /// 0 = starting, [`AUDIO_RUNNING`], [`AUDIO_FAILED`].
     pub state: AtomicU8,
+    /// Opt-in WASAPI exclusive render (low latency). Seeded before the
+    /// audio thread starts (env `BP_AUDIO_EXCLUSIVE` or the in-app toggle,
+    /// which takes effect on the next connect — the device is owned for
+    /// the session's lifetime so it cannot flip live). Read once at the
+    /// top of [`run`].
+    pub exclusive: AtomicBool,
 }
 
 // ── Opus decode (libavcodec built-in) ─────────────────────────────────────
@@ -664,7 +670,7 @@ pub fn run(core: &RxCore, shared: &AudioShared, stopped: &AtomicBool) {
         }
     };
 
-    if std::env::var("BP_AUDIO_EXCLUSIVE").as_deref() == Ok("1") {
+    if shared.exclusive.load(Ordering::Relaxed) {
         const DECODED_CHANNELS: u16 = 2;
         match WasapiExclusiveOut::new(DECODED_CHANNELS) {
             Ok(out) => {
@@ -678,7 +684,7 @@ pub fn run(core: &RxCore, shared: &AudioShared, stopped: &AtomicBool) {
             Err(e) => {
                 tracing::warn!(
                     err = %e,
-                    "BP_AUDIO_EXCLUSIVE=1 requested but exclusive init failed — falling back to shared mode"
+                    "exclusive audio requested but init failed — falling back to shared mode"
                 );
             }
         }

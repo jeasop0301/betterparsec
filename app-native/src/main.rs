@@ -255,7 +255,9 @@ struct Running {
 }
 
 impl Running {
-    fn start(cfg: ConnectForm, egui_ctx: eframe::egui::Context) -> Self {
+    fn start(cfg: ConnectForm, audio_exclusive: bool, egui_ctx: eframe::egui::Context) -> Self {
+        #[cfg(not(all(windows, feature = "video")))]
+        let _ = audio_exclusive;
         let core = Arc::new(RxCore::new(0));
         let stats = Arc::new(RxStats::default());
         let fps = Arc::new(FpsWindow::default());
@@ -366,6 +368,10 @@ impl Running {
 
         #[cfg(all(windows, feature = "video"))]
         let audio_shared = Arc::new(audio::AudioShared::default());
+        #[cfg(all(windows, feature = "video"))]
+        audio_shared
+            .exclusive
+            .store(audio_exclusive, Ordering::Relaxed);
         #[cfg(all(windows, feature = "video"))]
         let audio_thread = {
             let core = core.clone();
@@ -513,6 +519,13 @@ struct App {
     /// frame so the present thread applies it (present.rs sharpen pass).
     #[cfg(feature = "video")]
     sharpen_pct: u32,
+    /// Opt-in WASAPI exclusive audio (low latency). Seeded from
+    /// `BP_AUDIO_EXCLUSIVE`; the sidebar toggle persists it here so it
+    /// applies on the next connect (seeded into `AudioShared::exclusive`
+    /// at `Running::start` — the device is owned per-session, so it
+    /// cannot flip live).
+    #[cfg(all(windows, feature = "video"))]
+    audio_exclusive: bool,
 }
 
 impl App {
@@ -547,7 +560,20 @@ impl App {
                 .and_then(|v| v.trim().parse::<u32>().ok())
                 .unwrap_or(0)
                 .min(100),
+            #[cfg(all(windows, feature = "video"))]
+            audio_exclusive: std::env::var("BP_AUDIO_EXCLUSIVE").as_deref() == Ok("1"),
         }
+    }
+
+    /// Persisted WASAPI-exclusive audio preference (windows+video only;
+    /// always `false` otherwise so `Running::start` has a value to seed).
+    #[cfg(all(windows, feature = "video"))]
+    fn audio_exclusive_pref(&self) -> bool {
+        self.audio_exclusive
+    }
+    #[cfg(not(all(windows, feature = "video")))]
+    fn audio_exclusive_pref(&self) -> bool {
+        false
     }
 
     /// Session teardown half of the immersive machine: run the owed
@@ -688,7 +714,11 @@ impl eframe::App for App {
                             self.cursor_state.reset(); // per-connection shapes
                             self.reset_immersive(ctx);
                         }
-                        self.running = Some(Running::start(self.form.clone(), ctx.clone()));
+                        self.running = Some(Running::start(
+                            self.form.clone(),
+                            self.audio_exclusive_pref(),
+                            ctx.clone(),
+                        ));
                     }
                     ui.add_space(4.0);
                     ui.small("dev TLS: accepts any certificate (localhost testing)");
@@ -793,6 +823,17 @@ impl eframe::App for App {
                         {
                             run.video.nv12.store(nv12, Ordering::Relaxed);
                         }
+                    }
+                    // Opt-in WASAPI exclusive audio (low latency): the
+                    // render device is owned for the session's lifetime, so
+                    // the audio thread latches its mode at connect — this
+                    // toggle takes effect on the next connect/reconnect.
+                    #[cfg(all(windows, feature = "video"))]
+                    {
+                        ui.checkbox(
+                            &mut self.audio_exclusive,
+                            "Exclusive audio (low latency, reconnect to apply)",
+                        );
                     }
                     ui.add_space(8.0);
                     let disconnect = ui.button("Disconnect").clicked();
@@ -1069,7 +1110,11 @@ impl eframe::App for App {
                             self.video_gen = 0;
                         }
                         tracing::info!("stall watchdog reconnect: rebuilding the session");
-                        self.running = Some(Running::start(self.form.clone(), ctx.clone()));
+                        self.running = Some(Running::start(
+                            self.form.clone(),
+                            self.audio_exclusive_pref(),
+                            ctx.clone(),
+                        ));
                     }
                 }
             }

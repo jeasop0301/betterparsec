@@ -76,12 +76,12 @@ fn main() -> eframe::Result {
             None => registry.init(),
         }
     }
-    tracing::info!("=== betterparsec build 07-16j starting ===");
+    tracing::info!("=== betterparsec build 07-16k starting ===");
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
-            .with_title("BetterParsec — build 07-16j (remote Alt+Tab + focus-safe cursor)"),
+            .with_title("BetterParsec — build 07-16k (tracked remote Alt+Tab)"),
         ..Default::default()
     };
     eframe::run_native(

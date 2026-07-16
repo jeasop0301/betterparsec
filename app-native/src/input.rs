@@ -513,6 +513,14 @@ pub enum HookAction {
     Disconnect,
 }
 
+fn is_alt_key(vk: u32) -> bool {
+    vk == VK_MENU.0 as u32 || vk == VK_LMENU.0 as u32 || vk == VK_RMENU.0 as u32
+}
+
+fn tracked_alt_state(vk: u32, key_up: bool, previous: bool) -> bool {
+    if is_alt_key(vk) { !key_up } else { previous }
+}
+
 /// Pure Keyboard Lock decision table (unit-tested, no Win32).
 ///
 /// `alt_down` carries whichever extra-modifier condition matters for
@@ -549,14 +557,7 @@ pub fn hook_decision(vk: u32, alt_down: bool, key_up: bool, capture_on: bool) ->
             HookAction::Pass
         };
     }
-    let is_system_modifier = matches!(
-        vk,
-        x if x == VK_MENU.0 as u32
-            || x == VK_LMENU.0 as u32
-            || x == VK_RMENU.0 as u32
-            || x == VK_LWIN.0 as u32
-            || x == VK_RWIN.0 as u32
-    );
+    let is_system_modifier = is_alt_key(vk) || vk == VK_LWIN.0 as u32 || vk == VK_RWIN.0 as u32;
     let is_alt_tab = vk == VK_TAB.0 as u32 && alt_down;
     if is_system_modifier || is_alt_tab {
         HookAction::SwallowForward
@@ -572,6 +573,9 @@ pub fn hook_decision(vk: u32, alt_down: bool, key_up: bool, capture_on: bool) ->
 struct HookShared {
     capture: Arc<CaptureShared>,
     sender: InputSender,
+    /// Alt is swallowed before Windows updates its async keyboard state, so
+    /// subsequent Tab events must use hook-owned state.
+    alt_pressed: Arc<AtomicBool>,
     /// Remembers a swallowed Tab-down until its matching up edge even if the
     /// user releases Alt first.
     alt_tab_active: Arc<AtomicBool>,
@@ -608,6 +612,7 @@ pub fn install_keyboard_hook(capture: Arc<CaptureShared>, sender: InputSender) {
     let shared = HookShared {
         capture,
         sender,
+        alt_pressed: Arc::new(AtomicBool::new(false)),
         alt_tab_active: Arc::new(AtomicBool::new(false)),
     };
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
@@ -696,14 +701,18 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             let key_up = matches!(msg, WM_KEYUP | WM_SYSKEYUP);
             let ctrl_down = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0;
             let shift_down = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0;
+            let previous_alt = shared.alt_pressed.load(Ordering::Acquire);
+            let alt_pressed = tracked_alt_state(vk, key_up, previous_alt);
+            if is_alt_key(vk) {
+                shared.alt_pressed.store(alt_pressed, Ordering::Release);
+            }
             let alt_tab_active = if vk == VK_TAB.0 as u32 {
                 if !key_up {
-                    let active = kb.flags.contains(LLKHF_ALTDOWN);
+                    let active = alt_pressed || kb.flags.contains(LLKHF_ALTDOWN);
                     shared.alt_tab_active.store(active, Ordering::Release);
                     active
                 } else {
-                    kb.flags.contains(LLKHF_ALTDOWN)
-                        || shared.alt_tab_active.swap(false, Ordering::AcqRel)
+                    alt_pressed || shared.alt_tab_active.swap(false, Ordering::AcqRel)
                 }
             } else {
                 false
@@ -712,10 +721,10 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                 alt_tab_active
             } else if vk == VK_OEM_3.0 as u32 {
                 // Ctrl+Alt+` hard disconnect: Ctrl+Alt, shift-agnostic.
-                kb.flags.contains(LLKHF_ALTDOWN) && ctrl_down
+                alt_pressed && ctrl_down
             } else {
                 // VK_Q escape hatch: full Ctrl+Alt+Shift combo.
-                kb.flags.contains(LLKHF_ALTDOWN) && ctrl_down && shift_down
+                alt_pressed && ctrl_down && shift_down
             };
             match hook_decision(vk, alt_down, key_up, shared.capture.keyboard_capture()) {
                 HookAction::Pass => {}
@@ -730,6 +739,9 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                     return LRESULT(1);
                 }
                 HookAction::SwallowForward => {
+                    if vk == VK_TAB.0 as u32 && !key_up {
+                        tracing::info!("immersive remote Alt+Tab forwarded");
+                    }
                     shared.sender.send(&InboundPacket::Key {
                         action: if key_up {
                             KeyAction::Up
@@ -737,11 +749,10 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                             KeyAction::Down
                         },
                         modifiers: {
-                            // Build modifiers from the reliable hook signals:
-                            // GetKeyState (used by current_modifiers) can miss
-                            // keys in a low-level hook's thread, dropping the
-                            // Alt off a forwarded Alt+Tab so the host never sees
-                            // the combo (field report: Alt+Tab does nothing).
+                            // The hook owns Alt state because swallowed Alt
+                            // events never update Windows' async key state.
+                            // This keeps the complete remote chord ordered and
+                            // ensures Tab carries the ALT modifier.
                             let mut m = KeyModifiers::empty();
                             if shift_down {
                                 m |= KeyModifiers::SHIFT;
@@ -749,7 +760,8 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                             if ctrl_down {
                                 m |= KeyModifiers::CTRL;
                             }
-                            if kb.flags.contains(LLKHF_ALTDOWN) {
+                            if !is_alt_key(vk) && (alt_pressed || kb.flags.contains(LLKHF_ALTDOWN))
+                            {
                                 m |= KeyModifiers::ALT;
                             }
                             if unsafe { GetAsyncKeyState(VK_LWIN.0 as i32) } < 0
@@ -1017,6 +1029,13 @@ mod tests {
             SwallowForward
         );
         assert_eq!(hook_decision(VK_TAB.0 as u32, false, false, true), Pass);
+    }
+
+    #[test]
+    fn swallowed_alt_state_survives_until_its_hook_key_up() {
+        assert!(tracked_alt_state(VK_LMENU.0 as u32, false, false));
+        assert!(tracked_alt_state(VK_TAB.0 as u32, false, true));
+        assert!(!tracked_alt_state(VK_LMENU.0 as u32, true, true));
     }
 
     #[test]

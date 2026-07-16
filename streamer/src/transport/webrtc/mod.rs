@@ -151,6 +151,11 @@ pub async fn new(
 
     // -- Register media codecs
     // TODO: register them based on the sdp
+    // P2 wire-in (deferred, S5): `negotiate_codecs` below is the pure
+    // intersection helper for SDP-driven codec pruning; wiring it into the
+    // MediaEngine registration here (and threading a parsed SDP offer into
+    // this fn) is a later live A/B slice — see docs/design for the codec
+    // negotiation contract. Registration below stays unconditional.
     let mut api_media = MediaEngine::default();
     register_audio_codecs(&mut api_media).expect("failed to register audio codecs");
     register_video_codecs(&mut api_media).expect("failed to register video codecs");
@@ -869,5 +874,51 @@ impl TransportSender for WebRTCTransportSender {
             .map_err(|err| TransportError::Implementation(err.into()))?;
 
         Ok(())
+    }
+}
+
+/// Pure codec-set negotiation: given the host's supported codec identifiers
+/// (mime types, in host-priority order) and the set the peer declared
+/// negotiable (e.g. parsed from an SDP offer's `a=rtpmap`/`a=fmtp` lines),
+/// return the negotiated list, preserving host-priority order.
+///
+/// OUT OF SCOPE (P2 wire-in, see comment above `register_video_codecs`
+/// call in [`new`]): this fn is not yet wired into the unconditional
+/// `register_audio_codecs`/`register_video_codecs` MediaEngine registration.
+/// It's a standalone building block for a later SDP-gated negotiation slice.
+#[allow(dead_code)]
+fn negotiate_codecs<'a>(host_supported: &[&'a str], peer_offered: &[&str]) -> Vec<&'a str> {
+    host_supported
+        .iter()
+        .copied()
+        .filter(|host_codec| {
+            peer_offered
+                .iter()
+                .any(|peer_codec| peer_codec.eq_ignore_ascii_case(host_codec))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod codec_select_tests {
+    use super::negotiate_codecs;
+
+    #[test]
+    fn register_codecs_from_sdp_selects_negotiated() {
+        let host_supported = ["video/H265", "video/AV1", "video/H264"];
+        let peer_offered = ["video/av1", "video/h264"];
+
+        let negotiated = negotiate_codecs(&host_supported, &peer_offered);
+
+        // Host priority order preserved; H265 dropped (not peer-offered).
+        assert_eq!(negotiated, vec!["video/AV1", "video/H264"]);
+    }
+
+    #[test]
+    fn negotiate_codecs_empty_intersection() {
+        let host_supported = ["video/H265"];
+        let peer_offered = ["video/VP9"];
+
+        assert!(negotiate_codecs(&host_supported, &peer_offered).is_empty());
     }
 }

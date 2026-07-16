@@ -36,6 +36,12 @@ pub async fn new() -> Result<(WebSocketTransportSender, WebSocketTransportEvents
     let (event_sender, event_receiver) = channel::<TransportEvent>(20);
 
     // TODO: use the video_frame_queue_size with packet rtt info to estimate latency of pictures and request idr if too big
+    // P2 wire-in (deferred, S5): `should_request_idr` below is the pure
+    // decision fn for this. Wiring it here needs `video_frame_queue_size`
+    // threaded into this fn (it isn't a parameter of `new` today) plus a
+    // live RTT sample source (see `recv_rtt`/`rtt` field below) sampled on
+    // an interval to drive `WebSocketTransportSender::needs_idr`. Deferred
+    // as a later live A/B slice; pure fn + test land now.
 
     let (clipboard_apply_tx, clipboard_apply_rx) = channel::<String>(20);
 
@@ -330,5 +336,49 @@ impl TransportSender for WebSocketTransportSender {
     async fn close(&self) -> Result<(), TransportError> {
         // emtpy
         Ok(())
+    }
+}
+
+/// Pure RTT-aware IDR-request decision (P2 TODO wire-in deferred — see
+/// comment in [`new`] above). Estimates the queue's drain latency as
+/// `frame_queue_size * frame_interval_ms` and compares it, plus one RTT of
+/// round-trip slack, against `max_latency_ms`. Returns `true` when the
+/// queue has backed up far enough that a fresh IDR should be requested
+/// before the picture backlog exceeds the acceptable latency budget.
+#[allow(dead_code)]
+fn should_request_idr(
+    frame_queue_size: usize,
+    rtt_ms: u32,
+    frame_interval_ms: u32,
+    max_latency_ms: u32,
+) -> bool {
+    let queue_latency_ms = (frame_queue_size as u32).saturating_mul(frame_interval_ms);
+    queue_latency_ms.saturating_add(rtt_ms) > max_latency_ms
+}
+
+#[cfg(test)]
+mod idr_decision_tests {
+    use super::should_request_idr;
+
+    #[test]
+    fn rtt_spike_requests_idr() {
+        // 5 queued frames @ 16ms/frame = 80ms queue latency; a 40ms rtt
+        // spike pushes total estimated latency to 120ms, over the 100ms
+        // budget -> request IDR.
+        assert!(should_request_idr(5, 40, 16, 100));
+    }
+
+    #[test]
+    fn healthy_queue_does_not_request_idr() {
+        // 2 queued frames @ 16ms/frame = 32ms + a normal 10ms rtt = 42ms,
+        // comfortably under the 100ms budget.
+        assert!(!should_request_idr(2, 10, 16, 100));
+    }
+
+    #[test]
+    fn zero_interval_never_requests_idr_from_queue_alone() {
+        // frame_interval_ms == 0 means the queue term contributes nothing;
+        // an in-budget rtt alone must not trip the decision.
+        assert!(!should_request_idr(1000, 50, 0, 100));
     }
 }

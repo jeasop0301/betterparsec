@@ -31,10 +31,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetClientRect, HHOOK, HTCLIENT, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, SetCursor,
-    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_XBUTTONDOWN, WM_XBUTTONUP,
+    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use crate::VideoShared;
@@ -314,7 +314,14 @@ pub fn release_sticky_keys(sender: &InputSender) {
 /// unreachable (field report: had to kill the app). When the hook is
 /// installed it swallows Q before the wndproc sees it, so this never
 /// double-fires.
-fn is_wndproc_escape(relative: bool, msg: u32, vk: u16, ctrl: bool, alt: bool, shift: bool) -> bool {
+fn is_wndproc_escape(
+    relative: bool,
+    msg: u32,
+    vk: u16,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+) -> bool {
     relative && matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN) && vk == VK_Q.0 && ctrl && alt && shift
 }
 
@@ -881,12 +888,7 @@ mod tests {
     fn wndproc_escape_fires_only_on_full_combo_keydown_while_captured() {
         // Full Ctrl+Alt+Shift+Q key-down while captured → escape.
         assert!(is_wndproc_escape(
-            true,
-            WM_KEYDOWN,
-            VK_Q.0,
-            true,
-            true,
-            true
+            true, WM_KEYDOWN, VK_Q.0, true, true, true
         ));
         // Alt makes Q a syskey — same result.
         assert!(is_wndproc_escape(
@@ -899,39 +901,15 @@ mod tests {
         ));
         // Not captured → never (normal desktop use must not trap Q).
         assert!(!is_wndproc_escape(
-            false,
-            WM_KEYDOWN,
-            VK_Q.0,
-            true,
-            true,
-            true
+            false, WM_KEYDOWN, VK_Q.0, true, true, true
         ));
         // Missing any modifier → no escape.
         assert!(!is_wndproc_escape(
-            true,
-            WM_KEYDOWN,
-            VK_Q.0,
-            true,
-            false,
-            true
+            true, WM_KEYDOWN, VK_Q.0, true, false, true
         ));
         // Wrong key → no escape.
-        assert!(!is_wndproc_escape(
-            true,
-            WM_KEYDOWN,
-            0x41,
-            true,
-            true,
-            true
-        ));
+        assert!(!is_wndproc_escape(true, WM_KEYDOWN, 0x41, true, true, true));
         // Key-up (WM_KEYUP) is not a trigger edge.
-        assert!(!is_wndproc_escape(
-            true,
-            WM_KEYUP,
-            VK_Q.0,
-            true,
-            true,
-            true
-        ));
+        assert!(!is_wndproc_escape(true, WM_KEYUP, VK_Q.0, true, true, true));
     }
 }

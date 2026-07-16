@@ -64,11 +64,13 @@ pub struct AudioShared {
 
 // ── Opus decode (libavcodec built-in) ─────────────────────────────────────
 
-/// Decodes RFC 7587 opus packets to interleaved f32 stereo @ 48 kHz.
+/// Decodes RFC 7587 opus packets to interleaved f32 @ 48 kHz for whatever
+/// channel count it was opened with.
 pub struct OpusDecoder {
     ctx: *mut ff::AVCodecContext,
     frame: *mut ff::AVFrame,
     pkt: *mut ff::AVPacket,
+    channels: u16,
 }
 
 // SAFETY: pointers are exclusively owned; the audio thread is the only
@@ -76,7 +78,13 @@ pub struct OpusDecoder {
 unsafe impl Send for OpusDecoder {}
 
 impl OpusDecoder {
-    pub fn new() -> Result<Self, AudioError> {
+    /// Opens the FFmpeg opus decoder for `channels` (SDP-negotiated,
+    /// already clamped by `client_transport::flow::negotiated_channels` —
+    /// see `RxCore::audio_channels`). `0` defensively falls back to stereo;
+    /// callers should not normally pass it since the channel-count cell is
+    /// pre-clamped at the session boundary.
+    pub fn new(channels: u16) -> Result<Self, AudioError> {
+        let channels = if channels == 0 { 2 } else { channels };
         unsafe {
             let codec = ff::avcodec_find_decoder(ff::AVCodecID::AV_CODEC_ID_OPUS);
             if codec.is_null() {
@@ -90,13 +98,14 @@ impl OpusDecoder {
                 ctx,
                 frame: ptr::null_mut(),
                 pkt: ptr::null_mut(),
+                channels,
             };
             // RTP opus is always decoded at 48 kHz; TOC switches frame
-            // sizes internally. The track is stereo (RFC 7587 §4.2).
+            // sizes internally. The channel layout is SDP-negotiated
+            // (surround decode) — `run_shared`/`run_exclusive` reopen this
+            // decoder whenever `RxCore::audio_channels()` changes.
             (*ctx).sample_rate = 48_000;
-            ff::av_channel_layout_default(&mut (*ctx).ch_layout, 2);
-            // TODO(surround): decoder is opened stereo; N-channel decode
-            // needs the stream channel count (SDP-negotiated).
+            ff::av_channel_layout_default(&mut (*ctx).ch_layout, channels as i32);
             let rc = ff::avcodec_open2(ctx, codec, ptr::null_mut());
             if rc < 0 {
                 return Err(AudioError(format!("avcodec_open2: {}", err_str(rc))));
@@ -108,6 +117,12 @@ impl OpusDecoder {
             }
             Ok(d)
         }
+    }
+
+    /// Channel count this decoder instance was opened for (what
+    /// [`Self::decode`]'s output is interleaved as).
+    pub fn channels(&self) -> u16 {
+        self.channels
     }
 
     /// Decode one opus packet, appending interleaved stereo f32 @ 48 kHz
@@ -660,7 +675,12 @@ pub fn run(core: &RxCore, shared: &AudioShared, stopped: &AtomicBool) {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    let mut dec = match OpusDecoder::new() {
+    // Opened stereo until the SDP-negotiated channel count is known
+    // (`RxCore::audio_channels()` == 0 for ~130 ms after connect, per the
+    // `ConnectionComplete` timing note in client-transport::session) —
+    // `OpusDecoder::new` treats 0 as "stereo fallback". `run_shared`/
+    // `run_exclusive` reopen the decoder once the real count lands.
+    let mut dec = match OpusDecoder::new(core.audio_channels()) {
         Ok(d) => Some(d),
         Err(e) => {
             // Decoder init cannot recover by retry — audio stays off.
@@ -671,8 +691,13 @@ pub fn run(core: &RxCore, shared: &AudioShared, stopped: &AtomicBool) {
     };
 
     if shared.exclusive.load(Ordering::Relaxed) {
-        const DECODED_CHANNELS: u16 = 2;
-        match WasapiExclusiveOut::new(DECODED_CHANNELS) {
+        // WASAPI-exclusive is a fixed device format picked once up front
+        // (spike §C-3) — it MUST stay a device-supported count (stereo),
+        // never the decoder's negotiated source channel count N: opening
+        // a 6-ch exclusive stream against a stereo-only endpoint fails.
+        // `convert_into` downmixes N -> this count.
+        const EXCLUSIVE_DEVICE_CHANNELS: u16 = 2;
+        match WasapiExclusiveOut::new(EXCLUSIVE_DEVICE_CHANNELS) {
             Ok(out) => {
                 if run_exclusive(core, shared, stopped, out, &mut dec, delay_ms) {
                     return;
@@ -691,6 +716,40 @@ pub fn run(core: &RxCore, shared: &AudioShared, stopped: &AtomicBool) {
     }
 
     run_shared(core, shared, stopped, dec, delay_ms);
+}
+
+/// Reopens `dec` for `RxCore::audio_channels()` when that count is known
+/// (nonzero) and differs from the decoder's current channel count — the
+/// SDP-negotiated count lands ~130 ms after connect (well after [`run`]
+/// eagerly opens the stereo-fallback decoder), and a session-long fixed
+/// decoder would otherwise never see it. No-op while still unknown (0)
+/// or unchanged. A reopen failure keeps decoding with the previous
+/// decoder/channel count rather than dropping audio entirely.
+#[cfg(windows)]
+fn maybe_reopen_decoder(core: &RxCore, dec: &mut Option<OpusDecoder>) {
+    let wanted = core.audio_channels();
+    if wanted == 0 {
+        return;
+    }
+    if dec.as_ref().is_some_and(|d| d.channels() == wanted) {
+        return;
+    }
+    match OpusDecoder::new(wanted) {
+        Ok(d) => {
+            tracing::info!(
+                channels = wanted,
+                "opus decoder (re)opened for negotiated channel count"
+            );
+            *dec = Some(d);
+        }
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                channels = wanted,
+                "opus decoder reopen failed — keeping previous decoder"
+            );
+        }
+    }
 }
 
 /// Default WASAPI **shared**-mode path: fill the shared audio engine via
@@ -754,19 +813,19 @@ fn run_shared(
         match core.wait_audio(Duration::from_millis(20)) {
             Some(pkt) => {
                 shared.packets.fetch_add(1, Ordering::Relaxed);
+                maybe_reopen_decoder(core, &mut dec);
                 if let (Some(dec), Some(out)) = (dec.as_mut(), out.as_ref()) {
                     pcm.clear();
                     if let Err(e) = dec.decode(&pkt, &mut pcm) {
                         shared.decode_errors.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(err = %e, "opus decode failed — skipping packet");
                     } else {
-                        // Decoder is opened stereo (see the TODO at the
-                        // decoder-open site); pass its actual channel
-                        // count once N-channel decode lands.
-                        const DECODED_CHANNELS: u16 = 2;
+                        // The decoder's actual source channel count N —
+                        // `convert_into` downmixes N -> the (fixed,
+                        // device-supported) sink channel count below.
                         convert_into(
                             &pcm,
-                            DECODED_CHANNELS,
+                            dec.channels(),
                             48_000,
                             out.rate,
                             out.channels,
@@ -896,17 +955,21 @@ fn run_exclusive(
             match core.wait_audio(Duration::from_millis(20)) {
                 Some(pkt) => {
                     shared.packets.fetch_add(1, Ordering::Relaxed);
+                    maybe_reopen_decoder(core, dec);
                     if let Some(d) = dec.as_mut() {
                         pcm.clear();
                         if let Err(e) = d.decode(&pkt, &mut pcm) {
                             shared.decode_errors.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(err = %e, "opus decode failed — skipping packet");
                         } else {
-                            const DECODED_CHANNELS: u16 = 2;
+                            // `channels` here is the exclusive-mode
+                            // device's fixed format (see `run`); `d`'s
+                            // actual source channel count N is what
+                            // `convert_into` downmixes from.
                             let mut f = fifo
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            convert_into(&pcm, DECODED_CHANNELS, 48_000, rate, channels, &mut f);
+                            convert_into(&pcm, d.channels(), 48_000, rate, channels, &mut f);
                             while f.len() > fifo_cap {
                                 f.pop_front();
                             }
@@ -933,7 +996,7 @@ mod tests {
 
     #[test]
     fn opus_decoder_initializes() {
-        OpusDecoder::new().expect("libavcodec has the built-in opus decoder");
+        OpusDecoder::new(2).expect("libavcodec has the built-in opus decoder");
     }
 
     /// Pins the delay→samples math (truncation order) and the 2 s clamp.
@@ -1026,7 +1089,7 @@ mod tests {
             }
             assert!(!packets.is_empty(), "encoder produced packets");
 
-            let mut dec = OpusDecoder::new().expect("decoder");
+            let mut dec = OpusDecoder::new(2).expect("decoder");
             let mut pcm = Vec::new();
             for p in &packets {
                 dec.decode(p, &mut pcm).expect("decode");

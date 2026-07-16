@@ -48,6 +48,22 @@ use crate::transport::webrtc::qu_wire;
 /// Pinned by test: 4 MiB + 1 is rejected.
 const MAX_MSG_LEN: u32 = 4 * 1024 * 1024;
 
+/// Pure port resolution for the P2 config-driven relay port (module doc
+/// above: "P2 TODO: config-driven port + IPC plumbing"). `None` or
+/// `Some(0)` preserves today's ephemeral-port behavior (bind to port `0`,
+/// let the OS choose); any other configured value is used verbatim.
+///
+/// Plumbing deferred: wiring a real config value in requires (a) a port
+/// field on `common::config::WebRtcConfig` (or a dedicated qu-relay config
+/// struct), and (b) threading it through `QuRelayHandle::spawn` (called
+/// from `video.rs`, out of this slice's scope) down to the
+/// `TcpListener::bind` call below. This fn + its unit test land now; the
+/// `TcpListener::bind("127.0.0.1:0")` call stays unconditional.
+#[allow(dead_code)]
+pub(crate) fn resolve_relay_port(configured: Option<u16>) -> u16 {
+    configured.unwrap_or(0)
+}
+
 // ── Sink abstraction ──────────────────────────────────────────────────────
 
 /// Minimal async-send abstraction for the DataChannel side of the relay,
@@ -435,6 +451,14 @@ mod tests {
         io::{AsyncWriteExt, duplex},
         time::{Duration, sleep},
     };
+    #[test]
+    fn qu_relay_port_from_config() {
+        // None or 0 preserve today's ephemeral bind.
+        assert_eq!(resolve_relay_port(None), 0);
+        assert_eq!(resolve_relay_port(Some(0)), 0);
+        // Any other configured port passes through verbatim.
+        assert_eq!(resolve_relay_port(Some(45820)), 45820);
+    }
 
     // ── Test sink (Vec<Bytes>) ────────────────────────────────────────────
 

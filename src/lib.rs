@@ -250,11 +250,12 @@ pub fn spawn_embedded(config: Config) -> Result<EmbeddedServer, anyhow::Error> {
         }
         Err(_) => {
             let _ = thread.join();
-            Err(anyhow::anyhow!("embedded web-server thread died during bind"))
+            Err(anyhow::anyhow!(
+                "embedded web-server thread died during bind"
+            ))
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -307,11 +308,15 @@ mod tests {
         // Raw HTTP roundtrip — no client dependency.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
-        sock.write_all(b"GET /api/config.js HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .await
-            .expect("send request");
+        sock.write_all(
+            b"GET /api/config.js HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .expect("send request");
         let mut response = Vec::new();
-        sock.read_to_end(&mut response).await.expect("read response");
+        sock.read_to_end(&mut response)
+            .await
+            .expect("read response");
         let head = String::from_utf8_lossy(&response);
         assert!(
             head.starts_with("HTTP/1.1 "),
@@ -335,8 +340,10 @@ mod tests {
 
         use std::io::{Read, Write};
         let mut sock = std::net::TcpStream::connect(addr).expect("connect");
-        sock.write_all(b"GET /api/config.js HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .expect("send request");
+        sock.write_all(
+            b"GET /api/config.js HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .expect("send request");
         let mut response = Vec::new();
         sock.read_to_end(&mut response).expect("read response");
         assert!(

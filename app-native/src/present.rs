@@ -25,15 +25,16 @@ use windows::Win32::Graphics::Direct3D::{
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BUFFER_DESC,
     D3D11_COMPARISON_NEVER, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_MAP_WRITE_DISCARD, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT, D3D11CreateDevice, ID3D11Buffer,
-    ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader, ID3D11RenderTargetView,
-    ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
+    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_FORMAT_SUPPORT_DISPLAY, D3D11_MAP_WRITE_DISCARD,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_TEXTURE_ADDRESS_CLAMP,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT,
+    D3D11CreateDevice, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
+    ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
+    ID3D11VertexShader,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN,
-    DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+    DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
@@ -193,6 +194,31 @@ fn sharpen_from_env() -> f32 {
         .unwrap_or(0.0)
 }
 
+/// `BP_PRESENT_10BIT`: `"1"` opts into a 10-bit swapchain backbuffer
+/// when the device/display actually supports it as a display target;
+/// absent or any other value → 8-bit. Free-lunch-off-by-default: this
+/// path routes RGBA present through a shader blit instead of the
+/// bit-exact `CopyResource` fast path, so it stays opt-in.
+fn present_10bit_from_env() -> bool {
+    std::env::var("BP_PRESENT_10BIT")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Pure swapchain-backbuffer-format selector: 10-bit
+/// (`R10G10B10A2_UNORM`) only when the caller wants it AND the
+/// device/display reports support for it as a swapchain/display
+/// target; `R8G8B8A8_UNORM` otherwise (default, and any unsupported
+/// case). No I/O, no device calls — callers gather `caps_support_10bit`
+/// via `ID3D11Device::CheckFormatSupport` before calling this.
+fn preferred_present_format(want_10bit: bool, caps_support_10bit: bool) -> DXGI_FORMAT {
+    if want_10bit && caps_support_10bit {
+        DXGI_FORMAT_R10G10B10A2_UNORM
+    } else {
+        DXGI_FORMAT_R8G8B8A8_UNORM
+    }
+}
+
 /// Compile an HLSL source string via `D3DCompile`, returning shader
 /// bytecode ready for `CreateVertexShader`/`CreatePixelShader`.
 fn compile_hlsl(src: &str, entry: PCSTR, target: PCSTR) -> Result<Vec<u8>, PresentError> {
@@ -282,6 +308,13 @@ struct Renderer {
     ctx: ID3D11DeviceContext,
     swapchain: IDXGISwapChain2,
     waitable: HANDLE,
+    /// Actual swapchain backbuffer `DXGI_FORMAT`, chosen once at
+    /// creation by [`preferred_present_format`] (env `BP_PRESENT_10BIT`
+    /// gated by a `CheckFormatSupport` probe, with a logged fallback to
+    /// `R8G8B8A8_UNORM` on unsupported caps or swapchain-create
+    /// failure). Stable for the Renderer's lifetime — `ensure_size`'s
+    /// `ResizeBuffers` keeps it via `DXGI_FORMAT_UNKNOWN`.
+    backbuffer_format: DXGI_FORMAT,
     /// DEFAULT-usage upload target for the decoded RGBA rows, matching
     /// the swapchain buffer dimensions.
     upload: Option<ID3D11Texture2D>,
@@ -324,7 +357,20 @@ struct Renderer {
 unsafe impl Send for Renderer {}
 
 impl Renderer {
+    /// Reads the `BP_PRESENT_10BIT` env gate once; tests call `new_inner`
+    /// to force `want_10bit` WITHOUT a process-global env var (setting one
+    /// races sibling present tests running in parallel and corrupts their
+    /// readback — the backbuffer would silently flip to 10-bit).
     fn new(hwnd: HWND, width: u32, height: u32) -> Result<Self, PresentError> {
+        Self::new_inner(hwnd, width, height, present_10bit_from_env())
+    }
+
+    fn new_inner(
+        hwnd: HWND,
+        width: u32,
+        height: u32,
+        want_10bit: bool,
+    ) -> Result<Self, PresentError> {
         unsafe {
             let mut device = None;
             let mut ctx = None;
@@ -346,10 +392,16 @@ impl Renderer {
             let dxgi_dev: IDXGIDevice = device.cast()?;
             let factory: IDXGIFactory2 = dxgi_dev.GetAdapter()?.GetParent()?;
 
-            let desc = DXGI_SWAP_CHAIN_DESC1 {
+            let caps_10bit = device
+                .CheckFormatSupport(DXGI_FORMAT_R10G10B10A2_UNORM)
+                .map(|support| support & D3D11_FORMAT_SUPPORT_DISPLAY.0 as u32 != 0)
+                .unwrap_or(false);
+            let mut format = preferred_present_format(want_10bit, caps_10bit);
+
+            let mut desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
-                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                Format: format,
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
                     Quality: 0,
@@ -363,10 +415,19 @@ impl Renderer {
                 Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
                 ..Default::default()
             };
-            let swapchain: IDXGISwapChain2 = factory
+            let mut swapchain_result = factory
                 .CreateSwapChainForHwnd(&device, hwnd, &desc, None, None)
-                .map_err(|e| PresentError(format!("CreateSwapChainForHwnd: {e}")))?
-                .cast()?;
+                .and_then(|s| s.cast::<IDXGISwapChain2>());
+            if swapchain_result.is_err() && format == DXGI_FORMAT_R10G10B10A2_UNORM {
+                tracing::warn!("10-bit swapchain create failed — falling back to 8-bit backbuffer");
+                format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                desc.Format = format;
+                swapchain_result = factory
+                    .CreateSwapChainForHwnd(&device, hwnd, &desc, None, None)
+                    .and_then(|s| s.cast::<IDXGISwapChain2>());
+            }
+            let swapchain: IDXGISwapChain2 = swapchain_result
+                .map_err(|e| PresentError(format!("CreateSwapChainForHwnd: {e}")))?;
             // On the swapchain, NOT the device (Present would block).
             swapchain.SetMaximumFrameLatency(1)?;
             let waitable = HANDLE(swapchain.GetFrameLatencyWaitableObject().0);
@@ -379,6 +440,7 @@ impl Renderer {
                 ctx,
                 swapchain,
                 waitable,
+                backbuffer_format: format,
                 upload: None,
                 upload_srv: None,
                 sharpen: sharpen_from_env(),
@@ -471,7 +533,12 @@ impl Renderer {
             self.ctx
                 .UpdateSubresource(&upload, 0, None, frame.rgba.as_ptr().cast(), w * 4, 0);
             let back: ID3D11Texture2D = self.swapchain.GetBuffer(0)?;
-            if self.sharpen > 0.0 {
+            if self.sharpen > 0.0 || self.backbuffer_format == DXGI_FORMAT_R10G10B10A2_UNORM {
+                // CopyResource requires format-compatible src/dst; an R8
+                // upload can't CopyResource into an R10 backbuffer, so
+                // the 10-bit path always routes through the shader blit
+                // (the SHARPEN_HLSL pass is a passthrough at strength
+                // 0.0 — center + 0 * (...) == center).
                 self.draw_sharpen(&back, &upload, w, h)?;
             } else {
                 self.ctx.CopyResource(&back, &upload);
@@ -818,7 +885,12 @@ impl Renderer {
     }
 
     /// Copy the current backbuffer to a staging texture and return its
-    /// pixels tightly packed (test/readback path).
+    /// pixels tightly packed (test/readback path). Staging format
+    /// mirrors [`Self::backbuffer_format`] — `CopyResource` requires
+    /// format-compatible src/dst, and a mismatched staging format would
+    /// fail the copy under the 10-bit path. Both supported backbuffer
+    /// formats (`R8G8B8A8_UNORM`, `R10G10B10A2_UNORM`) are 32-bit/pixel,
+    /// so the tight `width * 4` row stride below holds for either.
     #[cfg(test)]
     fn read_backbuffer(&mut self) -> Result<Vec<u8>, PresentError> {
         use windows::Win32::Graphics::Direct3D11::{
@@ -831,7 +903,7 @@ impl Renderer {
                 Height: self.height,
                 MipLevels: 1,
                 ArraySize: 1,
-                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                Format: self.backbuffer_format,
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
                     Quality: 0,
@@ -1166,6 +1238,33 @@ mod tests {
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::{CW_USEDEFAULT, WS_OVERLAPPEDWINDOW};
 
+    /// GATING acceptance: the 10-bit format selector is pure and needs
+    /// no D3D11 device — default off, want+supported -> R10, and
+    /// want+unsupported (caps probe failed) falls back to R8.
+    #[test]
+    fn preferred_present_format_selects_10bit_only_when_wanted_and_supported() {
+        assert_eq!(
+            preferred_present_format(false, true),
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            "default (BP_PRESENT_10BIT unset) stays 8-bit even if the device supports 10-bit"
+        );
+        assert_eq!(
+            preferred_present_format(true, true),
+            DXGI_FORMAT_R10G10B10A2_UNORM,
+            "opted in + device supports it -> 10-bit"
+        );
+        assert_eq!(
+            preferred_present_format(true, false),
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            "opted in but CheckFormatSupport says unsupported -> fall back to 8-bit"
+        );
+        assert_eq!(
+            preferred_present_format(false, false),
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            "neither wanted nor supported -> 8-bit"
+        );
+    }
+
     /// Hidden top-level window standing in for the eframe chrome.
     fn hidden_parent() -> HWND {
         register_class();
@@ -1332,6 +1431,54 @@ mod tests {
             after_out > after_in + 5,
             "expected overshoot just after the edge: in={after_in} out={after_out}"
         );
+
+        drop(r);
+        unsafe {
+            let _ = DestroyWindow(parent); // destroys the child too
+        }
+    }
+
+    /// Secondary acceptance (device-backed, self-skips without a D3D11
+    /// device like the other Renderer tests): with `BP_PRESENT_10BIT=1`
+    /// the swapchain backbuffer format is either `R10G10B10A2_UNORM`
+    /// (device/display supports it) or the `R8G8B8A8_UNORM` fallback —
+    /// never a creation failure — and a subsequent RGBA draw+present+
+    /// readback round-trips through the shader-blit path without error.
+    #[test]
+    fn swapchain_10bit_or_fallback() {
+        // Force want_10bit via new_inner (NOT a process-global env var,
+        // which would race sibling present tests running in parallel).
+        let parent = hidden_parent();
+        let child = create_stream_child(parent).expect("child window");
+        unsafe {
+            let _ = MoveWindow(child, 0, 0, 320, 240, false);
+        }
+
+        let f = gradient(64, 48);
+        let mut r = match Renderer::new_inner(child, 64, 48, true) {
+            Ok(r) => r,
+            Err(e) => {
+                // No hardware D3D11 device (bare CI VM): nothing to test.
+                eprintln!("skipping: {e}");
+                unsafe {
+                    let _ = DestroyWindow(parent);
+                }
+                return;
+            }
+        };
+        assert!(
+            r.backbuffer_format == DXGI_FORMAT_R10G10B10A2_UNORM
+                || r.backbuffer_format == DXGI_FORMAT_R8G8B8A8_UNORM,
+            "backbuffer format must be 10-bit or the 8-bit fallback, got {:?}",
+            r.backbuffer_format
+        );
+        r.draw(&f).expect("draw through shader-blit or copy path");
+        // Bytes-per-pixel is 4 for both supported formats, so the
+        // readback shape (not content — 10-bit re-encodes the byte
+        // pattern) must at least match length.
+        let out = r.read_backbuffer().expect("readback");
+        assert_eq!(out.len(), f.rgba.len());
+        r.present().expect("present");
 
         drop(r);
         unsafe {

@@ -39,7 +39,7 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 use crate::capi::RxCore;
 use crate::cursor::{CursorShared, decode_pos, decode_shape};
-use crate::flow::{FlowAction, FlowConfig, SignalingFlow, StreamParams};
+use crate::flow::{FlowAction, FlowConfig, SignalingFlow, StreamParams, negotiated_channels};
 use crate::tls::{ServerTrust, client_config};
 use crate::watchdog::{StallWatchdog, WatchdogAction, WatchdogConfig};
 
@@ -577,6 +577,15 @@ async fn run_session(
                         }
                         FlowAction::Complete(params) => {
                             info!(?params, "ConnectionComplete");
+                            let channels = negotiated_channels(params.audio_channel_count);
+                            if !(1..=8).contains(&params.audio_channel_count) {
+                                warn!(
+                                    audio_channel_count = params.audio_channel_count,
+                                    fallback_channels = channels,
+                                    "invalid/zero SDP audio channel count — falling back to stereo"
+                                );
+                            }
+                            core.set_audio_channels(channels);
                             *params_out
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) =

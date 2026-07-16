@@ -12,7 +12,7 @@
 //! The mirror C header lives at `client-transport/include/client_transport.h`
 //! and must stay in sync with this file.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,6 +42,11 @@ pub struct RxCore {
     /// Opus packets from the audio RTP track (session `on_track` pushes;
     /// the audio render thread pops). Independent of the video pipeline.
     audio: SampleQueue,
+    /// SDP-negotiated audio channel count (already clamped by
+    /// `crate::flow::negotiated_channels`), latched by the session's
+    /// `ConnectionComplete` handler. `0` = unknown/not yet negotiated —
+    /// `app-native`'s audio thread treats that as "decode stereo".
+    audio_channels: AtomicU16,
 }
 
 impl RxCore {
@@ -53,6 +58,7 @@ impl RxCore {
             decode_needs_idr: AtomicBool::new(false),
             frames_delivered: AtomicU64::new(0),
             audio: SampleQueue::new(DEFAULT_AUDIO_CAP),
+            audio_channels: AtomicU16::new(0),
         }
     }
 
@@ -118,6 +124,19 @@ impl RxCore {
     /// `None` on timeout or after [`RxCore::close`].
     pub fn wait_audio(&self, timeout: Duration) -> Option<Vec<u8>> {
         self.audio.wait_pop(timeout)
+    }
+
+    /// Latch the SDP-negotiated audio channel count (session's
+    /// `ConnectionComplete` handler, already run through
+    /// `crate::flow::negotiated_channels`).
+    pub fn set_audio_channels(&self, channels: u16) {
+        self.audio_channels.store(channels, Ordering::Release);
+    }
+
+    /// Current negotiated audio channel count; `0` means unknown/not yet
+    /// negotiated (audio thread decodes stereo until this becomes nonzero).
+    pub fn audio_channels(&self) -> u16 {
+        self.audio_channels.load(Ordering::Acquire)
     }
 
     pub fn close(&self) {

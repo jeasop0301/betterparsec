@@ -46,6 +46,22 @@ pub struct StreamParams {
     pub audio_mapping: [u8; 8],
 }
 
+/// Clamp an SDP-negotiated audio channel count into the decodable range.
+///
+/// `sdp_ch` is `StreamParams::audio_channel_count` off `ConnectionComplete`.
+/// Valid negotiated counts are `1..=8`; `0` (not yet known / not sent) and
+/// anything outside that range are treated as invalid and fall back to
+/// stereo — the one layout every device path (WASAPI shared *and*
+/// exclusive) is guaranteed to support, rather than clamping a bogus large
+/// count down to 8 and pretending it was negotiated.
+pub fn negotiated_channels(sdp_ch: u32) -> u16 {
+    if (1..=8).contains(&sdp_ch) {
+        sdp_ch as u16
+    } else {
+        2
+    }
+}
+
 /// Immutable per-session request parameters.
 #[derive(Debug, Clone)]
 pub struct FlowConfig {
@@ -309,5 +325,21 @@ mod tests {
         let set = serde_json::to_value(StreamClientMessage::SetTransport(TransportType::WebRTC))
             .expect("serialise");
         assert_eq!(set["SetTransport"], "WebRTC");
+    }
+
+    /// GATING acceptance (S2 surround N-channel decode): clamp behaviour
+    /// plus the 0/invalid → stereo fallback.
+    #[test]
+    fn negotiated_channels_clamps_and_falls_back_to_stereo() {
+        // 0 (not yet known / not negotiated) → stereo.
+        assert_eq!(negotiated_channels(0), 2);
+        // In-range counts pass through unchanged.
+        assert_eq!(negotiated_channels(1), 1);
+        assert_eq!(negotiated_channels(2), 2);
+        assert_eq!(negotiated_channels(6), 6);
+        assert_eq!(negotiated_channels(8), 8);
+        // Out-of-range (invalid) → stereo, not clamped to 8.
+        assert_eq!(negotiated_channels(9), 2);
+        assert_eq!(negotiated_channels(100), 2);
     }
 }

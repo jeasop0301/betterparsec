@@ -28,6 +28,11 @@ New-Item -ItemType Directory -Path $staging | Out-Null
 
 $files = @(
     'betterparsec.exe',
+    # Field diagnosis for the 07-17 Alt+Tab issue: run hook-probe.exe on
+    # the client machine — exit 0 / "events observed: ~10" proves LL
+    # keyboard hooks work there; 0 events means something on that machine
+    # blocks them (security software / conflicting hook).
+    'hook-probe.exe',
     'avcodec-61.dll', 'avdevice-61.dll', 'avfilter-10.dll',
     'avformat-61.dll', 'avutil-59.dll', 'swresample-5.dll', 'swscale-8.dll'
 )

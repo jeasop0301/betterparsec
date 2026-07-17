@@ -15,6 +15,10 @@ required-features = ["video"]
 name = "quality-probe"
 path = "src/bin/quality_probe.rs"
 required-features = ["video"]
+[[bin]]
+name = "hook-probe"
+path = "src/bin/hook_probe.rs"
+required-features = ["video"]
 
 [dependencies]
 client-transport = { path = "../client-transport" }

@@ -80,14 +80,14 @@ fn main() -> eframe::Result {
             None => registry.init(),
         }
     }
-    tracing::info!("=== betterparsec build 07-17g starting ===");
+    tracing::info!("=== betterparsec build 07-17h starting ===");
     #[cfg(all(windows, feature = "video"))]
     tracing::info!(elevated = is_elevated(), "process integrity");
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
-            .with_title("BetterParsec — build 07-17g (run-as-admin option)"),
+            .with_title("BetterParsec — build 07-17h (Ctrl+Tab = host Alt+Tab)"),
         ..Default::default()
     };
     eframe::run_native(

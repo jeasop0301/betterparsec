@@ -67,6 +67,24 @@ fn main() {
         }
     };
 
+    // RegisterHotKey(Alt+Tab) viability probe (07-17g field log: the
+    // registration fails on every attempt on the tester's machine —
+    // this tells us whether that is machine-specific or OS-reserved).
+    {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            MOD_ALT, RegisterHotKey, UnregisterHotKey, VK_TAB,
+        };
+        match unsafe { RegisterHotKey(None, 42, MOD_ALT, VK_TAB.0 as u32) } {
+            Ok(()) => {
+                println!("RegisterHotKey(Alt+Tab): OK");
+                unsafe {
+                    let _ = UnregisterHotKey(None, 42);
+                }
+            }
+            Err(e) => println!("RegisterHotKey(Alt+Tab): FAILED — {e}"),
+        }
+    }
+
     // Inject 5 SHIFT down/up pairs, spaced out so each is a distinct event.
     for _ in 0..5 {
         let mk = |flags: KEYBD_EVENT_FLAGS| INPUT {

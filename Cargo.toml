@@ -134,3 +134,10 @@ workspace = true
 # ignored; patches and revision pins are the reproducible source of truth.
 [patch."https://github.com/MrCreativ3001/moonlight-common-rust.git"]
 moonlight-common = { path = "vendor/moonlight-common-rust" }
+
+# Vendored SCTP with the clock-step RTT fix (see vendor/webrtc-sctp/Cargo.toml
+# header): a wall-clock adjustment mid-session must skip one RTT sample, not
+# abort SACK handling and desync the inflight queue (2026-07-17 live incident:
+# every DataChannel — input/cursor/control — frozen behind a TSN-pop cascade).
+[patch."https://github.com/MrCreativ3001/webrtc-rs.git"]
+webrtc-sctp = { path = "vendor/webrtc-sctp" }

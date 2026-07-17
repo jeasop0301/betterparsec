@@ -579,6 +579,10 @@ struct HookShared {
     /// Remembers a swallowed Tab-down until its matching up edge even if the
     /// user releases Alt first.
     alt_tab_active: Arc<AtomicBool>,
+    /// Diagnostic: set on the first event this installation's proc receives
+    /// (live evidence for "hook installed but Windows never delivers" —
+    /// the silent LowLevelHooksTimeout removal, field reports 07-16/07-17).
+    saw_event: Arc<AtomicBool>,
 }
 
 struct HookState {
@@ -614,6 +618,7 @@ pub fn install_keyboard_hook(capture: Arc<CaptureShared>, sender: InputSender) {
         sender,
         alt_pressed: Arc::new(AtomicBool::new(false)),
         alt_tab_active: Arc::new(AtomicBool::new(false)),
+        saw_event: Arc::new(AtomicBool::new(false)),
     };
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
     let join = std::thread::Builder::new()
@@ -711,6 +716,9 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             .as_ref()
             .map(|s| s.shared.clone());
         if let Some(shared) = shared {
+            if !shared.saw_event.swap(true, Ordering::AcqRel) {
+                tracing::info!("kb hook first event received — hook is live");
+            }
             let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
             let vk = kb.vkCode;
             let msg = wparam.0 as u32;

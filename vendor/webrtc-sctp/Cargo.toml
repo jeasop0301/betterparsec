@@ -1,0 +1,64 @@
+# Vendored from https://github.com/MrCreativ3001/webrtc-rs.git rev c9675e2
+# (sctp/) with ONE behavioral patch: SACK RTT measurement no longer
+# aborts chunk handling when the wall clock steps backwards mid-session
+# (webrtc-sctp uses non-monotonic SystemTime for RTT; an NTP adjustment
+# made handle_chunk return ErrInvalidSystemTime and desynced the inflight
+# queue, killing every DataChannel — live incident 2026-07-17, client
+# mouse+keyboard frozen for ~7s with a "unable to be popped from inflight
+# queue TSN" cascade). See association/association_internal.rs, the two
+# `duration_since(c.since)` sites. Wired in via [patch] in the workspace
+# root Cargo.toml. Workspace-inherited fields are materialized below
+# because this copy lives outside the fork's workspace.
+[package]
+name = "webrtc-sctp"
+version = "0.17.1"
+authors = ["Rain Liu <yliu@webrtc.rs>"]
+edition = "2021"
+description = "A pure Rust implementation of SCTP"
+license = "MIT/Apache-2.0"
+documentation = "https://docs.rs/webrtc-sctp"
+homepage = "https://webrtc.rs"
+repository = "https://github.com/webrtc-rs/webrtc/tree/master/sctp"
+
+[dependencies]
+util = { package = "webrtc-util", git = "https://github.com/MrCreativ3001/webrtc-rs.git", rev = "c9675e222245e95c056e2dcc0195fb076ffa9b89", default-features = false, features = ["conn"] }
+
+arc-swap = "1"
+tokio = { version = "1.32.0", features = [
+    "fs",
+    "io-util",
+    "io-std",
+    "macros",
+    "net",
+    "parking_lot",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+bytes = "1"
+rand = "0.9"
+crc = "3.2.1"
+async-trait = "0.1"
+log = "0.4"
+thiserror = "1"
+portable-atomic = "1.6"
+
+[dev-dependencies]
+lazy_static = "1"
+env_logger = "0.11.3"
+chrono = "0.4.28"
+clap = "3"
+
+[[example]]
+name = "ping"
+path = "examples/ping.rs"
+bench = false
+
+[[example]]
+name = "pong"
+path = "examples/pong.rs"
+bench = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

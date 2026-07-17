@@ -1,6 +1,11 @@
 # Rust
 /target
 /vendor
+# EXCEPT the hand-patched SCTP crate: unlike the bootstrap-generated
+# moonlight checkout, this copy carries a repository-owned behavioral fix
+# (clock-step RTT — see vendor/webrtc-sctp/Cargo.toml header) and IS the
+# source of truth for the [patch] in the workspace root.
+!/vendor/webrtc-sctp/
 finalOutput
 ignore
 # Release-mode local web asset copy (built from dist/, see README "release mode")

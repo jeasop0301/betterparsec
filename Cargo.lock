@@ -5845,7 +5845,6 @@ dependencies = [
 [[package]]
 name = "webrtc-sctp"
 version = "0.17.1"
-source = "git+https://github.com/MrCreativ3001/webrtc-rs.git?rev=c9675e222245e95c056e2dcc0195fb076ffa9b89#c9675e222245e95c056e2dcc0195fb076ffa9b89"
 dependencies = [
  "arc-swap",
  "async-trait",

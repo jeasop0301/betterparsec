@@ -80,12 +80,12 @@ fn main() -> eframe::Result {
             None => registry.init(),
         }
     }
-    tracing::info!("=== betterparsec build 07-17b starting ===");
+    tracing::info!("=== betterparsec build 07-17c starting ===");
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
-            .with_title("BetterParsec — build 07-17b (focus-guarded capture)"),
+            .with_title("BetterParsec — build 07-17c (sctp clock fix + hook diag)"),
         ..Default::default()
     };
     eframe::run_native(

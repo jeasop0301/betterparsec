@@ -1205,12 +1205,24 @@ mod tests {
         let mut now = Instant::now();
 
         for _cycle in 0..3 {
-            // Let the fake child (a ~1ms sleep) actually die before we
-            // ask the supervisor to notice.
-            std::thread::sleep(Duration::from_millis(40));
-            now += Duration::from_millis(40);
-            let state = sup.poll_at(now);
-            assert_eq!(state, SupervisorState::Restarting);
+            // Let the fake child (a ~1ms sleep) actually die AND the
+            // supervisor observe it. A fixed 40ms sleep flaked twice
+            // under parallel-test load (process spawn+exit can take far
+            // longer than the nominal 1ms), so wait bounded-but-
+            // generously for the Restarting observation instead. The
+            // wait happens BEFORE crash detection, so it consumes none
+            // of the backoff window the cycle measures.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut state = sup.poll_at(now);
+            while state != SupervisorState::Restarting {
+                assert!(
+                    Instant::now() < deadline,
+                    "child death never observed — state={state:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+                now += Duration::from_millis(10);
+                state = sup.poll_at(now);
+            }
 
             let mut ticks = 0u32;
             loop {

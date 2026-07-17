@@ -1141,12 +1141,14 @@ impl StreamSurface {
             unsafe {
                 let _ = ClipCursor(None);
             }
+            CLIP_HWND.store(0, Ordering::Release);
             return;
         }
         let mut rect = RECT::default();
         unsafe {
-            if GetWindowRect(self.hwnd, &mut rect).is_ok() {
-                let _ = ClipCursor(Some(&rect));
+            if GetWindowRect(self.hwnd, &mut rect).is_ok() && ClipCursor(Some(&rect)).is_ok() {
+                CLIP_HWND.store(self.hwnd.0 as isize, Ordering::Release);
+                ensure_clip_failsafe();
             }
         }
     }
@@ -1160,11 +1162,91 @@ impl StreamSurface {
         unsafe {
             let _ = ClipCursor(None);
         }
+        CLIP_HWND.store(0, Ordering::Release);
     }
 }
 
 const HID_PAGE_GENERIC: u16 = 0x01;
 const HID_USAGE_MOUSE: u16 = 0x02;
+
+/// hwnd whose rect currently owns our `ClipCursor` (0 = no active clip)
+/// — written by [`StreamSurface::clip_cursor_to_self`]/the release paths,
+/// read by the clip failsafe thread.
+static CLIP_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// Millisecond heartbeat of the shell frame loop ([`note_shell_tick`]).
+static SHELL_TICK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FAILSAFE_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Shell frame heartbeat — `App::update` calls this every frame so the
+/// clip failsafe can tell a healthy shell from a hung one.
+pub fn note_shell_tick() {
+    SHELL_TICK_MS.store(now_ms(), Ordering::Release);
+}
+
+/// Pure failsafe verdict (tested): release the OS cursor clip when the
+/// clipped window is gone/foreign OR the shell frame loop stopped
+/// ticking. Field reports 07-16/07-17: `ClipCursor` is global OS state
+/// that Windows never auto-releases; every in-process release path runs
+/// on the shell/wndproc threads, so a hung UI thread (or any missed
+/// focus transition) left the user's cursor permanently caged. The
+/// failsafe thread is the one release path that depends on nothing else.
+pub fn failsafe_should_release(clip_active: bool, window_ours_and_alive: bool, shell_alive: bool) -> bool {
+    clip_active && (!window_ours_and_alive || !shell_alive)
+}
+
+/// Watchdog thread for the cursor clip: every 250 ms, if we own a clip
+/// but the clipped window is not foreground/alive or the shell loop has
+/// not ticked for >1 s, force `ClipCursor(None)`. Spawned once, on the
+/// first actual clip.
+fn ensure_clip_failsafe() {
+    if FAILSAFE_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("clip-failsafe".into())
+        .spawn(|| {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                ClipCursor, GA_ROOT, GetAncestor, GetForegroundWindow, IsWindow,
+            };
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let raw = CLIP_HWND.load(Ordering::Acquire);
+                if raw == 0 {
+                    continue;
+                }
+                let hwnd = HWND(raw as *mut _);
+                let (ours, shell_alive) = unsafe {
+                    let alive = IsWindow(Some(hwnd)).as_bool();
+                    let fg = GetForegroundWindow();
+                    let ours = alive && (fg == hwnd || fg == GetAncestor(hwnd, GA_ROOT));
+                    let alive_shell =
+                        now_ms().saturating_sub(SHELL_TICK_MS.load(Ordering::Acquire)) < 1_000;
+                    (ours, alive_shell)
+                };
+                if failsafe_should_release(true, ours, shell_alive) {
+                    unsafe {
+                        let _ = ClipCursor(None);
+                    }
+                    CLIP_HWND.store(0, Ordering::Release);
+                    tracing::warn!(
+                        window_ours = ours,
+                        shell_alive,
+                        "clip failsafe released the cursor"
+                    );
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(err = %e, "clip failsafe thread spawn failed");
+    }
+}
 
 /// Global immersive-capture teardown: deregister the raw mouse, unclip
 /// the cursor, and uninstall the Keyboard Lock hook (Phase B2,
@@ -1186,6 +1268,7 @@ pub fn release_mouse_capture_global() {
         let _ = RegisterRawInputDevices(&[rid], size_of::<RAWINPUTDEVICE>() as u32);
         let _ = ClipCursor(None);
     }
+    CLIP_HWND.store(0, Ordering::Release);
     crate::input::uninstall_keyboard_hook();
 }
 
@@ -1363,6 +1446,26 @@ fn render_loop(hwnd: HWND, shared: &Arc<VideoShared>, core: &Arc<RxCore>, want_1
 mod tests {
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::{CW_USEDEFAULT, WS_OVERLAPPEDWINDOW};
+
+    #[test]
+    fn clip_failsafe_releases_on_foreign_window_or_hung_shell_only() {
+        // (clip_active, window_ours_and_alive, shell_alive) -> release
+        let cases = [
+            (false, false, false, false), // no clip: never touch the OS state
+            (false, true, true, false),
+            (true, true, true, false), // healthy: leave the clip alone
+            (true, false, true, true), // foreign/destroyed window
+            (true, true, false, true), // shell hung
+            (true, false, false, true),
+        ];
+        for (active, ours, shell, want) in cases {
+            assert_eq!(
+                failsafe_should_release(active, ours, shell),
+                want,
+                "active={active} ours={ours} shell={shell}"
+            );
+        }
+    }
 
     // ── G004: PresentStall bounded ladder (pure, no D3D11 device) ───────
 

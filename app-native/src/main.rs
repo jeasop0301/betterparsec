@@ -80,12 +80,12 @@ fn main() -> eframe::Result {
             None => registry.init(),
         }
     }
-    tracing::info!("=== betterparsec build 07-17c starting ===");
+    tracing::info!("=== betterparsec build 07-17d starting ===");
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
-            .with_title("BetterParsec — build 07-17c (sctp clock fix + hook diag)"),
+            .with_title("BetterParsec — build 07-17d (clip failsafe thread)"),
         ..Default::default()
     };
     eframe::run_native(
@@ -1313,6 +1313,11 @@ impl eframe::App for App {
 
         #[cfg(not(all(windows, feature = "video")))]
         let _ = &frame;
+
+        // Clip-failsafe heartbeat: proves the shell loop is alive so the
+        // watchdog thread only force-unclips when this stops ticking.
+        #[cfg(all(windows, feature = "video"))]
+        present::note_shell_tick();
 
         self.poll_host_starting();
 

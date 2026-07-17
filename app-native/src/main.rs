@@ -80,12 +80,12 @@ fn main() -> eframe::Result {
             None => registry.init(),
         }
     }
-    tracing::info!("=== betterparsec build 07-16m starting ===");
+    tracing::info!("=== betterparsec build 07-17a starting ===");
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
-            .with_title("BetterParsec — build 07-16m (IDR-gated loss recovery)"),
+            .with_title("BetterParsec — build 07-17a (FEC v2 + watchdog + host role)"),
         ..Default::default()
     };
     eframe::run_native(

@@ -58,8 +58,8 @@
 G001–G006 헤드리스 게이트 전부 그린 이후에만 실행. 각 크리티컬 셀 **15분**. 증거(로그/incident snapshot/판정)는 셀별로 보존.
 
 ## 사전 조건
-- [ ] 호스트에 최신 `streamer.exe` 배포 + 재시작 (커밋 기준 확인 — FEC v2/IDR 게이트/`FecSenderExit` 포함 빌드)
-- [ ] 클라이언트 최신 빌드 (`betterparsec.exe` — watchdog/incident telemetry/FEC v2 포함)
+- [ ] 호스트에 최신 `streamer.exe`(+`web-server.exe` 갱신 시 함께) 배포 + 서비스 재시작 (커밋 `1bc7b99` 이후 빌드 — FEC v2/IDR 게이트/`FecSenderExit` 포함)
+- [ ] 클라이언트 타이틀바가 **`build 07-17a (FEC v2 + watchdog + host role)`** 인지 확인 — `07-16m` 이하면 G001–G006 미포함 구버전
 - [ ] `RUST_LOG=info` + `betterparsec.log` 확보 경로 확인. 스톨 시 incident snapshot(23필드) 캡처 방법 숙지
 
 ## 크리티컬 셀 (각 15분, 전 셀 통과 = P0 클로저)

@@ -80,12 +80,12 @@ fn main() -> eframe::Result {
             None => registry.init(),
         }
     }
-    tracing::info!("=== betterparsec build 07-17a starting ===");
+    tracing::info!("=== betterparsec build 07-17b starting ===");
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
-            .with_title("BetterParsec — build 07-17a (FEC v2 + watchdog + host role)"),
+            .with_title("BetterParsec — build 07-17b (focus-guarded capture)"),
         ..Default::default()
     };
     eframe::run_native(
@@ -1690,24 +1690,42 @@ impl eframe::App for App {
                                         }
                                         if self.immersive.engaged() {
                                             // Phase B2 host-authority
-                                            // auto-switch (Parsec/Moonlight
-                                            // parity): mirror the host's
-                                            // reported cursor visibility
-                                            // every frame — fullscreen and
-                                            // the keyboard hook stay
-                                            // engaged for the whole
-                                            // session, only the mouse
-                                            // relative flag + clip follow
-                                            // the host.
-                                            let want_rel = immersive::wants_relative_capture(
-                                                true,
+                                            // auto-switch + foreground
+                                            // guard: fullscreen and the
+                                            // keyboard hook stay engaged
+                                            // for the whole session; the
+                                            // mouse relative flag + clip
+                                            // follow the host, and ANY
+                                            // foreign foreground window
+                                            // (dead hook Alt+Tab escape,
+                                            // parent-focus loss, UAC)
+                                            // releases capture instead of
+                                            // caging the cursor to a
+                                            // background window.
+                                            match immersive::frame_capture(
+                                                s.is_foreground(),
                                                 run.session.cursor().visible(),
-                                            );
-                                            self.capture.set_relative(want_rel);
-                                            if want_rel {
-                                                s.clip_cursor_to_self();
-                                            } else {
-                                                s.release_cursor_clip();
+                                            ) {
+                                                immersive::FrameCapture::ReleaseAndExit => {
+                                                    tracing::info!(
+                                                        "immersive foreground lost — releasing capture and exiting"
+                                                    );
+                                                    self.capture.set_relative(false);
+                                                    self.capture.set_keyboard_capture(false);
+                                                    s.release_mouse_capture();
+                                                    input::release_sticky_keys(
+                                                        &run.session.input_sender(),
+                                                    );
+                                                    self.capture.request_exit();
+                                                }
+                                                immersive::FrameCapture::Clip => {
+                                                    self.capture.set_relative(true);
+                                                    s.clip_cursor_to_self();
+                                                }
+                                                immersive::FrameCapture::Unclip => {
+                                                    self.capture.set_relative(false);
+                                                    s.release_cursor_clip();
+                                                }
                                             }
                                         }
                                     }

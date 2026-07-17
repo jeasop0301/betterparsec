@@ -158,7 +158,13 @@ impl CursorShared {
     /// callback thread — see the doc comment on this struct for why plain
     /// atomic stores are sufficient here).
     pub fn store(&self, p: CursorPos) {
-        self.visible.store(p.visible, Ordering::Release);
+        let prev = self.visible.swap(p.visible, Ordering::AcqRel);
+        if prev != p.visible {
+            // Transition-only, so this stays quiet at 60 Hz — live-debug
+            // evidence for the host-authority mouse-mode auto-switch
+            // (clip follows this flag; a stuck value cages the cursor).
+            tracing::info!(visible = p.visible, "host cursor visibility changed");
+        }
         let packed = ((p.x as u32 as u64) << 32) | (p.y as u32 as u64);
         self.pos.store(packed, Ordering::Release);
         self.shape_id.store(p.shape_id, Ordering::Release);

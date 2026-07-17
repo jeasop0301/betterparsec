@@ -1113,11 +1113,36 @@ impl StreamSurface {
         release_mouse_capture_global();
     }
 
+    /// True when the foreground window is the stream child itself or its
+    /// top-level (chrome) window — the only states in which caging the
+    /// cursor is legitimate. Any other foreground window means a system
+    /// key sequence escaped capture (dead hook, parent-focus Alt+Tab,
+    /// UAC) and clipping would trap the cursor on a background window.
+    pub fn is_foreground(&self) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, GetForegroundWindow};
+        unsafe {
+            let fg = GetForegroundWindow();
+            if fg.is_invalid() {
+                return false;
+            }
+            fg == self.hwnd || fg == GetAncestor(self.hwnd, GA_ROOT)
+        }
+    }
+
     /// Re-assert the cursor clip onto the child window rect — called
     /// every frame while immersive, so moves/resizes need no event
-    /// plumbing.
+    /// plumbing. Foreground-guarded at this lowest level too: if our
+    /// windows are not foreground, clipping is never legitimate, so this
+    /// releases instead (field report 2026-07-17 — cursor caged to a
+    /// background window after a local Alt+Tab escape).
     pub fn clip_cursor_to_self(&self) {
         use windows::Win32::UI::WindowsAndMessaging::ClipCursor;
+        if !self.is_foreground() {
+            unsafe {
+                let _ = ClipCursor(None);
+            }
+            return;
+        }
         let mut rect = RECT::default();
         unsafe {
             if GetWindowRect(self.hwnd, &mut rect).is_ok() {

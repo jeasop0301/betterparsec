@@ -625,6 +625,22 @@ pub fn install_keyboard_hook(capture: Arc<CaptureShared>, sender: InputSender) {
             let _ = PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE);
             match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) {
                 Ok(hook) => {
+                    // LL hook callbacks race Windows' LowLevelHooksTimeout:
+                    // exceed it once (scheduling starvation under game/render
+                    // load counts) and the hook is SILENTLY removed — the
+                    // 07-16/07-17 field failure ("Alt+Tab switched CLIENT
+                    // windows during immersive"). Time-critical priority is
+                    // the standard mitigation for input-hook pump threads.
+                    {
+                        use windows::Win32::System::Threading::{
+                            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+                        };
+                        if SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL)
+                            .is_err()
+                        {
+                            tracing::warn!("kb-hook pump: SetThreadPriority failed");
+                        }
+                    }
                     let _ = ready_tx.send(Ok(GetCurrentThreadId()));
                     tracing::info!("WH_KEYBOARD_LL installed on dedicated pump thread");
                     while GetMessageW(&mut msg, None, 0, 0).0 > 0 {

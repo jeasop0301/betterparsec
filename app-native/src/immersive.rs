@@ -27,6 +27,41 @@ pub fn wants_relative_capture(engaged: bool, host_cursor_visible: bool) -> bool 
     engaged && !host_cursor_visible
 }
 
+/// Per-frame capture verdict while engaged (Phase B2 + focus guard).
+///
+/// The Alt+Tab/UAC escape hole (field report 2026-07-17): the
+/// WM_KILLFOCUS cleanup lives on the stream *child*'s wndproc, so any
+/// focus loss that bypasses the child (focus was on the parent chrome
+/// window, or the keyboard hook died and a local Alt+Tab switched
+/// windows) left `engaged()` true while the shell kept re-asserting
+/// `ClipCursor` every repaint — caging the cursor to a background
+/// window with no escape. The shell therefore polls the foreground
+/// window every frame and folds it into this decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameCapture {
+    /// One of our windows is foreground and the host cursor is hidden
+    /// (game): keep relative capture and re-assert the clip.
+    Clip,
+    /// Foreground, host cursor visible (menu/desktop): absolute input,
+    /// cursor free.
+    Unclip,
+    /// Neither the stream child nor the chrome window is foreground — a
+    /// system key sequence escaped capture: release everything and exit
+    /// immersive instead of caging the cursor to a background window.
+    ReleaseAndExit,
+}
+
+/// Foreground-aware Phase B2 decision, applied every engaged frame.
+pub fn frame_capture(our_window_foreground: bool, host_cursor_visible: bool) -> FrameCapture {
+    if !our_window_foreground {
+        FrameCapture::ReleaseAndExit
+    } else if host_cursor_visible {
+        FrameCapture::Unclip
+    } else {
+        FrameCapture::Clip
+    }
+}
+
 /// Side effects the shell must execute, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -219,6 +254,25 @@ mod tests {
                 wants_relative_capture(engaged, host_cursor_visible),
                 want,
                 "engaged={engaged} host_cursor_visible={host_cursor_visible}"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_capture_releases_on_any_focus_loss_regardless_of_host_cursor() {
+        use FrameCapture::*;
+        // (our_window_foreground, host_cursor_visible) -> verdict
+        let cases = [
+            (true, false, Clip),
+            (true, true, Unclip),
+            (false, false, ReleaseAndExit),
+            (false, true, ReleaseAndExit),
+        ];
+        for (foreground, host_cursor_visible, want) in cases {
+            assert_eq!(
+                frame_capture(foreground, host_cursor_visible),
+                want,
+                "foreground={foreground} host_cursor_visible={host_cursor_visible}"
             );
         }
     }

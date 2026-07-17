@@ -80,12 +80,14 @@ fn main() -> eframe::Result {
             None => registry.init(),
         }
     }
-    tracing::info!("=== betterparsec build 07-17f starting ===");
+    tracing::info!("=== betterparsec build 07-17g starting ===");
+    #[cfg(all(windows, feature = "video"))]
+    tracing::info!(elevated = is_elevated(), "process integrity");
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
-            .with_title("BetterParsec — build 07-17f (hotkey alt-tab + ws keepalive)"),
+            .with_title("BetterParsec — build 07-17g (run-as-admin option)"),
         ..Default::default()
     };
     eframe::run_native(
@@ -93,6 +95,63 @@ fn main() -> eframe::Result {
         options,
         Box::new(|_cc| Ok(Box::new(App::new()))),
     )
+}
+
+/// True when this process runs with an elevated (administrator) token.
+/// Anti-keylogging security suites can only blind LL keyboard hooks of
+/// medium-integrity processes — Parsec's service restarts its client
+/// elevated for exactly this reason, so we log the state at startup and
+/// offer a one-click elevated relaunch.
+#[cfg(all(windows, feature = "video"))]
+fn is_elevated() -> bool {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut _ as *mut _),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        ok && elevation.TokenIsElevated != 0
+    }
+}
+
+/// Relaunch this exe through the UAC `runas` verb and exit — the ad-hoc
+/// equivalent of Parsec's elevated-service restart, for machines whose
+/// security software blinds medium-integrity keyboard hooks.
+#[cfg(all(windows, feature = "video"))]
+fn restart_elevated() {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{HSTRING, w};
+    let Ok(exe) = std::env::current_exe() else {
+        tracing::warn!("restart_elevated: current_exe unavailable");
+        return;
+    };
+    unsafe {
+        ShellExecuteW(
+            None,
+            w!("runas"),
+            &HSTRING::from(exe.as_os_str()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        );
+    }
+    std::process::exit(0);
 }
 
 // ── Live receive stats (pump thread → UI) ─────────────────────────────────
@@ -1330,6 +1389,22 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("BetterParsec");
+            // Parsec-parity elevation escape hatch: anti-keylogging
+            // suites blind medium-integrity LL keyboard hooks (07-17
+            // field issue — Alt+Tab never reached the hook); an elevated
+            // relaunch puts the hook above them, exactly like Parsec's
+            // service-driven admin restart.
+            #[cfg(all(windows, feature = "video"))]
+            {
+                static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if !*ELEVATED.get_or_init(is_elevated)
+                    && ui
+                        .small_button("Restart as administrator (stronger keyboard capture)")
+                        .clicked()
+                {
+                    restart_elevated();
+                }
+            }
             ui.add_space(8.0);
             self.host_section(ui);
             ui.separator();

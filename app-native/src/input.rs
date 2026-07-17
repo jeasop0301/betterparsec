@@ -36,7 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_INPUT,
     WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
     WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_USER, WM_XBUTTONDOWN,
+    WM_HOTKEY, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_USER, WM_XBUTTONDOWN,
     WM_XBUTTONUP,
 };
 
@@ -343,6 +343,44 @@ pub fn release_sticky_keys(sender: &InputSender) {
     }
 }
 
+/// The exact key chord a remote Alt+Tab tap needs, in send order —
+/// pure so the hotkey fallback path is testable. `shift` = reverse
+/// cycling (Alt+Shift+Tab).
+fn alt_tab_chord(shift: bool) -> Vec<(KeyAction, u16, KeyModifiers)> {
+    let mut mods = KeyModifiers::ALT;
+    if shift {
+        mods |= KeyModifiers::SHIFT;
+    }
+    let mut chord = vec![(KeyAction::Down, VK_MENU.0, KeyModifiers::ALT)];
+    if shift {
+        chord.push((KeyAction::Down, VK_SHIFT.0, mods));
+    }
+    chord.push((KeyAction::Down, VK_TAB.0, mods));
+    chord.push((KeyAction::Up, VK_TAB.0, mods));
+    if shift {
+        chord.push((KeyAction::Up, VK_SHIFT.0, KeyModifiers::ALT));
+    }
+    chord.push((KeyAction::Up, VK_MENU.0, KeyModifiers::empty()));
+    chord
+}
+
+/// Forward one full remote Alt+Tab tap (the RegisterHotKey fallback for
+/// machines where WH_KEYBOARD_LL never receives events — 07-17e live
+/// log: 57 re-registrations, zero events, while wndproc keys flowed
+/// fine. Anti-keylogging security suites are built to blind LL keyboard
+/// hooks exactly like that; the system hotkey mechanism still works).
+fn forward_alt_tab(sender: &InputSender, shift: bool) {
+    for (action, key, modifiers) in alt_tab_chord(shift) {
+        sender.send(&InboundPacket::Key {
+            action,
+            modifiers,
+            key,
+            flags: KeyFlags::empty(),
+        });
+    }
+    tracing::info!(shift, "remote Alt+Tab forwarded via RegisterHotKey fallback");
+}
+
 /// Pure predicate for the hook-independent immersive escape in [`handle`]:
 /// Ctrl+Alt+Shift+Q on a key-down while immersive keyboard capture is
 /// engaged (session-scoped — NOT the per-frame relative flag, which the
@@ -613,6 +651,10 @@ fn wall_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Thread-hotkey ids for the RegisterHotKey Alt+Tab fallback.
+const HOTKEY_ALT_TAB: i32 = 1;
+const HOTKEY_ALT_SHIFT_TAB: i32 = 2;
+
 /// Installs the WH_KEYBOARD_LL hook on a DEDICATED message-pump thread
 /// (idempotent — a second call while installed is a no-op). A low-level
 /// hook executes in the context of its installing thread; installing on
@@ -635,6 +677,7 @@ pub fn install_keyboard_hook(capture: Arc<CaptureShared>, sender: InputSender) {
         last_event_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     let last_event_ms = shared.last_event_ms.clone();
+    let hotkey_sender = shared.sender.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
     let join = std::thread::Builder::new()
         .name("kb-hook-pump".into())
@@ -664,6 +707,39 @@ pub fn install_keyboard_hook(capture: Arc<CaptureShared>, sender: InputSender) {
                     }
                     let _ = ready_tx.send(Ok(GetCurrentThreadId()));
                     tracing::info!("WH_KEYBOARD_LL installed on dedicated pump thread");
+                    // Hook-free Alt+Tab fallback: RegisterHotKey routes the
+                    // system task-switch chord to THIS thread as WM_HOTKEY
+                    // and suppresses the local switcher — the mechanism
+                    // alternative task switchers use, and it keeps working
+                    // on machines whose anti-keylogging software blinds LL
+                    // keyboard hooks entirely (07-17e live log: 57
+                    // re-registrations, zero events). On healthy machines
+                    // the hook swallows Alt-down first, so the OS never
+                    // matches the hotkey and this path stays silent — no
+                    // double-forward.
+                    {
+                        use windows::Win32::UI::Input::KeyboardAndMouse::{
+                            MOD_ALT, MOD_SHIFT, RegisterHotKey,
+                        };
+                        if RegisterHotKey(None, HOTKEY_ALT_TAB, MOD_ALT, VK_TAB.0 as u32).is_err()
+                        {
+                            tracing::warn!(
+                                "RegisterHotKey(Alt+Tab) failed — hotkey fallback unavailable"
+                            );
+                        }
+                        if RegisterHotKey(
+                            None,
+                            HOTKEY_ALT_SHIFT_TAB,
+                            MOD_ALT | MOD_SHIFT,
+                            VK_TAB.0 as u32,
+                        )
+                        .is_err()
+                        {
+                            tracing::warn!(
+                                "RegisterHotKey(Alt+Shift+Tab) failed — hotkey fallback unavailable"
+                            );
+                        }
+                    }
                     // Re-registration watchdog (07-17d live log: five
                     // installs, ZERO proc events across 4+ minutes of
                     // gaming — Windows removes a timed-out LL hook with no
@@ -675,6 +751,11 @@ pub fn install_keyboard_hook(capture: Arc<CaptureShared>, sender: InputSender) {
                     let timer = SetTimer(None, 0, 3_000, None);
                     let mut rehooks = 0u32;
                     while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+                        if msg.message == WM_HOTKEY {
+                            let shift = msg.wParam.0 as i32 == HOTKEY_ALT_SHIFT_TAB;
+                            forward_alt_tab(&hotkey_sender, shift);
+                            continue;
+                        }
                         if msg.message == WM_TIMER {
                             let last = last_event_ms.load(Ordering::Acquire);
                             if wall_ms().saturating_sub(last) > 3_000 {
@@ -706,6 +787,11 @@ pub fn install_keyboard_hook(capture: Arc<CaptureShared>, sender: InputSender) {
                         }
                         let _ = TranslateMessage(&msg);
                         DispatchMessageW(&msg);
+                    }
+                    {
+                        use windows::Win32::UI::Input::KeyboardAndMouse::UnregisterHotKey;
+                        let _ = UnregisterHotKey(None, HOTKEY_ALT_TAB);
+                        let _ = UnregisterHotKey(None, HOTKEY_ALT_SHIFT_TAB);
                     }
                     if timer != 0 {
                         let _ = KillTimer(None, timer);
@@ -1138,6 +1224,33 @@ mod tests {
         assert_eq!(
             hook_decision(VK_Q.0 as u32, false, false, true),
             HookAction::Pass
+        );
+    }
+
+    #[test]
+    fn alt_tab_chord_is_a_balanced_tap_with_alt_carried_on_tab() {
+        use KeyAction::{Down, Up};
+        let alt = KeyModifiers::ALT;
+        let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
+        assert_eq!(
+            alt_tab_chord(false),
+            vec![
+                (Down, VK_MENU.0, alt),
+                (Down, VK_TAB.0, alt),
+                (Up, VK_TAB.0, alt),
+                (Up, VK_MENU.0, KeyModifiers::empty()),
+            ]
+        );
+        assert_eq!(
+            alt_tab_chord(true),
+            vec![
+                (Down, VK_MENU.0, alt),
+                (Down, VK_SHIFT.0, alt_shift),
+                (Down, VK_TAB.0, alt_shift),
+                (Up, VK_TAB.0, alt_shift),
+                (Up, VK_SHIFT.0, alt),
+                (Up, VK_MENU.0, KeyModifiers::empty()),
+            ]
         );
     }
 

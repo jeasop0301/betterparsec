@@ -852,6 +852,7 @@ async fn run_session(
     let mut dog_audio_ms: u64 = 0;
     let mut dog_last_idr_attempt: u32 = 0;
     let mut dog_paused = false;
+    let mut last_ws_ping_ms: u64 = now_ms();
 
     loop {
         tokio::select! {
@@ -862,6 +863,10 @@ async fn run_session(
             _ = tick.tick() => {
                 let now = now_ms();
                 core.tick(now);
+                if now.saturating_sub(last_ws_ping_ms) >= 30_000 {
+                    last_ws_ping_ms = now;
+                    ws_keepalive(&ws_tx).await;
+                }
                 if event_overflowed.swap(false, Ordering::AcqRel) {
                     bail!("session control event queue saturated");
                 }
@@ -1366,6 +1371,20 @@ async fn send_ws(ws_tx: &Arc<Mutex<WsSink>>, msg: &StreamClientMessage) -> anyho
         .send(WsMessage::Text(text))
         .await
         .context("ws send")
+}
+
+/// NAT keepalive for the signaling socket: during a healthy WebRTC
+/// session this TCP connection is near-silent (media rides separate UDP
+/// flows), and consumer routers expire idle TCP mappings after ~5 min —
+/// two 2026-07-17 live sessions both lost the socket ~275 s in ("peer
+/// closed connection without close_notify"), which also killed the
+/// stall-watchdog's IDR/RestartIce path. A ws Ping every 30 s keeps the
+/// mapping warm; failures are logged, not fatal (the receive side
+/// surfaces the real error).
+async fn ws_keepalive(ws_tx: &Arc<Mutex<WsSink>>) {
+    if let Err(e) = ws_tx.lock().await.send(WsMessage::Ping(Vec::new())).await {
+        warn!(err = %e, "signaling ws keepalive ping failed");
+    }
 }
 
 fn build_webrtc_api() -> anyhow::Result<API> {

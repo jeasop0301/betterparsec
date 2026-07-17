@@ -32,11 +32,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetClientRect, GetMessageW, HTCLIENT, KBDLLHOOKSTRUCT,
-    LLKHF_ALTDOWN, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetCursor,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_INPUT, WM_KEYDOWN,
-    WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    KillTimer, LLKHF_ALTDOWN, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetCursor,
+    SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_INPUT,
+    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_USER, WM_XBUTTONDOWN,
+    WM_XBUTTONUP,
 };
 
 use crate::VideoShared;
@@ -583,6 +584,9 @@ struct HookShared {
     /// (live evidence for "hook installed but Windows never delivers" —
     /// the silent LowLevelHooksTimeout removal, field reports 07-16/07-17).
     saw_event: Arc<AtomicBool>,
+    /// Millisecond wall-clock of the last event the proc received (0 =
+    /// never) — drives the pump thread's re-registration watchdog.
+    last_event_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 struct HookState {
@@ -598,6 +602,15 @@ static HOOK_STATE: OnceLock<Mutex<Option<HookState>>> = OnceLock::new();
 
 fn hook_state() -> &'static Mutex<Option<HookState>> {
     HOOK_STATE.get_or_init(|| Mutex::new(None))
+}
+
+/// Millisecond wall clock for the hook-liveness watchdog (monotonicity
+/// not required — a clock step just makes one watchdog window odd).
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Installs the WH_KEYBOARD_LL hook on a DEDICATED message-pump thread
@@ -619,7 +632,9 @@ pub fn install_keyboard_hook(capture: Arc<CaptureShared>, sender: InputSender) {
         alt_pressed: Arc::new(AtomicBool::new(false)),
         alt_tab_active: Arc::new(AtomicBool::new(false)),
         saw_event: Arc::new(AtomicBool::new(false)),
+        last_event_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
+    let last_event_ms = shared.last_event_ms.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
     let join = std::thread::Builder::new()
         .name("kb-hook-pump".into())
@@ -629,7 +644,8 @@ pub fn install_keyboard_hook(capture: Arc<CaptureShared>, sender: InputSender) {
             let mut msg = MSG::default();
             let _ = PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE);
             match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) {
-                Ok(hook) => {
+                Ok(first_hook) => {
+                    let mut hook = first_hook;
                     // LL hook callbacks race Windows' LowLevelHooksTimeout:
                     // exceed it once (scheduling starvation under game/render
                     // load counts) and the hook is SILENTLY removed — the
@@ -648,9 +664,51 @@ pub fn install_keyboard_hook(capture: Arc<CaptureShared>, sender: InputSender) {
                     }
                     let _ = ready_tx.send(Ok(GetCurrentThreadId()));
                     tracing::info!("WH_KEYBOARD_LL installed on dedicated pump thread");
+                    // Re-registration watchdog (07-17d live log: five
+                    // installs, ZERO proc events across 4+ minutes of
+                    // gaming — Windows removes a timed-out LL hook with no
+                    // notification and SetWindowsHookExW still reports the
+                    // old success). A thread timer re-registers the hook
+                    // whenever no event has arrived for >3 s; re-hooking a
+                    // healthy-but-idle hook is harmless, and a dead one
+                    // comes back within 3 s instead of never.
+                    let timer = SetTimer(None, 0, 3_000, None);
+                    let mut rehooks = 0u32;
                     while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+                        if msg.message == WM_TIMER {
+                            let last = last_event_ms.load(Ordering::Acquire);
+                            if wall_ms().saturating_sub(last) > 3_000 {
+                                let _ = UnhookWindowsHookEx(hook);
+                                match SetWindowsHookExW(
+                                    WH_KEYBOARD_LL,
+                                    Some(keyboard_hook_proc),
+                                    None,
+                                    0,
+                                ) {
+                                    Ok(h) => {
+                                        hook = h;
+                                        rehooks += 1;
+                                        if last == 0 && rehooks == 1 {
+                                            tracing::warn!(
+                                                "kb hook re-registered — zero events since install (Windows likely removed it silently)"
+                                            );
+                                        } else {
+                                            tracing::debug!(rehooks, "kb hook re-registered after idle");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(err = %e, "kb hook re-registration failed — keyboard capture dead until re-engage");
+                                        break;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         let _ = TranslateMessage(&msg);
                         DispatchMessageW(&msg);
+                    }
+                    if timer != 0 {
+                        let _ = KillTimer(None, timer);
                     }
                     let _ = UnhookWindowsHookEx(hook);
                     tracing::info!("WH_KEYBOARD_LL uninstalled");
@@ -716,6 +774,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             .as_ref()
             .map(|s| s.shared.clone());
         if let Some(shared) = shared {
+            shared.last_event_ms.store(wall_ms(), Ordering::Release);
             if !shared.saw_event.swap(true, Ordering::AcqRel) {
                 tracing::info!("kb hook first event received — hook is live");
             }

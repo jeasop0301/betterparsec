@@ -360,7 +360,7 @@ pub async fn start_host(
                 Message::Text(text) => {
                     let Ok(message) = serde_json::from_str::<StreamClientMessage>(&text) else {
                         warn!("[Stream]: failed to deserialize from json");
-                        return;
+                        break;
                     };
 
                     ipc_sender.send(ServerIpcMessage::WebSocket(message)).await;
@@ -373,6 +373,15 @@ pub async fn start_host(
                 _ => {}
             }
         }
+        // The client's signaling socket is gone (clean close, network
+        // drop, or the deserialize bail above): the streamer has no
+        // client anymore, so tell it to stop. Without this, a
+        // WebRTC-transport streamer that never sends a ws message never
+        // notices the closed socket and lives forever (2026-07-17 live
+        // incident: an AwaitingIdr streamer zombied for 8+ minutes in a
+        // 250 ms IDR-request/queue-overflow loop after the client left).
+        info!("[Stream]: client signaling socket closed — stopping streamer");
+        ipc_sender.send(ServerIpcMessage::Stop).await;
     });
 
     Ok(response)

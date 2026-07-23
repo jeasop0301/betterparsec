@@ -1,5 +1,6 @@
 # Rust
 /target
+/drivers/betterparsec-kbdflt/out
 /vendor
 # EXCEPT the hand-patched SCTP crate: unlike the bootstrap-generated
 # moonlight checkout, this copy carries a repository-owned behavioral fix
@@ -44,3 +45,6 @@ server
 # Stray tool dumps (cargo metadata etc.)
 /meta.json
 /meta.err
+
+# Nested crate build output
+/tools/parsec-vdd-keepalive/target

@@ -58,6 +58,7 @@ ffmpeg-sys-next = { version = "7.1", optional = true, default-features = false, 
     "swscale",
 ] }
 libc = { version = "0.2", optional = true }
+parking_lot = { version = "0.12", optional = true }
 # M4 cursor P2 native render: SHAPE PNG decode → HCURSOR (cursor_icon.rs).
 png = { version = "0.17", optional = true }
 
@@ -82,6 +83,7 @@ windows = { version = "0.62", optional = true, features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
     "Win32_System_Threading",
+    "Win32_System_Pipes",
     "Win32_Security",
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -105,6 +107,7 @@ default = []
 video = [
     "dep:ffmpeg-sys-next",
     "dep:libc",
+    "dep:parking_lot",
     "dep:windows",
     "dep:moonlight-common",
     "dep:png",

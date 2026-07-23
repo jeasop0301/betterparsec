@@ -59,5 +59,61 @@ export function decodeClipboardText(buf: ArrayBuffer): string | null {
     }
 
     const bytes = new Uint8Array(buf, HEADER_LEN, len)
-    return new TextDecoder("utf-8").decode(bytes)
+    // Reject invalid UTF-8, matching the Rust peer's String::from_utf8().ok()
+    // (streamer/src/transport/clipboard.rs) so both languages accept/reject the
+    // same frames — a non-fatal decoder would silently accept with U+FFFD.
+    try {
+        return new TextDecoder("utf-8", { fatal: true }).decode(bytes)
+    } catch {
+        return null
+    }
+}
+
+// Image (PNG) wire — mirror of streamer/src/transport/clipboard.rs `image`.
+//   u8 kind=1 (IMAGE) | u16 width | u16 height | u32 png_len | png bytes
+
+export const CLIPBOARD_KIND_IMAGE = 1
+// 8 MiB — a full-screen PNG screenshot fits; bounds a runaway image paste.
+export const CLIPBOARD_IMAGE_MAX_LEN = 8 * 1024 * 1024
+const IMAGE_HEADER_LEN = 9
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+
+export type ClipboardImage = { width: number; height: number; png: Uint8Array }
+
+function startsWithPngSignature(bytes: Uint8Array): boolean {
+    if (bytes.length < PNG_SIGNATURE.length) return false
+    for (let i = 0; i < PNG_SIGNATURE.length; i++) {
+        if (bytes[i] !== PNG_SIGNATURE[i]) return false
+    }
+    return true
+}
+
+/** Encodes a PNG image; null if the payload is not a PNG or exceeds the cap. */
+export function encodeClipboardImage(width: number, height: number, png: Uint8Array): ArrayBuffer | null {
+    if (png.length > CLIPBOARD_IMAGE_MAX_LEN || !startsWithPngSignature(png)) {
+        return null
+    }
+    const out = new Uint8Array(IMAGE_HEADER_LEN + png.length)
+    const view = new DataView(out.buffer)
+    out[0] = CLIPBOARD_KIND_IMAGE
+    view.setUint16(1, width & 0xffff, true)
+    view.setUint16(3, height & 0xffff, true)
+    view.setUint32(5, png.length, true)
+    out.set(png, IMAGE_HEADER_LEN)
+    return out.buffer
+}
+
+/** Parses an IMAGE frame; null on truncation, oversize, wrong kind, or non-PNG. */
+export function decodeClipboardImage(buf: ArrayBuffer): ClipboardImage | null {
+    const view = new DataView(buf)
+    if (view.byteLength < IMAGE_HEADER_LEN) return null
+    if (view.getUint8(0) !== CLIPBOARD_KIND_IMAGE) return null
+    const width = view.getUint16(1, true)
+    const height = view.getUint16(3, true)
+    const len = view.getUint32(5, true)
+    if (len > CLIPBOARD_IMAGE_MAX_LEN) return null
+    if (view.byteLength < IMAGE_HEADER_LEN + len) return null
+    const png = new Uint8Array(buf.slice(IMAGE_HEADER_LEN, IMAGE_HEADER_LEN + len))
+    if (!startsWithPngSignature(png)) return null
+    return { width, height, png }
 }

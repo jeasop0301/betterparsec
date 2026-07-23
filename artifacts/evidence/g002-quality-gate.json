@@ -1,0 +1,150 @@
+{
+  "architectReview": {
+    "architectureStatus": "CLEAR",
+    "productStatus": "CLEAR",
+    "codeStatus": "CLEAR",
+    "recommendation": "APPROVE",
+    "evidence": "Two-lane cleanup sweep of the frozen G002 diff. Queue/event/recovery lane (agent://87-CleanG002Queue) confirmed zero blockers after generation-keyed queue-owned recovery landed: both P2 advisories (TOCTOU publication ordering, same-epoch aliasing) and all four P3s verified fixed against current source. Native decode lane (agent://88-CleanG002Native) confirmed both blockers fixed (B1 first-connection nonzero-epoch adoption, B2 same-epoch reset poisoning) plus A1-A4 advisories; its one residual LOW finding (trailing-reset poison discard) was subsequently fixed by the parent with drain_newest returning Option and the drain_newest_trailing_reset_abandons_the_pre_reset_unit_and_returns_none regression test.",
+    "commands": [
+      "agent://87-CleanG002Queue",
+      "agent://88-CleanG002Native"
+    ],
+    "blockers": []
+  },
+  "executorQa": {
+    "status": "passed",
+    "e2eStatus": "passed",
+    "redTeamStatus": "passed",
+    "evidence": "Executor QA/red-team lane agent://90-G002QaRedTeam verified every G002 obligation against source and the parent-run test artifact: reset-before-frame ordering, atomic overflow reset, generation-keyed recovery (wrap-safe counter, same-epoch aliasing rejected at three layers), TOCTOU atomicity via a real blocked-thread test, stale-epoch rejection, failed/no-output key structurally unable to clear recovery, real-AVFrame-only is_key, first-connection epoch adoption, pre-reset poisoning, and line-by-line capi.rs/header ABI parity. All 25 namedEvidence tests were located verbatim; no fabricated evidence.",
+    "e2eCommands": [
+      "cargo test -p transport-core -p client-transport -p streamer",
+      "cargo test -p app-native --features video --bins"
+    ],
+    "redTeamCommands": [
+      "cargo test -p client-transport --lib",
+      "cargo test -p app-native --features video --bins"
+    ],
+    "artifactRefs": [
+      {
+        "id": "g002-decode-report",
+        "kind": "algorithm-boundary-test-report",
+        "path": "target/g002-decode-test-report.json",
+        "description": "Parent-run Rust test/lint evidence with named G002 adversarial tests"
+      }
+    ],
+    "contractCoverage": [
+      {
+        "id": "g002-ordering",
+        "contractRef": "G002 ordered events",
+        "obligation": "Frame|Discontinuity carried in order with epoch; overflow reset atomically precedes retained data",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["g002-queue-surface"],
+        "adversarialCaseRefs": ["g002-overflow-atomic", "g002-multi-reset"]
+      },
+      {
+        "id": "g002-flush",
+        "contractRef": "G002 decoder flush",
+        "obligation": "Discontinuity flushes FFmpeg buffers, clears pending output, gates deltas",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["g002-native-surface"],
+        "adversarialCaseRefs": ["g002-flush-chain"]
+      },
+      {
+        "id": "g002-decoded-key",
+        "contractRef": "G002 decoded-key acknowledgement",
+        "obligation": "Only a successfully output matching-epoch decoded key acknowledges recovery (generation-keyed); failed/no-output key stays latched",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["g002-native-surface", "g002-queue-surface"],
+        "adversarialCaseRefs": ["g002-aliasing", "g002-failed-key", "g002-stale-epoch", "g002-poison"]
+      }
+    ],
+    "surfaceEvidence": [
+      {
+        "id": "g002-queue-surface",
+        "contractRef": "G002 queue/capi/ABI surface",
+        "surface": "api",
+        "invocation": "cargo test -p client-transport --lib (83 tests incl. generation/atomicity/aliasing)",
+        "verdict": "passed",
+        "artifactRefs": ["g002-decode-report"]
+      },
+      {
+        "id": "g002-native-surface",
+        "contractRef": "G002 native FFmpeg decode surface",
+        "surface": "algorithm",
+        "invocation": "cargo test -p app-native --features video --bins (83+6 tests incl. FFmpeg integration flush/synthetic-stream)",
+        "verdict": "passed",
+        "artifactRefs": ["g002-decode-report"]
+      }
+    ],
+    "adversarialCases": [
+      {
+        "id": "g002-overflow-atomic",
+        "contractRef": "G002 ordered events",
+        "scenario": "Queue overflow while consumer blocked; generation counter u64 wrap",
+        "expectedBehavior": "Reset enqueued before retained frame under one lock; wrapped generation lands on 1, never the sentinel",
+        "verdict": "passed",
+        "artifactRefs": ["g002-decode-report"]
+      },
+      {
+        "id": "g002-multi-reset",
+        "contractRef": "G002 ordered events",
+        "scenario": "Multiple discontinuities interleaved with frames",
+        "expectedBehavior": "Strict arrival order preserved; compat wait_pop never reorders",
+        "verdict": "passed",
+        "artifactRefs": ["g002-decode-report"]
+      },
+      {
+        "id": "g002-flush-chain",
+        "contractRef": "G002 decoder flush",
+        "scenario": "Real FFmpeg reference chain across avcodec_flush_buffers",
+        "expectedBehavior": "Flush clears reference chain; garbage input never yields a frame",
+        "verdict": "passed",
+        "artifactRefs": ["g002-decode-report"]
+      },
+      {
+        "id": "g002-aliasing",
+        "contractRef": "G002 decoded-key acknowledgement",
+        "scenario": "Same-epoch burst discontinuities with an earlier key ack",
+        "expectedBehavior": "Stale generation ack rejected at queue, RxCore/ABI, and decode-state layers",
+        "verdict": "passed",
+        "artifactRefs": ["g002-decode-report"]
+      },
+      {
+        "id": "g002-failed-key",
+        "contractRef": "G002 decoded-key acknowledgement",
+        "scenario": "Failed or output-less key packet; delta mislabelled as key",
+        "expectedBehavior": "No DecodeMeta constructed; recovery stays latched; is_key from real AVFrame only",
+        "verdict": "passed",
+        "artifactRefs": ["g002-decode-report"]
+      },
+      {
+        "id": "g002-stale-epoch",
+        "contractRef": "G002 decoded-key acknowledgement",
+        "scenario": "Decoded output from a superseded epoch; nonzero first-connection epoch",
+        "expectedBehavior": "Stale epoch rejected; first-seen epoch adopted instead of assuming zero",
+        "verdict": "passed",
+        "artifactRefs": ["g002-decode-report"]
+      },
+      {
+        "id": "g002-poison",
+        "contractRef": "G002 decoded-key acknowledgement",
+        "scenario": "Pre-reset unit in hand across a same-epoch reset, including trailing-reset drains",
+        "expectedBehavior": "Poisoned unit accounted but never decoded; trailing reset returns no frame",
+        "verdict": "passed",
+        "artifactRefs": ["g002-decode-report"]
+      }
+    ],
+    "blockers": []
+  },
+  "iteration": {
+    "status": "passed",
+    "evidence": "Cleanup blockers (B1/B2) and both P2 advisories were fixed via the generation-keyed queue-owned recovery redesign; reviewers re-confirmed zero blockers on the final snapshot; the last residual LOW finding was fixed by the parent with a regression test and full gate rerun (transport-core 151, client-transport 83, streamer 215, app-native 83+6, clippy -D warnings clean).",
+    "fullRerun": true,
+    "rerunCommands": [
+      "cargo test -p transport-core -p client-transport -p streamer",
+      "cargo test -p app-native --features video --bins",
+      "cargo clippy -p transport-core -p client-transport -p streamer -p app-native --all-targets -- -D warnings"
+    ],
+    "blockers": []
+  }
+}

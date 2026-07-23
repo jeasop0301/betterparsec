@@ -16,6 +16,7 @@ pub mod capi;
 pub mod cursor;
 pub mod flow;
 pub mod frame_queue;
+pub mod path_select;
 pub mod session;
 pub mod tls;
 pub mod watchdog;

@@ -1,11 +1,9 @@
 //! FFmpeg H.264 decode — A0 slice 2 (design D6 Phase A,
 //! docs/design/unified-app-architecture.md §4-1).
 //!
-//! D3D11VA hwaccel with software fallback. Decoded pictures are
-//! downloaded to CPU and converted to RGBA for the interim egui present;
-//! slice 3 replaces the present with the raw FLIP_DISCARD swapchain
-//! consuming the D3D11 texture directly (D5) — the decode half of this
-//! module survives that switch as-is.
+//! D3D11VA hwaccel with software fallback. In fast mode the decoder and
+//! presenter share one D3D11 device: retained hardware frames are sampled
+//! directly by the swapchain shader. RGBA remains the safe fallback.
 //!
 //! FrameQueue guarantees complete Annex-B access units (video_rx
 //! reassembles), so there is no `av_parser` stage: one `DecodeUnit` ==
@@ -15,6 +13,130 @@ use std::ptr;
 
 use ffmpeg_sys_next as ff;
 
+#[cfg(windows)]
+use parking_lot::{ReentrantMutex, ReentrantMutexGuard};
+#[cfg(windows)]
+use std::ffi::c_void;
+#[cfg(windows)]
+use std::sync::Arc;
+#[cfg(windows)]
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
+#[cfg(windows)]
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_BIND_DECODER, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11CreateDevice,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+};
+#[cfg(windows)]
+use windows::core::Interface;
+
+/// The pinned `AVD3D11VADeviceContext` ABI. FFmpeg owns (and releases) the
+/// COM references handed to it during `Decoder::new`.
+#[cfg(windows)]
+#[repr(C)]
+struct AvD3d11VaDeviceContext {
+    device: *mut c_void,
+    device_context: *mut c_void,
+    video_device: *mut c_void,
+    video_context: *mut c_void,
+    lock: Option<unsafe extern "C" fn(*mut c_void)>,
+    unlock: Option<unsafe extern "C" fn(*mut c_void)>,
+    lock_ctx: *mut c_void,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct AvD3d11VaFramesContext {
+    texture: *mut c_void,
+    bind_flags: u32,
+    misc_flags: u32,
+    texture_infos: *mut c_void,
+}
+
+/// One device and immediate context for both FFmpeg and the raw presenter.
+/// D3D11 immediate-context calls are serialized by the same recursive lock
+/// FFmpeg invokes through its `AVD3D11VADeviceContext` callbacks.
+#[cfg(windows)]
+pub struct SharedD3d11 {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    context_lock: ReentrantMutex<()>,
+}
+
+#[cfg(windows)]
+unsafe impl Send for SharedD3d11 {}
+#[cfg(windows)]
+unsafe impl Sync for SharedD3d11 {}
+
+#[cfg(windows)]
+impl SharedD3d11 {
+    pub fn new() -> Result<Arc<Self>, DecodeError> {
+        unsafe {
+            let mut device = None;
+            let mut context = None;
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                Default::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+            .map_err(|e| DecodeError(format!("D3D11CreateDevice: {e}")))?;
+            Ok(Arc::new(Self {
+                device: device.ok_or_else(|| DecodeError("no D3D11 device".into()))?,
+                context: context.ok_or_else(|| DecodeError("no D3D11 immediate context".into()))?,
+                context_lock: ReentrantMutex::new(()),
+            }))
+        }
+    }
+
+    pub fn device(&self) -> &ID3D11Device {
+        &self.device
+    }
+
+    pub fn context(&self) -> &ID3D11DeviceContext {
+        &self.context
+    }
+
+    pub fn lock_context(&self) -> ReentrantMutexGuard<'_, ()> {
+        self.context_lock.lock()
+    }
+    pub fn is_removed(&self) -> bool {
+        unsafe { self.device.GetDeviceRemovedReason().is_err() }
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "C" fn lock_d3d11(ctx: *mut c_void) {
+    unsafe {
+        let guard = (&*(ctx.cast::<ReentrantMutex<()>>())).lock();
+        // `lock_ctx` points into `SharedD3d11`, which the decoder retains until
+        // its FFmpeg device context is destroyed; the callback pair is balanced.
+        let guard = std::mem::transmute::<
+            ReentrantMutexGuard<'_, ()>,
+            ReentrantMutexGuard<'static, ()>,
+        >(guard);
+        D3D11_LOCK_GUARDS.with(|guards| guards.borrow_mut().push(guard));
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "C" fn unlock_d3d11(_ctx: *mut c_void) {
+    D3D11_LOCK_GUARDS.with(|guards| {
+        let _ = guards.borrow_mut().pop();
+    });
+}
+
+#[cfg(windows)]
+thread_local! {
+    static D3D11_LOCK_GUARDS: std::cell::RefCell<Vec<ReentrantMutexGuard<'static, ()>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// One decoded picture, RGBA8, tightly packed (`width * 4` stride).
 pub struct RgbaFrame {
     pub width: usize,
@@ -22,26 +144,46 @@ pub struct RgbaFrame {
     pub rgba: Vec<u8>,
 }
 
-/// One decoded picture as NV12 planes (tight strides), for the GPU present
-/// path: Y plane (`width*height` bytes) + interleaved UV plane
-/// (`width*(height/2)` bytes) plus the YUV->RGB matrix the shader applies.
-/// Avoids the CPU swscale and halves the CPU->GPU upload vs `RgbaFrame`.
-pub struct Nv12Frame {
+/// A retained D3D11VA decode surface. `frame` is an independent `av_frame_ref`
+/// whose buffers own the decoder texture until the presenter renders or drops
+/// it. The frame is immutable after receipt; it crosses pump→present only for
+/// that ownership transfer.
+#[cfg(windows)]
+pub struct GpuFrame {
+    frame: *mut ff::AVFrame,
+    texture: *mut c_void,
     pub width: usize,
     pub height: usize,
-    pub y: Vec<u8>,
-    pub uv: Vec<u8>,
-    /// Row-major YUV->RGB: `out_c = m[c][0]*Y + m[c][1]*U + m[c][2]*V + m[c][3]`
-    /// with Y,U,V the R8 / R8G8-normalized samples in [0,1].
+    pub allocation_width: u32,
+    pub allocation_height: u32,
+    pub uv_scale_offset: [f32; 4],
+    pub array_slice: u32,
     pub matrix: [[f32; 4]; 3],
 }
 
+#[cfg(windows)]
+unsafe impl Send for GpuFrame {}
+
+#[cfg(windows)]
+impl GpuFrame {
+    pub(crate) fn texture(&self) -> *mut c_void {
+        self.texture
+    }
+}
+
+#[cfg(windows)]
+impl Drop for GpuFrame {
+    fn drop(&mut self) {
+        unsafe { ff::av_frame_free(&mut self.frame) };
+    }
+}
+
 /// A decoded picture in whichever form the pump produced: `Rgba` (the
-/// swscale CPU path, and the software-decode / egui-fallback form) or
-/// `Nv12` (the GPU present path — planes + matrix, no CPU color convert).
+/// swscale CPU path and egui fallback) or `Gpu` (a retained D3D11VA surface).
 pub enum DecodedFrame {
     Rgba(RgbaFrame),
-    Nv12(Nv12Frame),
+    #[cfg(windows)]
+    Gpu(GpuFrame),
 }
 
 impl DecodedFrame {
@@ -49,7 +191,8 @@ impl DecodedFrame {
     pub fn dims(&self) -> (u32, u32) {
         match self {
             DecodedFrame::Rgba(f) => (f.width as u32, f.height as u32),
-            DecodedFrame::Nv12(f) => (f.width as u32, f.height as u32),
+            #[cfg(windows)]
+            DecodedFrame::Gpu(f) => (f.width as u32, f.height as u32),
         }
     }
 }
@@ -97,24 +240,67 @@ fn err_str(rc: i32) -> String {
     format!("{} ({rc})", String::from_utf8_lossy(&buf[..end]))
 }
 
-/// `get_format` callback: prefer D3D11 hw surfaces, otherwise fall back to
-/// the first (software) format libavcodec offers.
+/// `get_format` callback: prefer a shader-readable D3D11 decode pool. The
+/// default FFmpeg D3D11VA pool is decoder-only and cannot be sampled by the
+/// presenter, so zero-copy must explicitly add `D3D11_BIND_SHADER_RESOURCE`.
 unsafe extern "C" fn pick_pixfmt(
-    _ctx: *mut ff::AVCodecContext,
+    ctx: *mut ff::AVCodecContext,
     fmts: *const ff::AVPixelFormat,
 ) -> ff::AVPixelFormat {
     unsafe {
         let mut i = 0;
+        let mut software = ff::AVPixelFormat::AV_PIX_FMT_NONE;
         while *fmts.offset(i) != ff::AVPixelFormat::AV_PIX_FMT_NONE {
-            if *fmts.offset(i) == ff::AVPixelFormat::AV_PIX_FMT_D3D11 {
-                return ff::AVPixelFormat::AV_PIX_FMT_D3D11;
+            let candidate = *fmts.offset(i);
+            if candidate != ff::AVPixelFormat::AV_PIX_FMT_D3D11 {
+                software = candidate;
+            }
+            if candidate == ff::AVPixelFormat::AV_PIX_FMT_D3D11 {
+                #[cfg(windows)]
+                {
+                    let mut frames: *mut ff::AVBufferRef = ptr::null_mut();
+                    let rc = ff::avcodec_get_hw_frames_parameters(
+                        ctx,
+                        (*ctx).hw_device_ctx,
+                        ff::AVPixelFormat::AV_PIX_FMT_D3D11,
+                        &mut frames,
+                    );
+                    if rc >= 0 && !frames.is_null() {
+                        let frames_ctx = (*frames).data.cast::<ff::AVHWFramesContext>();
+                        let d3d = (*frames_ctx).hwctx.cast::<AvD3d11VaFramesContext>();
+                        (*frames_ctx).initial_pool_size =
+                            (*frames_ctx).initial_pool_size.saturating_add(2);
+                        (*d3d).bind_flags |=
+                            D3D11_BIND_DECODER.0 as u32 | D3D11_BIND_SHADER_RESOURCE.0 as u32;
+                        let init_rc = ff::av_hwframe_ctx_init(frames);
+                        if init_rc >= 0 {
+                            (*ctx).hw_frames_ctx = ff::av_buffer_ref(frames);
+                            ff::av_buffer_unref(&mut frames);
+                            if !(*ctx).hw_frames_ctx.is_null() {
+                                return ff::AVPixelFormat::AV_PIX_FMT_D3D11;
+                            }
+                        } else {
+                            tracing::warn!(
+                                err = %err_str(init_rc),
+                                "shader-readable D3D11VA frame pool init failed"
+                            );
+                        }
+                        ff::av_buffer_unref(&mut frames);
+                    } else {
+                        tracing::warn!(
+                            err = %err_str(rc),
+                            "D3D11VA frame parameters unavailable"
+                        );
+                    }
+                    ff::av_buffer_unref(&mut (*ctx).hw_frames_ctx);
+                }
             }
             i += 1;
         }
-        // Start of the list == first (most preferred) software format, or
-        // AV_PIX_FMT_NONE when the list is empty (libavcodec then fails
-        // cleanly).
-        *fmts
+        // FFmpeg lists hardware candidates first. On custom-pool failure,
+        // explicitly select its final software candidate rather than letting
+        // libavcodec build an unsampleable default D3D11 pool.
+        software
     }
 }
 
@@ -212,6 +398,8 @@ pub struct Decoder {
     sws: *mut ff::SwsContext,
     /// A D3D11VA device is attached (negotiation may still pick software).
     pub hw_device: bool,
+    #[cfg(windows)]
+    shared_d3d11: Option<Arc<SharedD3d11>>,
 }
 
 // SAFETY: all pointers are exclusively owned by this struct; FFmpeg
@@ -220,7 +408,24 @@ pub struct Decoder {
 unsafe impl Send for Decoder {}
 
 impl Decoder {
+    #[cfg(windows)]
     pub fn new() -> Result<Self, DecodeError> {
+        Self::new_inner(None)
+    }
+
+    #[cfg(windows)]
+    pub fn new_with_d3d11(shared_d3d11: Arc<SharedD3d11>) -> Result<Self, DecodeError> {
+        Self::new_inner(Some(shared_d3d11))
+    }
+
+    #[cfg(not(windows))]
+    pub fn new() -> Result<Self, DecodeError> {
+        Self::new_inner()
+    }
+
+    fn new_inner(
+        #[cfg(windows)] shared_d3d11: Option<Arc<SharedD3d11>>,
+    ) -> Result<Self, DecodeError> {
         unsafe {
             let codec = ff::avcodec_find_decoder(ff::AVCodecID::AV_CODEC_ID_H264);
             if codec.is_null() {
@@ -239,6 +444,8 @@ impl Decoder {
                 pkt: ptr::null_mut(),
                 sws: ptr::null_mut(),
                 hw_device: false,
+                #[cfg(windows)]
+                shared_d3d11,
             };
 
             (*ctx).flags |= ff::AV_CODEC_FLAG_LOW_DELAY as i32;
@@ -246,21 +453,51 @@ impl Decoder {
             // single-threaded anyway; the stream is realtime, not a file.
             (*ctx).thread_count = 1;
 
-            let mut dev: *mut ff::AVBufferRef = ptr::null_mut();
-            let rc = ff::av_hwdevice_ctx_create(
-                &mut dev,
-                ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
-                ptr::null(),
-                ptr::null_mut(),
-                0,
-            );
-            if rc >= 0 {
-                (*ctx).hw_device_ctx = ff::av_buffer_ref(dev);
-                ff::av_buffer_unref(&mut dev);
-                (*ctx).get_format = Some(pick_pixfmt);
-                d.hw_device = !(*ctx).hw_device_ctx.is_null();
-            } else {
-                tracing::warn!(err = %err_str(rc), "D3D11VA unavailable — software decode");
+            #[cfg(windows)]
+            if let Some(shared) = d.shared_d3d11.as_ref() {
+                let mut dev =
+                    ff::av_hwdevice_ctx_alloc(ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA);
+                if dev.is_null() {
+                    tracing::warn!("av_hwdevice_ctx_alloc(D3D11VA) failed — software decode");
+                } else {
+                    let hwctx = (*dev).data.cast::<ff::AVHWDeviceContext>();
+                    let d3d = (*hwctx).hwctx.cast::<AvD3d11VaDeviceContext>();
+                    // `into_raw` transfers this cloned COM reference to FFmpeg;
+                    // its documented device-context destructor balances it.
+                    (*d3d).device = shared.device().clone().into_raw();
+                    (*d3d).lock = Some(lock_d3d11);
+                    (*d3d).unlock = Some(unlock_d3d11);
+                    (*d3d).lock_ctx = (&shared.context_lock as *const ReentrantMutex<()>)
+                        .cast_mut()
+                        .cast();
+                    let rc = ff::av_hwdevice_ctx_init(dev);
+                    if rc >= 0 {
+                        (*ctx).hw_device_ctx = ff::av_buffer_ref(dev);
+                        (*ctx).get_format = Some(pick_pixfmt);
+                        d.hw_device = !(*ctx).hw_device_ctx.is_null();
+                    } else {
+                        tracing::warn!(err = %err_str(rc), "shared D3D11VA init failed — software decode");
+                    }
+                    ff::av_buffer_unref(&mut dev);
+                }
+            }
+
+            #[cfg(not(windows))]
+            {
+                let mut dev: *mut ff::AVBufferRef = ptr::null_mut();
+                let rc = ff::av_hwdevice_ctx_create(
+                    &mut dev,
+                    ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+                    ptr::null(),
+                    ptr::null_mut(),
+                    0,
+                );
+                if rc >= 0 {
+                    (*ctx).hw_device_ctx = ff::av_buffer_ref(dev);
+                    ff::av_buffer_unref(&mut dev);
+                    (*ctx).get_format = Some(pick_pixfmt);
+                    d.hw_device = !(*ctx).hw_device_ctx.is_null();
+                }
             }
 
             let rc = ff::avcodec_open2(ctx, codec, ptr::null_mut());
@@ -328,7 +565,7 @@ impl Decoder {
                 if rc < 0 {
                     return Err(DecodeError(format!("receive_frame: {}", err_str(rc))));
                 }
-                let is_key = (*self.frame).flags & ff::AV_FRAME_FLAG_KEY as i32 != 0;
+                let is_key = (*self.frame).flags & ff::AV_FRAME_FLAG_KEY != 0;
                 let frame = self.frame_to_rgba()?;
                 ff::av_frame_unref(self.frame);
                 out = Some(Decoded {
@@ -382,7 +619,7 @@ impl Decoder {
                 if rc < 0 {
                     return Err(DecodeError(format!("receive_frame: {}", err_str(rc))));
                 }
-                let is_key = (*self.frame).flags & ff::AV_FRAME_FLAG_KEY as i32 != 0;
+                let is_key = (*self.frame).flags & ff::AV_FRAME_FLAG_KEY != 0;
                 ff::av_frame_unref(self.frame);
                 out = Some(DecodeMeta {
                     epoch,
@@ -503,19 +740,9 @@ impl Decoder {
         }
     }
 
-    /// Like [`Decoder::decode`] but prefers NV12 planes for the GPU present
-    /// path (no CPU color conversion): when the decoded picture is NV12,
-    /// returns [`DecodedFrame::Nv12`]. When it isn't (e.g. software decode
-    /// engaged mid-stream and yielded YUV420P), that is *not* a decode
-    /// failure — this falls back to the RGBA/swscale path for that one
-    /// picture and returns [`DecodedFrame::Rgba`] instead, exactly like
-    /// [`Decoder::decode`] would have. `Err` is reserved for a genuine
-    /// decode error (send/receive_packet failure, or the RGBA fallback
-    /// itself failing) — never for a merely-non-NV12 picture — so recovery
-    /// state/IDR requests upstream are never re-armed for a picture that
-    /// actually decoded fine. Same `epoch`/`frame_id`/real-key
-    /// [`DecodeMeta`] contract as [`Decoder::decode`].
-    pub fn decode_nv12(
+    /// Decode for the direct D3D11 present path. D3D11VA frames retain their
+    /// decoder surface; software output uses the established RGBA fallback.
+    pub fn decode_gpu(
         &mut self,
         epoch: u32,
         frame_id: u32,
@@ -544,15 +771,18 @@ impl Decoder {
                 if rc < 0 {
                     return Err(DecodeError(format!("receive_frame: {}", err_str(rc))));
                 }
-                let is_key = (*self.frame).flags & ff::AV_FRAME_FLAG_KEY as i32 != 0;
-                // Try the NV12 fast path first; a non-NV12 picture isn't a
-                // decode failure, so fall back to the RGBA/swscale path
-                // for this one picture (frame_to_rgba supports NV12,
-                // YUV420P, and YUVJ420P — frame_to_nv12 only accepts a
-                // literal NV12 copy) instead of propagating an error.
-                let frame = match self.frame_to_nv12() {
-                    Ok(nv12) => DecodedFrame::Nv12(nv12),
-                    Err(_) => DecodedFrame::Rgba(self.frame_to_rgba()?),
+                let is_key = (*self.frame).flags & ff::AV_FRAME_FLAG_KEY != 0;
+                let frame = if (*self.frame).format == ff::AVPixelFormat::AV_PIX_FMT_D3D11 as i32 {
+                    #[cfg(windows)]
+                    {
+                        DecodedFrame::Gpu(self.frame_to_gpu()?)
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        DecodedFrame::Rgba(self.frame_to_rgba()?)
+                    }
+                } else {
+                    DecodedFrame::Rgba(self.frame_to_rgba()?)
                 };
                 ff::av_frame_unref(self.frame);
                 out = Some(Decoded {
@@ -568,50 +798,78 @@ impl Decoder {
         }
     }
 
-    /// Download (when on a D3D11 surface) the current `self.frame` and copy
-    /// its NV12 planes tightly packed. `Err` for non-NV12 formats so the
-    /// caller can fall back to the RGBA path.
-    unsafe fn frame_to_nv12(&mut self) -> Result<Nv12Frame, DecodeError> {
+    #[cfg(windows)]
+    fn frame_to_gpu(&self) -> Result<GpuFrame, DecodeError> {
         unsafe {
-            let mut src: *mut ff::AVFrame = self.frame;
-            if (*self.frame).format == ff::AVPixelFormat::AV_PIX_FMT_D3D11 as i32 {
-                ff::av_frame_unref(self.sw_frame);
-                let rc = ff::av_hwframe_transfer_data(self.sw_frame, self.frame, 0);
-                if rc < 0 {
-                    return Err(DecodeError(format!("hwframe transfer: {}", err_str(rc))));
-                }
-                src = self.sw_frame;
+            if (*self.frame).format != ff::AVPixelFormat::AV_PIX_FMT_D3D11 as i32 {
+                return Err(DecodeError("decoded frame is not D3D11VA".into()));
             }
-            if (*src).format != ff::AVPixelFormat::AV_PIX_FMT_NV12 as i32 {
-                return Err(DecodeError("decoded frame is not NV12".into()));
+            let width = (*self.frame).width;
+            let height = (*self.frame).height;
+            if width <= 0 || height <= 0 || (*self.frame).data[0].is_null() {
+                return Err(DecodeError(
+                    "D3D11VA frame has no texture or dimensions".into(),
+                ));
             }
-            let w = (*src).width;
-            let h = (*src).height;
-            if w <= 0 || h <= 0 {
-                return Err(DecodeError("decoded frame has no dimensions".into()));
+            let texture_ptr = (*self.frame).data[0].cast::<c_void>();
+            let texture = ID3D11Texture2D::from_raw_borrowed(&texture_ptr)
+                .ok_or_else(|| DecodeError("D3D11VA frame texture is invalid".into()))?;
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            texture.GetDesc(&mut desc);
+            let crop_left = (*self.frame).crop_left as u32;
+            let crop_top = (*self.frame).crop_top as u32;
+            let crop_right = (*self.frame).crop_right as u32;
+            let crop_bottom = (*self.frame).crop_bottom as u32;
+            let visible_width = (width as u32)
+                .checked_sub(crop_left.saturating_add(crop_right))
+                .filter(|&v| v > 0)
+                .ok_or_else(|| DecodeError("D3D11VA frame has invalid horizontal crop".into()))?;
+            let visible_height = (height as u32)
+                .checked_sub(crop_top.saturating_add(crop_bottom))
+                .filter(|&v| v > 0)
+                .ok_or_else(|| DecodeError("D3D11VA frame has invalid vertical crop".into()))?;
+            let right = crop_left
+                .checked_add(visible_width)
+                .filter(|&v| v <= desc.Width)
+                .ok_or_else(|| DecodeError("D3D11VA crop exceeds texture width".into()))?;
+            let bottom = crop_top
+                .checked_add(visible_height)
+                .filter(|&v| v <= desc.Height)
+                .ok_or_else(|| DecodeError("D3D11VA crop exceeds texture height".into()))?;
+            if desc.Width == 0 || desc.Height == 0 {
+                return Err(DecodeError("D3D11VA texture has invalid allocation".into()));
             }
-            let (w, h) = (w as usize, h as usize);
-            let y_ls = (*src).linesize[0] as usize;
-            let y_ptr = (*src).data[0];
-            let mut y = Vec::with_capacity(w * h);
-            for r in 0..h {
-                y.extend_from_slice(std::slice::from_raw_parts(y_ptr.add(r * y_ls), w));
+            let array_slice = ((*self.frame).data[1] as usize)
+                .try_into()
+                .map_err(|_| DecodeError("D3D11VA array slice exceeds u32".into()))?;
+            let mut retained = ff::av_frame_alloc();
+            if retained.is_null() {
+                return Err(DecodeError(
+                    "av_frame_alloc for D3D11VA frame failed".into(),
+                ));
             }
-            let uv_ls = (*src).linesize[1] as usize;
-            let uv_ptr = (*src).data[1];
-            let uv_h = h / 2;
-            let mut uv = Vec::with_capacity(w * uv_h);
-            for r in 0..uv_h {
-                uv.extend_from_slice(std::slice::from_raw_parts(uv_ptr.add(r * uv_ls), w));
+            if ff::av_frame_ref(retained, self.frame) < 0 {
+                ff::av_frame_free(&mut retained);
+                return Err(DecodeError("av_frame_ref for D3D11VA frame failed".into()));
             }
-            let cs = sws_cs_for((*src).colorspace as i32, h as i32);
-            let full = is_full_range((*src).color_range as i32, (*src).format);
-            Ok(Nv12Frame {
-                width: w,
-                height: h,
-                y,
-                uv,
-                matrix: yuv_to_rgb_matrix(cs, full),
+            Ok(GpuFrame {
+                frame: retained,
+                texture: texture_ptr,
+                width: visible_width as usize,
+                height: visible_height as usize,
+                allocation_width: desc.Width,
+                allocation_height: desc.Height,
+                uv_scale_offset: [
+                    (right - crop_left) as f32 / desc.Width as f32,
+                    (bottom - crop_top) as f32 / desc.Height as f32,
+                    crop_left as f32 / desc.Width as f32,
+                    crop_top as f32 / desc.Height as f32,
+                ],
+                array_slice,
+                matrix: yuv_to_rgb_matrix(
+                    sws_cs_for((*self.frame).colorspace as i32, height),
+                    is_full_range((*self.frame).color_range as i32, (*self.frame).format),
+                ),
             })
         }
     }
@@ -634,6 +892,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::process::Command;
+    #[cfg(windows)]
+    use windows::Win32::Graphics::Direct3D11::{D3D11_TEXTURE2D_DESC, ID3D11Texture2D};
 
     fn apply_matrix(m: &[[f32; 4]; 3], y: f32, u: f32, v: f32) -> [f32; 3] {
         [
@@ -790,6 +1050,12 @@ mod tests {
             aus.len()
         );
 
+        #[cfg(windows)]
+        let mut dec = match SharedD3d11::new() {
+            Ok(shared) => Decoder::new_with_d3d11(shared).expect("shared-device decoder init"),
+            Err(_) => Decoder::new().expect("software decoder init"),
+        };
+        #[cfg(not(windows))]
         let mut dec = Decoder::new().expect("decoder init");
         let mut frames = 0usize;
         let mut last: Option<RgbaFrame> = None;
@@ -820,6 +1086,41 @@ mod tests {
             f.rgba.chunks_exact(4).any(|px| px != first),
             "decoded frame is a flat fill"
         );
+
+        #[cfg(windows)]
+        if let Ok(shared) = SharedD3d11::new() {
+            let mut gpu_dec =
+                Decoder::new_with_d3d11(shared).expect("shared-device GPU decoder init");
+            let mut saw_output = false;
+            let mut saw_gpu = false;
+            for (i, au) in aus.iter().enumerate() {
+                let Some(decoded) = gpu_dec.decode_gpu(0, i as u32, au).expect("GPU decode AU")
+                else {
+                    continue;
+                };
+                saw_output = true;
+                if let DecodedFrame::Gpu(frame) = decoded.frame {
+                    let texture_ptr = frame.texture();
+                    let texture = unsafe {
+                        ID3D11Texture2D::from_raw_borrowed(&texture_ptr)
+                            .expect("retained GPU texture")
+                    };
+                    let mut desc = D3D11_TEXTURE2D_DESC::default();
+                    unsafe { texture.GetDesc(&mut desc) };
+                    assert_ne!(
+                        desc.BindFlags & D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                        0,
+                        "zero-copy decode texture must be shader-readable"
+                    );
+                    saw_gpu = true;
+                    break;
+                }
+            }
+            assert!(saw_output, "shared-device decoder produced no output");
+            if !saw_gpu {
+                eprintln!("skip GPU-surface assertion: decoder negotiated software fallback");
+            }
+        }
     }
 
     #[test]
@@ -898,12 +1199,11 @@ mod tests {
         // output for the new epoch — the defect this flush call exists to
         // close (stale decoder output presenting after a reset).
         let post_flush_delta = &aus[5];
-        match dec.decode(1, 999, post_flush_delta) {
-            Ok(Some(_)) => panic!(
+        if let Ok(Some(_)) = dec.decode(1, 999, post_flush_delta) {
+            panic!(
                 "a delta AU decoded immediately after flush must not yield a picture — \
                  the reference chain was just dropped"
-            ),
-            Ok(None) | Err(_) => {}
+            );
         }
     }
 }

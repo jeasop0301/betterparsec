@@ -1,0 +1,39 @@
+[package]
+name = "betterparsec-installer"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "betterparsec-installer"
+path = "src/main.rs"
+# The bin embeds a requireAdministrator manifest, so its test harness cannot be
+# launched non-elevated (os error 740). It has no unit tests (all pure logic and
+# its tests live in the betterparsec-installer-core crate); disable the bin test
+# harness so `cargo test`/`cargo test --workspace` never try to launch it.
+test = false
+
+[dependencies]
+betterparsec-kbdflt-core = { path = "../betterparsec-kbdflt-core" }
+
+# Native installer for the BetterParsec keyboard capture path (driver + broker).
+# Replaces the PowerShell install/sign scripts so it runs on hardened test
+# machines where PowerShell is blocked but a UAC-elevated native exe (like the
+# Parsec installer) still works. The requireAdministrator manifest is embedded
+# by build.rs; all privileged actions use native Win32 (registry + Service
+# Control Manager) plus bcdedit/certutil, no PowerShell.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+] }
+
+[build-dependencies]
+# Embeds the requireAdministrator manifest, correctly overriding the default
+# application manifest rustc injects on windows-msvc since 1.72.
+embed-manifest = "1.4"
+
+[lints]
+workspace = true

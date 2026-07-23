@@ -1,0 +1,25 @@
+{
+  "goal": "G033",
+  "title": "Protocol SDK and conformance kit",
+  "scope": "A golden-fixtures conformance runner: one shared canonical wire-vector file that both the Rust and TypeScript conformance tests load and must reproduce byte-identically. This is the mechanism a client port passes conformance against (reproduce every expected_hex). Predecessor to the platform-port stories.",
+  "artifacts": {
+    "shared_fixtures": "tests/conformance/wire_vectors.json",
+    "rust_runner": "common/tests/conformance.rs",
+    "ts_runner": "tests/conformance.test.mjs"
+  },
+  "covered_formats": [
+    "control_envelope (desktop-control versioned envelope + generation + domain)",
+    "display_mode_request (output identity/mode)",
+    "privacy_state (privacy/display-lease transaction result)",
+    "hdr_metadata (HDR mastering metadata / PQ-BT.2020 transport)"
+  ],
+  "guarantee": "Both languages encode the SAME vectors from the SAME shared file and are asserted byte-identical, so any Rust/TS divergence -- or a future client port that mis-encodes -- fails the conformance test. The kit is extensible: additional formats (cursor/clipboard, more media descriptors) fold into the same fixtures file with a matching case in each runner.",
+  "gates": {
+    "cargo_test_common_conformance": "1 passed (all 4 vectors byte-identical, Rust side)",
+    "node_conformance": "1 passed (same shared fixtures, TS side)",
+    "cargo_clippy_common": "exit 0 (-D warnings, includes the integration test)",
+    "tsc_build_light": "clean",
+    "git_diff_check": "clean"
+  },
+  "notes": "The versioned wire contracts themselves (desktop_control, media_caps) carry stable forward-compatible codes and a downgrade matrix (G017 negotiate), so version support/downgrade is part of the contract the conformance kit locks. Platform-specific bindings/headers are generated from the Rust contract via the existing capi/ts-rs mechanism."
+}

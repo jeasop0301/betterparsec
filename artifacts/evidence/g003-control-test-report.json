@@ -1,0 +1,97 @@
+{
+  "schemaVersion": 1,
+  "kind": "algorithm-boundary-test-report",
+  "goalId": "G003",
+  "contract": "G003 only: newest-wins epoch ACK, NeedsIdr latched until decoded-key acknowledgement, immediate signaling RequestIdr mirror on control failure with 100/250/500 ms capped retries then ICE renegotiation/reconnect; every FEC sender task/channel/queue failure clears active state, returns exactly one typed terminal reason via src/api/stream.rs, rejects deltas while AwaitingIdr, terminates the affected session, and forbids silent RTP fallback. G004 watchdog/telemetry excluded.",
+  "commands": [
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "transport-core",
+        "-p",
+        "client-transport",
+        "-p",
+        "streamer"
+      ],
+      "exitCode": 0,
+      "summary": "transport-core 151 passed/1 ignored; client-transport 89 passed; streamer 224 passed; fec_rig 8 passed",
+      "namedEvidence": [
+        "session::tests::control_retry_ladder_progression_and_success_reset",
+        "session::tests::control_retry_escalation_order",
+        "session::tests::needs_idr_latch_persists_while_recovery_open_then_stops_after_ack",
+        "session::tests::needs_idr_latch_reopen_is_idempotent_mid_episode",
+        "session::tests::pending_ack_epoch_newest_wins",
+        "session::tests::saturated_control_event_queue_latches_terminal_failure",
+        "fec_sender::tests::test_awaiting_idr_rejects_deltas_key_always_accepted",
+        "fec_sender::tests::test_one_terminal_per_task_under_concurrent_claims",
+        "fec_sender::tests::test_superseded_exit_produces_no_terminal_error_code",
+        "fec_sender::tests::test_failed_sink_clears_liveness_queue_and_requests_idr",
+        "video::tests::fec_only_dead_sender_produces_terminal_error_code_not_silent_black",
+        "video::tests::fec_only_dead_sender_superseded_exit_is_never_terminal",
+        "video::tests::fec_only_live_sender_never_terminates",
+        "video::tests::fec_only_pending_exit_claim_is_a_single_claim_latch",
+        "video::tests::legacy_client_dead_sender_never_terminates",
+        "video::tests::fec_only_skips_rtp_track_only_once_fec_carries",
+        "session::tests::needs_idr_latch_close_never_drops_an_unsent_bare_signal",
+        "fec_sender::tests::take_terminal_exit_is_gated_on_liveness"
+      ]
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "common"
+      ],
+      "exitCode": 0,
+      "summary": "common 83 passed including ConnectionTerminated code-table serialization coverage"
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "app-native",
+        "--features",
+        "video",
+        "--bins"
+      ],
+      "exitCode": 0,
+      "summary": "app-native 83+6 passed; no regression from G003 changes"
+    },
+    {
+      "argv": [
+        "cargo",
+        "clippy",
+        "-p",
+        "transport-core",
+        "-p",
+        "client-transport",
+        "-p",
+        "streamer",
+        "-p",
+        "app-native",
+        "-p",
+        "common",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exitCode": 0,
+      "summary": "All changed packages pass; five pre-existing dependency warnings originate in vendor/moonlight-common-rust"
+    }
+  ],
+  "artifactRefs": [
+    "client-transport/src/session.rs",
+    "client-transport/src/capi.rs",
+    "streamer/src/transport/webrtc/fec_sender.rs",
+    "streamer/src/transport/webrtc/video.rs",
+    "streamer/src/main.rs",
+    "common/src/api_bindings.rs",
+    "src/api/stream.rs"
+  ],
+  "result": "passed"
+}

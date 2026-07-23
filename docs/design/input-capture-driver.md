@@ -1,106 +1,142 @@
-# Input Capture Below Security Filters — Feasibility & Plan
+# Client Keyboard Capture Filter — Evidence, Constraints & Plan
 
-Status: **DECISION RECORD, not yet implemented.** Kernel driver is a
-roadmap item, gated on signing infrastructure. This document exists so
-the driver is not silently faked or half-built.
+Status: **test prototype implemented; live validation and production signing remain.**
+The repository now contains a KMDF keyboard class-filter prototype, LocalSystem
+broker, native client integration, standalone WDK build script, and explicit
+test-sign/install scripts. None of that is a shipping package or G007 evidence
+until it is installed, rebooted, and exercised on the target machines.
 
-## Problem (confirmed by 2026-07-17 live evidence)
+## Observed evidence (2026-07-17)
 
-On the tester's client machine, `WH_KEYBOARD_LL` receives **zero**
-callback events — even when the client runs **elevated** (log line
-`process integrity elevated=true`, then 84 re-registrations with no
-events). Ordinary key input still reaches the app's wndproc
-(`WM_KEYDOWN`), which is why in-game keys work. This signature — LL hook
-blinded, wndproc keys fine, survives elevation — is characteristic of
-anti-keylogging security software (Korean banking/security suites:
-AhnLab, TouchEn, nProtect and similar) that installs a keyboard filter
-and specifically defeats `SetWindowsHookEx(WH_KEYBOARD_LL)` keyloggers.
+On the tester's client machine, `WH_KEYBOARD_LL` produced zero callback events when
+the client was elevated (the log records `process integrity elevated=true` and 84
+re-registrations with no events). Ordinary keyboard input still reached the app
+window procedure as `WM_KEYDOWN`, so ordinary in-game keys continued to work.
 
-`RegisterHotKey(MOD_ALT, VK_TAB)` was also empirically falsified as a
-fallback: it returns `0x80070581` (hotkey already registered) on **every**
-Windows 11 machine, including the clean dev box — the OS pre-registers
-Alt+Tab. See `app-native/src/bin/hook_probe.rs` (`RegisterHotKey(Alt+Tab):
-FAILED`).
+`RegisterHotKey(MOD_ALT, VK_TAB)` returned `0x80070581` (already registered) in the
+recorded probe. This is evidence for that tested configuration, not evidence that
+all Windows 11 installations behave identically. The current evidence does not
+identify a particular security product, filter vendor, or mechanism. A keyboard
+filter, hook-API interference, a registration conflict, and other environmental
+causes remain hypotheses until the target stack and reproducible probes establish
+one.
 
-## What actually ships today (no driver)
+## Current fallback (no capture driver)
 
-`Ctrl+Tab` / `Ctrl+Shift+Tab` while immersive keyboard capture is engaged
-is translated in the wndproc into a full remote `Alt(+Shift)+Tab` chord
-(`app-native/src/input.rs::is_wndproc_alt_tab` + `forward_alt_tab`). This
-rides the app's own window messages, so **no keyboard hook and no driver
-is involved** — it cannot be blocked by an LL-hook filter and works at any
-privilege. Cost: the host's own `Ctrl+Tab` is shadowed during immersive.
+While immersive keyboard capture is engaged, `Ctrl+Tab` / `Ctrl+Shift+Tab` is
+translated by the window procedure into a remote `Alt(+Shift)+Tab` chord
+(`app-native/src/input.rs::CtrlTabRemap`). It uses application window messages
+and therefore does not depend on the low-level hook. Its cost is that the host's
+`Ctrl+Tab` is shadowed during immersive.
 
-This is the correct pragmatic answer for the special-key-forwarding use
-case. A driver is only required if we want to intercept and **suppress**
-the *real* `Alt+Tab` chord on a hook-blocked machine.
+This is a useful diagnostic and operational fallback, but it does **not** capture
+or suppress a locally pressed real `Alt+Tab`. It cannot satisfy G007 C5, and a
+passing fallback observation cannot convert a failed or untested real-Alt+Tab cell
+into a pass.
 
-## Why a kernel driver is not buildable "right now"
+## Required architecture
 
-A production keyboard capture/filter driver (kbfiltr-style upper filter on
-`kbdclass`, or a Raw-Input-elevating approach) requires, in order:
+The production client path is:
 
-1. **WDK toolchain** (Windows Driver Kit) — not present in this build
-   environment; the workspace is a Rust/cargo tree with no kernel toolchain.
-2. **Kernel code** in C (WDM/KMDF). Rust kernel drivers exist but are
-   experimental and still need the WDK link/sign path.
-3. **Driver signing** — kernel-mode drivers on x64 Windows 10/11 require
-   either:
-   - an **EV code-signing certificate** + **Microsoft attestation signing**
-     (Partner Center) for non-WHQL, or
-   - full **WHQL/HLK** certification for broad distribution.
-   Neither exists for this project. A self-signed test cert only loads
-   under **test signing mode** (`bcdedit /set testsigning on` + reboot),
-   which is unacceptable for end users.
-4. **Reboot + physical-hardware testing**. Kernel bugs BSOD the machine;
-   there is no way to build, load, or verify a `.sys` in this session.
+1. A signed keyboard **class filter** captures the client keyboard stream early
+   enough to make an explicit policy decision for real `Alt+Tab`.
+2. A privileged **broker service** receives the allowed capture events from the
+   filter and forwards them to the client transport with authenticated,
+   least-privilege IPC.
+3. The client forwards the remote chord; the filter's policy suppresses the local
+   chord only while an eligible immersive session is active.
+4. Production install, upgrade, rollback, and uninstall must atomically manage
+   both the filter and broker. Capture integrity fails closed on gaps or broker
+   loss, while the short driver lease fails open for **local** keyboard
+   availability so a dead broker cannot trap the workstation.
 
-Shipping a stub `.sys` or an unsigned driver as if it were a feature would
-be a lie and a security liability. It is intentionally NOT scaffolded here.
+This is a client capture design. **VHF is not part of client capture:** it is an
+optional host-side virtual-HID injection mechanism when the host needs it. It
+cannot replace the client filter or broker that observe and suppress the locally
+pressed chord.
 
-## The altitude caveat (a driver may not even fix this machine)
+### Implemented test path
 
-Filter drivers load at an **altitude** (Microsoft-allocated). If the
-security suite's keyboard filter sits at a **higher altitude** than ours in
-the `kbdclass` stack, it processes/scrubs scancodes **before** our filter
-sees them — our driver would be blinded exactly like the hook is. Beating
-it is not guaranteed by "having a driver"; it depends on relative altitude,
-which is contested territory and can escalate into an anti-cheat/anti-
-keylogger arms race. This must be validated on the actual target machine
-before committing to the effort.
+- `drivers/betterparsec-kbdflt` is a KMDF class upper-filter prototype. Under a
+  healthy 500 ms broker lease it mirrors every physical keyboard edge into one
+  sequenced ring before the callback acknowledges that source. It processes
+  class delivery one record at a time, so partial consumption has an exact
+  prefix. A prospective Alt-down is held only on the local path: following Tab
+  suppresses local Alt+Tab, while another decisive key replays Alt before that
+  key. Win edges are remote-only. Ctrl+Alt+Del, Ctrl+Alt+Q/backtick and Alt+F4
+  keep a local Windows path. Lease expiry, sequence/drop faults, contention and
+  ring pressure latch the epoch fault and fail open locally.
+- `input-broker` runs as LocalSystem, grants its single local named-pipe endpoint
+  only to SYSTEM, Administrators, and the current active-console user, rejects a
+  client from any other session, refreshes the lease, validates
+  nonce/sequence/drop state, and disarms on every exit. This test prototype does
+  not yet authenticate a particular signed BetterParsec client binary; that is
+  still required for a production service.
+- `app-native/src/input.rs` verifies that the pipe server is LocalSystem, waits
+  for armed status, and makes the ordered broker ring the sole remote keyboard
+  producer while active. Its persistent event-time router batches modifiers,
+  keeps the safety chords local, forwards real Alt+Tab/Alt+Shift+Tab and Win
+  chords, and releases remotely owned keys on every normal or error teardown.
+  Teardown keeps the fallback producer gated while the driver fences in-flight
+  callbacks, the broker acknowledges DISARM, and the UI thread drains legacy
+  keyboard messages already queued by the old producer. A missing acknowledgement
+  or failed release disconnects instead of enabling a second producer;
+  `WH_KEYBOARD_LL` is used only when broker setup fails before ARM can take effect.
+- `build-test.cmd`, `sign-test.ps1`, and `install-test.ps1` are explicit
+  development-machine tools. Signing, TESTSIGNING changes, filter installation,
+  and reboot are never automatic.
 
-## Cheaper mechanisms evaluated and rejected
+## Stack ordering and machine-specific risk
 
-- **Raw Input keyboard** (`RIDEV_NOLEGACY`, usage 0x01/0x06): reads from
-  `kbdclass` output. If the filter is a *kbdclass upper filter* it blinds
-  Raw Input too; if it is *LL-hook-specific* Raw Input would work — but Raw
-  Input **cannot suppress** a key, so local Alt+Tab would still fire. It
-  adds nothing over the existing wndproc path for non-suppressed keys.
-  Not worth the complexity for this problem.
-- **`RegisterHotKey`**: falsified (0x80070581), see above.
-- **Elevation alone**: falsified (hook still zero events elevated).
+Keyboard class filtering is configured through Plug and Play/class registry
+configuration, notably the `UpperFilters` and `LowerFilters` multi-string values
+for the relevant keyboard class/device stack. Their configured ordering and the
+device stack actually built by PnP determine which component observes an IRP or
+service callback first; they are not selected through a universal keyboard
+"altitude" value.
 
-## Recommended sequencing
+Consequently, a filter is not automatically a remedy for the observed hook
+failure. Before relying on it, capture the target machine's actual keyboard device
+stack and its `UpperFilters`/`LowerFilters` configuration, then test the signed
+filter there. Another component can still transform, consume, or prevent the
+events needed by this design. That is a hypothesis to test, not an attribution to
+named security software.
 
-1. **Confirm `Ctrl+Tab` (07-17h) works on the target machine** before any
-   driver investment. If it forwards to the host, the *functional* need is
-   met without a driver.
-2. **Gather evidence** the driver would even help: does Parsec's Alt+Tab
-   actually reach the host on that machine, and what is `hook_probe.exe`'s
-   event count (synthetic `SendInput` bypasses device-level filters — 10
-   means "real keys scrubbed at device level", 0 means "hook API blocked").
-   This distinguishes a device-filter (driver-beatable only by altitude)
-   from an API-block (hook-specific, Ctrl+Tab already suffices).
-3. **Only if 1 is insufficient and 2 shows a device-filter**, open a
-   dedicated driver project with: EV cert acquisition, Partner Center
-   attestation signing, a KMDF `kbdclass` upper filter, installer/service
-   integration (fits the G005 supervisor + G006 packaging story), and a
-   test-signing dev loop on dedicated hardware. Estimate: multi-week, cert
-   lead time dominates.
+## Signing and release contract
 
-## Placement
+A production-distributed kernel driver needs the Microsoft hardware signing
+release path: run the applicable HLK tests and submit the results/package for
+**WHCP dashboard signing**. The release checklist must retain the resulting
+signed package and hardware evidence.
 
-Roadmap: post-P0. The driver is a distribution/packaging concern (installer
-must register the service + driver, uninstaller must remove them), so it
-belongs after G007 live closure alongside the signed-installer work, not in
-the reliability core.
+Attestation signing, where Microsoft makes it applicable, is limited to
+development/testing use in this plan; it is not the production release target.
+Self-signed test certificates require test-signing configuration and are likewise
+restricted to dedicated development/test hardware, never end-user instructions.
+The repository does not yet have HLK results, WHCP dashboard signing, or a
+production installer/package. The checked-in self-signed path is test-only.
+
+## Work required before G007 closure
+
+1. Build the checked-in WDK prototype and broker, sign the SYS on a dedicated
+   test machine, install the filter/broker from an elevated shell, and reboot.
+   Kernel faults can crash or lock out the machine; retain recovery access.
+2. Inspect the target PnP stack and preserved `UpperFilters` ordering, then
+   validate the filter with real physical keyboard input, not only synthetic
+   `SendInput`.
+3. Run G007 C5 with a **real Alt+Tab**, then retain the required 2-hour
+   high-motion and 8-hour mixed/idle soak evidence. Until all pass, G007 remains
+   BLOCK. `Ctrl+Tab` may be recorded as F1 only.
+4. Before production distribution, complete the production installer lifecycle,
+   applicable HLK testing, and WHCP dashboard signing. The test scripts are not
+   a substitute for those release gates.
+
+## Rejected substitutes
+
+- **Raw Input** (`RIDEV_NOLEGACY`, usage 0x01/0x06) cannot suppress the local
+  chord, so it cannot implement the real-Alt+Tab capture contract.
+- **`RegisterHotKey`** is unavailable in the recorded test configuration and
+  cannot be assumed available elsewhere without per-machine evidence.
+- **Elevation alone** did not restore low-level-hook events in the recorded test.
+- A stub, unsigned, or test-signed driver presented as an end-user feature would
+  be a security and release-contract violation.

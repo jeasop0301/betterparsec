@@ -1,0 +1,17 @@
+[package]
+name = "betterparsec-kbdflt-core"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish = false
+
+# Pure, platform-independent installer logic (UpperFilters ordering,
+# REG_MULTI_SZ encoding). A separate crate with NO build.rs so its unit tests
+# run under `cargo test` without the installer bin's requireAdministrator
+# manifest (which forces elevation, os error 740, on every target of that crate).
+[lib]
+name = "betterparsec_kbdflt_core"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

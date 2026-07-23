@@ -431,6 +431,7 @@ dependencies = [
  "ffmpeg-sys-next",
  "libc",
  "moonlight-common",
+ "parking_lot",
  "png 0.17.16",
  "raw-window-handle",
  "serde",
@@ -554,6 +555,19 @@ name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
+
+[[package]]
+name = "betterparsec-installer"
+version = "2.10.0"
+dependencies = [
+ "betterparsec-kbdflt-core",
+ "embed-manifest",
+ "windows",
+]
+
+[[package]]
+name = "betterparsec-kbdflt-core"
+version = "2.10.0"
 
 [[package]]
 name = "betterparsec-updater"
@@ -1676,6 +1690,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "embed-manifest"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94cdc65b1cf9e871453ce2f86f5aaec24ff2eaa36a1fa3e02e441dddc3613b99"
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2522,6 +2542,10 @@ dependencies = [
  "block-padding",
  "generic-array",
 ]
+
+[[package]]
+name = "input-broker"
+version = "2.10.0"
 
 [[package]]
 name = "interceptor"

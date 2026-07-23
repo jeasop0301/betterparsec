@@ -89,6 +89,71 @@ pub(crate) fn exceeds_cap(text: &str) -> bool {
     text.len() > CLIPBOARD_MAX_LEN
 }
 
+/// Clipboard image (PNG) wire codec — the wire half of the bounded image
+/// clipboard. `#[allow(dead_code)]` because the live host CF_DIB<->PNG watcher
+/// and inbound apply path are deferred platform work (matching the repo's
+/// deferred-wire-in pattern); the codec itself is byte-pinned and unit-tested,
+/// and mirrored in `web/stream/clipboard_wire.ts`.
+#[allow(dead_code)]
+pub mod image {
+    pub const CLIPBOARD_KIND_IMAGE: u8 = 1;
+    /// 8 MiB — a full-screen PNG screenshot fits comfortably; bounds a runaway
+    /// image paste so a huge bitmap cannot flood either transport.
+    pub const CLIPBOARD_IMAGE_MAX_LEN: usize = 8 * 1024 * 1024;
+    /// Fixed IMAGE header: kind(1) + width(2) + height(2) + png_len(4).
+    pub const IMAGE_HEADER_LEN: usize = 9;
+    /// The 8-byte PNG signature — an image payload must start with it (type check).
+    const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
+    /// One decoded clipboard image: the PNG payload plus its declared pixel size.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ClipboardImage {
+        pub width: u16,
+        pub height: u16,
+        pub png: Vec<u8>,
+    }
+
+    /// `u8 kind=1 (IMAGE) | u16 width | u16 height | u32 png_len | png bytes`.
+    /// `None` when the payload is not a PNG (missing signature) or exceeds
+    /// [`CLIPBOARD_IMAGE_MAX_LEN`].
+    pub fn encode(width: u16, height: u16, png: &[u8]) -> Option<Vec<u8>> {
+        if png.len() > CLIPBOARD_IMAGE_MAX_LEN || !png.starts_with(&PNG_SIGNATURE) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(IMAGE_HEADER_LEN + png.len());
+        out.push(CLIPBOARD_KIND_IMAGE);
+        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&height.to_le_bytes());
+        out.extend_from_slice(&(png.len() as u32).to_le_bytes());
+        out.extend_from_slice(png);
+        Some(out)
+    }
+
+    /// Decodes an IMAGE frame. `None` on truncation, an oversized declared
+    /// length, a wrong `kind` byte, or a body that is not a PNG. Trailing bytes
+    /// beyond the declared length are tolerated.
+    pub fn decode(data: &[u8]) -> Option<ClipboardImage> {
+        if data.len() < IMAGE_HEADER_LEN || data[0] != CLIPBOARD_KIND_IMAGE {
+            return None;
+        }
+        let width = u16::from_le_bytes([data[1], data[2]]);
+        let height = u16::from_le_bytes([data[3], data[4]]);
+        let len = u32::from_le_bytes(data[5..9].try_into().ok()?) as usize;
+        if len > CLIPBOARD_IMAGE_MAX_LEN {
+            return None;
+        }
+        let body = data.get(IMAGE_HEADER_LEN..IMAGE_HEADER_LEN + len)?;
+        if !body.starts_with(&PNG_SIGNATURE) {
+            return None;
+        }
+        Some(ClipboardImage {
+            width,
+            height,
+            png: body.to_vec(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SinkState {
     /// Not open yet — keep polling, do not send.
@@ -473,5 +538,72 @@ mod tests {
     #[test]
     fn should_publish_allows_first_sample() {
         assert!(should_publish("first", None, None));
+    }
+
+    // ── Image (PNG) wire (shared with tests/clipboard_wire.test.mjs) ───────
+
+    #[test]
+    fn image_byte_pin_and_round_trip() {
+        // Minimal PNG signature + one trailing byte as a stand-in body.
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x42];
+        let bytes = image::encode(1920, 1080, &png).expect("valid png");
+        assert_eq!(
+            &bytes[..9],
+            &[
+                0x01, // kind = IMAGE
+                0x80, 0x07, // width 1920 LE
+                0x38, 0x04, // height 1080 LE
+                0x09, 0x00, 0x00, 0x00, // png_len 9 LE
+            ]
+        );
+        let decoded = image::decode(&bytes).expect("round trip");
+        assert_eq!(decoded.width, 1920);
+        assert_eq!(decoded.height, 1080);
+        assert_eq!(decoded.png, png);
+    }
+
+    #[test]
+    fn image_rejects_non_png_and_oversize() {
+        // Not a PNG: encode refuses.
+        assert_eq!(image::encode(1, 1, &[0, 1, 2, 3, 4, 5, 6, 7, 8]), None);
+        // Over cap: encode refuses.
+        let mut big = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        big.resize(image::CLIPBOARD_IMAGE_MAX_LEN + 1, 0);
+        assert_eq!(image::encode(1, 1, &big), None);
+    }
+
+    #[test]
+    fn image_decode_rejects_malformed() {
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let bytes = image::encode(2, 2, &png).expect("valid png");
+        // Wrong kind byte.
+        assert_eq!(image::decode(&[0x00, 0, 0, 0, 0, 0, 0, 0, 0]), None);
+        // Truncated header.
+        assert_eq!(image::decode(&bytes[..8]), None);
+        // Truncated body.
+        assert_eq!(image::decode(&bytes[..bytes.len() - 1]), None);
+        // Body present but not a PNG (declared len over a non-signature body).
+        let mut bad = vec![image::CLIPBOARD_KIND_IMAGE, 1, 0, 1, 0];
+        bad.extend_from_slice(&8u32.to_le_bytes());
+        bad.extend_from_slice(&[0u8; 8]);
+        assert_eq!(image::decode(&bad), None);
+        // Oversized declared length.
+        let mut oversize = vec![image::CLIPBOARD_KIND_IMAGE, 1, 0, 1, 0];
+        oversize.extend_from_slice(&((image::CLIPBOARD_IMAGE_MAX_LEN + 1) as u32).to_le_bytes());
+        assert_eq!(image::decode(&oversize), None);
+        // Trailing bytes beyond png_len are tolerated.
+        let mut trailing = bytes.clone();
+        trailing.extend_from_slice(&[0xFF, 0xFF]);
+        assert_eq!(image::decode(&trailing).map(|i| i.png), Some(png.to_vec()));
+    }
+
+    #[test]
+    fn text_and_image_decoders_ignore_each_other() {
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let img = image::encode(1, 1, &png).expect("valid png");
+        // The text decoder ignores an image frame (unknown kind).
+        assert_eq!(decode_text(&img), None);
+        // The image decoder ignores a text frame.
+        assert_eq!(image::decode(&encode_text("hi")), None);
     }
 }

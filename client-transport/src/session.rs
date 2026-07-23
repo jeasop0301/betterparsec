@@ -488,6 +488,31 @@ impl InputSender {
         };
         self.tx.try_send((ch.0, bytes)).is_ok()
     }
+
+    /// Encodes and enqueues a complete ordered packet batch atomically.
+    ///
+    /// Returns `false` without enqueueing anything when any packet cannot be
+    /// encoded or the queue lacks room for the whole batch. Chords must use
+    /// this path so queue pressure cannot leave remote modifiers half-applied.
+    pub fn send_batch(&self, packets: &[InboundPacket]) -> bool {
+        let mut encoded = Vec::with_capacity(packets.len());
+        for packet in packets {
+            let Some((channel, bytes)) = packet.encode() else {
+                return false;
+            };
+            encoded.push((channel.0, bytes));
+        }
+        if encoded.is_empty() {
+            return true;
+        }
+        let Ok(permits) = self.tx.try_reserve_many(encoded.len()) else {
+            return false;
+        };
+        for (permit, packet) in permits.zip(encoded) {
+            permit.send(packet);
+        }
+        true
+    }
 }
 
 /// Progress states only upgrade (Connecting → PeerConnected → Streaming):
@@ -1768,6 +1793,30 @@ mod tests {
         assert!(s.send(&pkt));
         assert!(s.send(&pkt));
         assert!(!s.send(&pkt), "full queue drops instead of blocking");
+    }
+
+    #[test]
+    fn input_sender_batch_is_all_or_nothing() {
+        let (tx, mut rx) = mpsc::channel::<(u8, Vec<u8>)>(2);
+        let sender = InputSender { tx };
+        let packet = || InboundPacket::MouseMove {
+            delta_x: 1,
+            delta_y: 2,
+        };
+        assert!(sender.send(&packet()));
+
+        let batch = [packet(), packet()];
+        assert!(
+            !sender.send_batch(&batch),
+            "one free slot cannot split a chord"
+        );
+        assert!(rx.try_recv().is_ok(), "the pre-existing packet remains");
+        assert!(rx.try_recv().is_err(), "failed batch enqueues no prefix");
+
+        assert!(sender.send_batch(&batch));
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
     }
     #[test]
     fn saturated_control_event_queue_latches_terminal_failure() {

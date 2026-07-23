@@ -15,32 +15,35 @@
 //! ALLOW_TEARING/vsync-off land with Phase B (§2 topology).
 
 use client_transport::capi::RxCore;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
+    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_SRV_DIMENSION_TEXTURE2DARRAY, ID3DBlob,
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BUFFER_DESC,
-    D3D11_COMPARISON_NEVER, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_FORMAT_SUPPORT_DISPLAY, D3D11_MAP_WRITE_DISCARD,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_TEXTURE_ADDRESS_CLAMP,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT,
-    D3D11CreateDevice, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
-    ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
-    ID3D11VertexShader,
+    D3D11_COMPARISON_NEVER, D3D11_CPU_ACCESS_WRITE, D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+    D3D11_FORMAT_SUPPORT_DISPLAY, D3D11_MAP_WRITE_DISCARD, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_SAMPLER_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC1, D3D11_SHADER_RESOURCE_VIEW_DESC1_0,
+    D3D11_TEX2D_ARRAY_SRV1, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT, ID3D11Buffer, ID3D11Device, ID3D11Device3,
+    ID3D11DeviceContext, ID3D11PixelShader, ID3D11RenderTargetView, ID3D11SamplerState,
+    ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
     DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
+#[cfg(test)]
+use windows::Win32::Graphics::Dxgi::DXGI_PRESENT;
 use windows::Win32::Graphics::Dxgi::{
-    DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
-    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGISwapChain2,
+    DXGI_ERROR_WAS_STILL_DRAWING, DXGI_PRESENT_DO_NOT_WAIT, DXGI_SCALING_STRETCH,
+    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2,
+    IDXGISwapChain2,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::WaitForSingleObjectEx;
@@ -53,7 +56,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{Interface, PCSTR, PCWSTR, s, w};
 
 use crate::VideoShared;
-use crate::video::{DecodedFrame, Nv12Frame, RgbaFrame};
+use crate::video::{DecodedFrame, GpuFrame, RgbaFrame};
 
 /// Present failure. Fatal to the raw surface only: the caller latches
 /// the egui-texture fallback and the session keeps running.
@@ -262,14 +265,15 @@ fn compile_hlsl(src: &str, entry: PCSTR, target: PCSTR) -> Result<Vec<u8>, Prese
 /// decoder-supplied YUV->RGB matrix (range + offset already folded in —
 /// see [`crate::video::Nv12Frame::matrix`]).
 const NV12_HLSL: &str = r#"
-Texture2D texY : register(t0);
-Texture2D texUV : register(t1);
+Texture2DArray texY : register(t0);
+Texture2DArray texUV : register(t1);
 SamplerState smp : register(s0);
 
 cbuffer Cb : register(b0) {
     float4 m0;
     float4 m1;
     float4 m2;
+    float4 uvScaleOffset;
 };
 
 struct VSOut {
@@ -286,8 +290,9 @@ VSOut VSMain(uint id : SV_VertexID) {
 }
 
 float4 PSMain(VSOut i) : SV_TARGET {
-    float Y = texY.Sample(smp, i.uv).r;
-    float2 uvss = texUV.Sample(smp, i.uv).rg;
+    float2 uv = saturate(i.uv * uvScaleOffset.xy + uvScaleOffset.zw);
+    float Y = texY.Sample(smp, float3(uv, 0.0)).r;
+    float2 uvss = texUV.Sample(smp, float3(uv, 0.0)).rg;
     float4 yuv1 = float4(Y, uvss.x, uvss.y, 1.0);
     return float4(dot(m0, yuv1), dot(m1, yuv1), dot(m2, yuv1), 1.0);
 }
@@ -299,6 +304,7 @@ float4 PSMain(VSOut i) : SV_TARGET {
 #[repr(C)]
 struct Nv12CbData {
     matrix: [[f32; 4]; 3],
+    uv_scale_offset: [f32; 4],
 }
 
 /// D3D11 device + FLIP_DISCARD swapchain bound to the stream child HWND.
@@ -308,6 +314,7 @@ struct Renderer {
     device: ID3D11Device,
     ctx: ID3D11DeviceContext,
     swapchain: IDXGISwapChain2,
+    shared_d3d11: Option<Arc<crate::video::SharedD3d11>>,
     waitable: HANDLE,
     /// Actual swapchain backbuffer `DXGI_FORMAT`, chosen once at
     /// creation by [`preferred_present_format`] (env `BP_PRESENT_10BIT`
@@ -334,16 +341,7 @@ struct Renderer {
     sharpen_sampler: Option<ID3D11SamplerState>,
     /// `SharpenCB` constant buffer (inverse resolution + strength).
     sharpen_cbuf: Option<ID3D11Buffer>,
-    /// GPU NV12->RGB present path (additive to the RGBA `upload` path
-    /// above): DEFAULT-usage Y (`R8_UNORM`, full res) and UV
-    /// (`R8G8_UNORM`, half res) planes, their SRVs, the shared full-screen
-    /// triangle vertex shader, NV12 pixel shader, a linear-clamp sampler,
-    /// and the per-frame YUV->RGB matrix constant buffer. All lazily
-    /// created on first NV12 frame and resolution-tied like `upload`.
-    tex_y: Option<ID3D11Texture2D>,
-    tex_uv: Option<ID3D11Texture2D>,
-    srv_y: Option<ID3D11ShaderResourceView>,
-    srv_uv: Option<ID3D11ShaderResourceView>,
+    /// GPU NV12->RGB shader resources shared by the retained D3D11VA path.
     nv12_vs: Option<ID3D11VertexShader>,
     nv12_ps: Option<ID3D11PixelShader>,
     nv12_sampler: Option<ID3D11SamplerState>,
@@ -369,8 +367,15 @@ impl Renderer {
         width: u32,
         height: u32,
         want_10bit: bool,
+        shared_d3d11: Arc<crate::video::SharedD3d11>,
     ) -> Result<Self, PresentError> {
-        Self::new_inner(hwnd, width, height, present_10bit_from_env() || want_10bit)
+        Self::new_inner(
+            hwnd,
+            width,
+            height,
+            present_10bit_from_env() || want_10bit,
+            Some(shared_d3d11),
+        )
     }
 
     fn new_inner(
@@ -378,24 +383,18 @@ impl Renderer {
         width: u32,
         height: u32,
         want_10bit: bool,
+        shared_d3d11: Option<Arc<crate::video::SharedD3d11>>,
     ) -> Result<Self, PresentError> {
         unsafe {
-            let mut device = None;
-            let mut ctx = None;
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                Default::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                Some(&[D3D_FEATURE_LEVEL_11_0]),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut ctx),
-            )
-            .map_err(|e| PresentError(format!("D3D11CreateDevice: {e}")))?;
-            let device = device.ok_or_else(|| PresentError("no D3D11 device".into()))?;
-            let ctx = ctx.ok_or_else(|| PresentError("no immediate context".into()))?;
+            let shared = match shared_d3d11 {
+                Some(shared) => shared,
+                None => crate::video::SharedD3d11::new()
+                    .map_err(|e| PresentError(format!("shared D3D11 setup: {e}")))?,
+            };
+            let shared_d3d11 = Some(Arc::clone(&shared));
+            let _lock = shared.lock_context();
+            let device = shared.device().clone();
+            let ctx = shared.context().clone();
 
             let dxgi_dev: IDXGIDevice = device.cast()?;
             let factory: IDXGIFactory2 = dxgi_dev.GetAdapter()?.GetParent()?;
@@ -446,6 +445,7 @@ impl Renderer {
             Ok(Self {
                 device,
                 ctx,
+                shared_d3d11,
                 swapchain,
                 waitable,
                 backbuffer_format: format,
@@ -456,10 +456,6 @@ impl Renderer {
                 sharpen_ps: None,
                 sharpen_sampler: None,
                 sharpen_cbuf: None,
-                tex_y: None,
-                tex_uv: None,
-                srv_y: None,
-                srv_uv: None,
                 nv12_vs: None,
                 nv12_ps: None,
                 nv12_sampler: None,
@@ -476,11 +472,6 @@ impl Renderer {
         }
         self.upload = None; // release before ResizeBuffers
         self.upload_srv = None; // tied to the (now-stale) upload texture
-        // NV12 upload textures/SRVs are resolution-tied the same way.
-        self.tex_y = None;
-        self.tex_uv = None;
-        self.srv_y = None;
-        self.srv_uv = None;
         unsafe {
             self.swapchain
                 .ResizeBuffers(
@@ -505,11 +496,14 @@ impl Renderer {
         if w == 0 || h == 0 || frame.rgba.len() != frame.width * frame.height * 4 {
             return Err(PresentError("bad frame dimensions".into()));
         }
-        self.ensure_size(w, h)?;
         unsafe {
             // 100ms cap: a lost waitable must never stall the pipe.
             WaitForSingleObjectEx(self.waitable, 100, false);
-
+        }
+        let shared_d3d11 = self.shared_d3d11.clone();
+        let _lock = shared_d3d11.as_ref().map(|shared| shared.lock_context());
+        self.ensure_size(w, h)?;
+        unsafe {
             if self.upload.is_none() {
                 let desc = D3D11_TEXTURE2D_DESC {
                     Width: w,
@@ -555,149 +549,117 @@ impl Renderer {
         Ok(())
     }
 
-    /// GPU NV12->RGB present: upload the Y/UV planes, run the NV12 pixel
-    /// shader with the frame's YUV->RGB matrix straight onto the
-    /// backbuffer. Additive to [`Self::draw`] — the RGBA path above is
-    /// untouched.
-    fn draw_nv12(&mut self, frame: &Nv12Frame) -> Result<(), PresentError> {
-        let (w, h) = (frame.width as u32, frame.height as u32);
-        if w == 0
-            || h == 0
-            || frame.y.len() != frame.width * frame.height
-            || frame.uv.len() != frame.width * (frame.height / 2)
-        {
-            return Err(PresentError("bad NV12 frame dimensions".into()));
+    /// Draw a retained FFmpeg D3D11VA NV12 array slice without CPU transfer
+    /// or an upload/copy texture. D3D11.1's PlaneSlice view is mandatory.
+    fn draw_gpu(&mut self, frame: &GpuFrame) -> Result<(), PresentError> {
+        let w = frame.width as u32;
+        let h = frame.height as u32;
+        if w == 0 || h == 0 || frame.allocation_width == 0 || frame.allocation_height == 0 {
+            return Err(PresentError("bad D3D11VA frame dimensions".into()));
         }
+        unsafe {
+            WaitForSingleObjectEx(self.waitable, 100, false);
+        }
+        let shared_d3d11 = self.shared_d3d11.clone();
+        let _lock = shared_d3d11.as_ref().map(|shared| shared.lock_context());
         self.ensure_size(w, h)?;
         unsafe {
-            // 100ms cap: a lost waitable must never stall the pipe.
-            WaitForSingleObjectEx(self.waitable, 100, false);
-
-            if self.tex_y.is_none() {
-                let desc = D3D11_TEXTURE2D_DESC {
-                    Width: w,
-                    Height: h,
-                    MipLevels: 1,
-                    ArraySize: 1,
-                    Format: DXGI_FORMAT_R8_UNORM,
-                    SampleDesc: DXGI_SAMPLE_DESC {
-                        Count: 1,
-                        Quality: 0,
+            let texture_ptr = frame.texture();
+            let texture = ID3D11Texture2D::from_raw_borrowed(&texture_ptr)
+                .ok_or_else(|| PresentError("D3D11VA frame has no texture".into()))?;
+            let device3: ID3D11Device3 = self.device.cast().map_err(|_| {
+                PresentError("D3D11.1 plane SRV API unavailable; zero-copy disabled".into())
+            })?;
+            let view = |plane| D3D11_SHADER_RESOURCE_VIEW_DESC1 {
+                Format: if plane == 0 {
+                    DXGI_FORMAT_R8_UNORM
+                } else {
+                    DXGI_FORMAT_R8G8_UNORM
+                },
+                ViewDimension: D3D_SRV_DIMENSION_TEXTURE2DARRAY,
+                Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC1_0 {
+                    Texture2DArray: D3D11_TEX2D_ARRAY_SRV1 {
+                        MostDetailedMip: 0,
+                        MipLevels: 1,
+                        FirstArraySlice: frame.array_slice,
+                        ArraySize: 1,
+                        PlaneSlice: plane,
                     },
-                    Usage: D3D11_USAGE_DEFAULT,
-                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                    ..Default::default()
-                };
-                let mut tex = None;
-                self.device
-                    .CreateTexture2D(&desc, None, Some(&mut tex))
-                    .map_err(|e| PresentError(format!("CreateTexture2D (Y): {e}")))?;
-                self.tex_y = tex;
-                // The old SRV (if any) pointed at the texture we just
-                // replaced — never reuse it across textures.
-                self.srv_y = None;
-            }
-            if self.tex_uv.is_none() {
-                let desc = D3D11_TEXTURE2D_DESC {
-                    Width: w / 2,
-                    Height: h / 2,
-                    MipLevels: 1,
-                    ArraySize: 1,
-                    Format: DXGI_FORMAT_R8G8_UNORM,
-                    SampleDesc: DXGI_SAMPLE_DESC {
-                        Count: 1,
-                        Quality: 0,
-                    },
-                    Usage: D3D11_USAGE_DEFAULT,
-                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                    ..Default::default()
-                };
-                let mut tex = None;
-                self.device
-                    .CreateTexture2D(&desc, None, Some(&mut tex))
-                    .map_err(|e| PresentError(format!("CreateTexture2D (UV): {e}")))?;
-                self.tex_uv = tex;
-                self.srv_uv = None;
-            }
-            // Cloned (COM AddRef, not a copy): the borrows end here so the
-            // lazy SRV/shader creation below can take `&mut self`.
-            let tex_y = self.tex_y.clone().expect("just created");
-            let tex_uv = self.tex_uv.clone().expect("just created");
-            // Row pitch is tight: `w` bytes/row for R8 (Y) and for R8G8 at
-            // `w/2` texels (2 bytes/texel * w/2 == w bytes/row).
-            self.ctx
-                .UpdateSubresource(&tex_y, 0, None, frame.y.as_ptr().cast(), w, 0);
-            self.ctx
-                .UpdateSubresource(&tex_uv, 0, None, frame.uv.as_ptr().cast(), w, 0);
+                },
+            };
+            let mut y = None;
+            let mut uv = None;
+            device3
+                .CreateShaderResourceView1(texture, Some(&view(0)), Some(&mut y))
+                .map_err(|e| PresentError(format!("CreateShaderResourceView1 (Y): {e}")))?;
+            device3
+                .CreateShaderResourceView1(texture, Some(&view(1)), Some(&mut uv))
+                .map_err(|e| PresentError(format!("CreateShaderResourceView1 (UV): {e}")))?;
+            let y: ID3D11ShaderResourceView = y
+                .ok_or_else(|| PresentError("no D3D11VA Y view".into()))?
+                .cast()
+                .map_err(|e| PresentError(format!("cast D3D11VA Y view: {e}")))?;
+            let uv: ID3D11ShaderResourceView = uv
+                .ok_or_else(|| PresentError("no D3D11VA UV view".into()))?
+                .cast()
+                .map_err(|e| PresentError(format!("cast D3D11VA UV view: {e}")))?;
+            self.draw_nv12_views(&y, &uv, w, h, frame.matrix, frame.uv_scale_offset)
+        }
+    }
 
-            self.ensure_nv12_resources()?;
-
-            if self.srv_y.is_none() {
-                let mut srv = None;
-                self.device
-                    .CreateShaderResourceView(&tex_y, None, Some(&mut srv))
-                    .map_err(|e| PresentError(format!("CreateShaderResourceView (Y): {e}")))?;
-                self.srv_y = srv;
-            }
-            if self.srv_uv.is_none() {
-                let mut srv = None;
-                self.device
-                    .CreateShaderResourceView(&tex_uv, None, Some(&mut srv))
-                    .map_err(|e| PresentError(format!("CreateShaderResourceView (UV): {e}")))?;
-                self.srv_uv = srv;
-            }
-            let srv_y = self.srv_y.clone().expect("just created");
-            let srv_uv = self.srv_uv.clone().expect("just created");
-
+    fn draw_nv12_views(
+        &mut self,
+        y: &ID3D11ShaderResourceView,
+        uv: &ID3D11ShaderResourceView,
+        w: u32,
+        h: u32,
+        matrix: [[f32; 4]; 3],
+        uv_scale_offset: [f32; 4],
+    ) -> Result<(), PresentError> {
+        self.ensure_nv12_resources()?;
+        unsafe {
             let back: ID3D11Texture2D = self.swapchain.GetBuffer(0)?;
-            let mut rtv: Option<ID3D11RenderTargetView> = None;
+            let mut rtv = None;
             self.device
-                .CreateRenderTargetView(&back, None, Some(&mut rtv))
-                .map_err(|e| PresentError(format!("CreateRenderTargetView: {e}")))?;
+                .CreateRenderTargetView(&back, None, Some(&mut rtv))?;
             let rtv = rtv.ok_or_else(|| PresentError("no render target view".into()))?;
-
             let cbuf = self.nv12_cbuf.clone().expect("ensured above");
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             self.ctx
-                .Map(&cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
-                .map_err(|e| PresentError(format!("Map cbuffer (NV12): {e}")))?;
-            let data = Nv12CbData {
-                matrix: frame.matrix,
-            };
-            std::ptr::copy_nonoverlapping(&data, mapped.pData.cast(), 1);
+                .Map(&cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
+            std::ptr::copy_nonoverlapping(
+                &Nv12CbData {
+                    matrix,
+                    uv_scale_offset,
+                },
+                mapped.pData.cast(),
+                1,
+            );
             self.ctx.Unmap(&cbuf, 0);
-
-            let viewport = D3D11_VIEWPORT {
+            self.ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
                 Width: w as f32,
                 Height: h as f32,
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
-            };
-            self.ctx.RSSetViewports(Some(&[viewport]));
+            }]));
             self.ctx
                 .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             self.ctx.VSSetShader(self.nv12_vs.as_ref(), None);
             self.ctx.PSSetShader(self.nv12_ps.as_ref(), None);
             self.ctx
-                .PSSetShaderResources(0, Some(&[Some(srv_y), Some(srv_uv)]));
+                .PSSetShaderResources(0, Some(&[Some(y.clone()), Some(uv.clone())]));
             self.ctx
                 .PSSetSamplers(0, Some(std::slice::from_ref(&self.nv12_sampler)));
             self.ctx.PSSetConstantBuffers(0, Some(&[Some(cbuf)]));
             self.ctx.OMSetRenderTargets(Some(&[Some(rtv)]), None);
             self.ctx.Draw(3, 0);
-
-            // Unbind the SRVs/RTV: the next frame's UpdateSubresource on
-            // the same tex_y/tex_uv (and the next FLIP_DISCARD buffer's
-            // implicit reuse) must never race a still-bound view —
-            // debug-layer hazard otherwise (mirrors `draw_sharpen`).
             self.ctx.PSSetShaderResources(0, Some(&[None, None]));
             self.ctx.OMSetRenderTargets(None, None);
         }
         Ok(())
     }
-
     /// Lazily compile/create the NV12 pass's device-level resources
     /// (shaders, sampler, constant buffer). Independent of resolution —
     /// created once per `Renderer` and reused across frames/resizes.
@@ -819,6 +781,8 @@ impl Renderer {
         h: u32,
     ) -> Result<(), PresentError> {
         self.ensure_sharpen_resources()?;
+        let shared_d3d11 = self.shared_d3d11.clone();
+        let _lock = shared_d3d11.as_ref().map(|shared| shared.lock_context());
         unsafe {
             if self.upload_srv.is_none() {
                 let mut srv = None;
@@ -883,13 +847,37 @@ impl Renderer {
         self.sharpen = strength;
     }
 
+    #[cfg(test)]
     fn present(&mut self) -> Result<(), PresentError> {
-        // Present(0): flip-model windowed replaces the queued frame
-        // without tearing; ALLOW_TEARING/vsync policy is Phase B.
+        // Tests use the ordinary blocking call. The production render thread
+        // uses `present_interruptible` so teardown cannot wait on an HWND
+        // message pump which is itself joining this thread.
+        let shared_d3d11 = self.shared_d3d11.clone();
+        let _lock = shared_d3d11.as_ref().map(|shared| shared.lock_context());
         unsafe { self.swapchain.Present(0, DXGI_PRESENT(0)) }
             .ok()
             .map_err(|e| PresentError(format!("Present: {e}")))?;
         Ok(())
+    }
+
+    fn present_interruptible(&mut self, stop: &AtomicBool) -> Result<(), PresentError> {
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return Err(PresentError("present stopped".into()));
+            }
+            let result = {
+                let shared_d3d11 = self.shared_d3d11.clone();
+                let _lock = shared_d3d11.as_ref().map(|shared| shared.lock_context());
+                unsafe { self.swapchain.Present(0, DXGI_PRESENT_DO_NOT_WAIT) }.ok()
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if error.code() == DXGI_ERROR_WAS_STILL_DRAWING => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => return Err(PresentError(format!("Present: {error}"))),
+            }
+        }
     }
 
     /// Copy the current backbuffer to a staging texture and return its
@@ -1197,7 +1185,11 @@ pub fn note_shell_tick() {
 /// on the shell/wndproc threads, so a hung UI thread (or any missed
 /// focus transition) left the user's cursor permanently caged. The
 /// failsafe thread is the one release path that depends on nothing else.
-pub fn failsafe_should_release(clip_active: bool, window_ours_and_alive: bool, shell_alive: bool) -> bool {
+pub fn failsafe_should_release(
+    clip_active: bool,
+    window_ours_and_alive: bool,
+    shell_alive: bool,
+) -> bool {
     clip_active && (!window_ours_and_alive || !shell_alive)
 }
 
@@ -1382,16 +1374,32 @@ fn render_loop(hwnd: HWND, shared: &Arc<VideoShared>, core: &Arc<RxCore>, want_1
 
         let (fw, fh) = frame.dims();
         if renderer.is_none() {
-            match Renderer::new_with_10bit(hwnd, fw, fh, want_10bit) {
+            let Some(device) = shared.d3d11.clone() else {
+                tracing::error!("shared D3D11 unavailable — egui fallback");
+                shared.raw_present_failed.store(true, Ordering::Release);
+                if matches!(frame, DecodedFrame::Rgba(_)) {
+                    *shared.frame.lock().unwrap_or_else(PoisonError::into_inner) = Some(frame);
+                }
+                return;
+            };
+            match Renderer::new_with_10bit(hwnd, fw, fh, want_10bit, device) {
                 Ok(r) => {
                     tracing::info!(w = fw, h = fh, "raw D3D11 FLIP_DISCARD surface up");
                     renderer = Some(r);
                 }
                 Err(e) => {
+                    if shared
+                        .d3d11
+                        .as_ref()
+                        .is_some_and(|device| device.is_removed())
+                    {
+                        shared.device_removed.store(true, Ordering::Release);
+                    }
                     tracing::error!(err = %e, "raw present init failed — egui fallback");
                     shared.raw_present_failed.store(true, Ordering::Release);
-                    // Put the frame back for the fallback consumer.
-                    *shared.frame.lock().unwrap_or_else(PoisonError::into_inner) = Some(frame);
+                    if matches!(frame, DecodedFrame::Rgba(_)) {
+                        *shared.frame.lock().unwrap_or_else(PoisonError::into_inner) = Some(frame);
+                    }
                     return;
                 }
             }
@@ -1401,9 +1409,13 @@ fn render_loop(hwnd: HWND, shared: &Arc<VideoShared>, core: &Arc<RxCore>, want_1
         r.sharpen = (shared.sharpen_pct.load(Ordering::Relaxed).min(100) as f32) / 100.0;
         let draw = match &frame {
             DecodedFrame::Rgba(f) => r.draw(f),
-            DecodedFrame::Nv12(f) => r.draw_nv12(f),
+            DecodedFrame::Gpu(f) => r.draw_gpu(f),
         };
-        match draw.and_then(|()| r.present()) {
+        let present_result = draw.and_then(|()| r.present_interruptible(&shared.present_stop));
+        if shared.present_stop.load(Ordering::Acquire) {
+            return;
+        }
+        match present_result {
             Ok(()) => {
                 // G004: the only point that feeds the present-success
                 // heartbeat — an actual successful `Present`, never the
@@ -1412,26 +1424,72 @@ fn render_loop(hwnd: HWND, shared: &Arc<VideoShared>, core: &Arc<RxCore>, want_1
                 core.note_presented();
             }
             Err(e) => {
-                // Device removed/reset etc.: retry a fresh device once
-                // per frame; latch fallback only if recreation also
-                // fails.
+                let device_removed = shared
+                    .d3d11
+                    .as_ref()
+                    .is_some_and(|device| device.is_removed());
+                if device_removed {
+                    // The pump owns the decoder replacement; signal it before
+                    // latching the raw presenter off.
+                    shared.device_removed.store(true, Ordering::Release);
+                }
+                if matches!(frame, DecodedFrame::Gpu(_)) {
+                    shared.nv12.store(false, Ordering::Release);
+                    core.request_idr();
+                    shared.raw_present_failed.store(true, Ordering::Release);
+                    return;
+                }
                 tracing::warn!(err = %e, "present failed — recreating device");
-                renderer = None;
-                match Renderer::new_with_10bit(hwnd, fw, fh, want_10bit) {
+                drop(renderer.take());
+                let Some(device) = shared.d3d11.clone() else {
+                    shared.raw_present_failed.store(true, Ordering::Release);
+                    *shared.frame.lock().unwrap_or_else(PoisonError::into_inner) = Some(frame);
+                    return;
+                };
+                match Renderer::new_with_10bit(hwnd, fw, fh, want_10bit, device) {
                     Ok(mut r) => {
                         let draw2 = match &frame {
                             DecodedFrame::Rgba(f) => r.draw(f),
-                            DecodedFrame::Nv12(f) => r.draw_nv12(f),
+                            DecodedFrame::Gpu(f) => r.draw_gpu(f),
                         };
-                        if draw2.and_then(|()| r.present()).is_ok() {
-                            renderer = Some(r);
-                            stall_ladder.on_present_success();
-                            core.note_presented();
+                        let retry_result =
+                            draw2.and_then(|()| r.present_interruptible(&shared.present_stop));
+                        if shared.present_stop.load(Ordering::Acquire) {
+                            return;
+                        }
+                        match retry_result {
+                            Ok(()) => {
+                                renderer = Some(r);
+                                stall_ladder.on_present_success();
+                                core.note_presented();
+                            }
+                            Err(e2) => {
+                                if shared
+                                    .d3d11
+                                    .as_ref()
+                                    .is_some_and(|device| device.is_removed())
+                                {
+                                    shared.device_removed.store(true, Ordering::Release);
+                                }
+                                tracing::error!(err = %e2, "recreated present failed — egui fallback");
+                                shared.raw_present_failed.store(true, Ordering::Release);
+                                *shared.frame.lock().unwrap_or_else(PoisonError::into_inner) =
+                                    Some(frame);
+                                return;
+                            }
                         }
                     }
                     Err(e2) => {
+                        if shared
+                            .d3d11
+                            .as_ref()
+                            .is_some_and(|device| device.is_removed())
+                        {
+                            shared.device_removed.store(true, Ordering::Release);
+                        }
                         tracing::error!(err = %e2, "device recreation failed — egui fallback");
                         shared.raw_present_failed.store(true, Ordering::Release);
+                        *shared.frame.lock().unwrap_or_else(PoisonError::into_inner) = Some(frame);
                         return;
                     }
                 }
@@ -1582,7 +1640,7 @@ mod tests {
         }
 
         let f1 = gradient(64, 48);
-        let mut r = match Renderer::new_with_10bit(child, 64, 48, false) {
+        let mut r = match Renderer::new_inner(child, 64, 48, false, None) {
             Ok(r) => r,
             Err(e) => {
                 // No hardware D3D11 device (bare CI VM): nothing to test.
@@ -1646,7 +1704,7 @@ mod tests {
 
         let (width, height) = (64usize, 32usize);
         let frame = edge_frame(width, height);
-        let mut r = match Renderer::new_with_10bit(child, width as u32, height as u32, false) {
+        let mut r = match Renderer::new_inner(child, width as u32, height as u32, false, None) {
             Ok(r) => r,
             Err(e) => {
                 // No hardware D3D11 device (bare CI VM): nothing to test.
@@ -1720,7 +1778,7 @@ mod tests {
         }
 
         let f = gradient(64, 48);
-        let mut r = match Renderer::new_inner(child, 64, 48, true) {
+        let mut r = match Renderer::new_inner(child, 64, 48, true, None) {
             Ok(r) => r,
             Err(e) => {
                 // No hardware D3D11 device (bare CI VM): nothing to test.

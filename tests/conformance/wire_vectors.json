@@ -1,0 +1,69 @@
+{
+  "schema": "betterparsec-wire-conformance",
+  "version": 1,
+  "note": "Canonical golden byte vectors for the port-relevant wire formats. Both the Rust conformance test (common/tests/conformance.rs) and the TypeScript conformance test (tests/conformance.test.mjs) load THIS file and must produce byte-identical output. A client port passes conformance when it reproduces every expected_hex.",
+  "vectors": [
+    {
+      "format": "control_envelope",
+      "name": "display envelope, kind 0x0102, gen 0x04030201, payload AABBCC",
+      "domain": 2,
+      "kind": 258,
+      "generation": 67305985,
+      "payload_hex": "aabbcc",
+      "expected_hex": "010202010102030403000000aabbcc"
+    },
+    {
+      "format": "display_mode_request",
+      "name": "output 2, 3840x2160 @ 144000 mHz",
+      "output_id": 2,
+      "width": 3840,
+      "height": 2160,
+      "refresh_mhz": 144000,
+      "expected_hex": "0200000f700880320200"
+    },
+    {
+      "format": "privacy_state",
+      "name": "active, blank-display, downgraded, policy_denied",
+      "active": true,
+      "protections": 1,
+      "status": "downgraded",
+      "reason": 5,
+      "expected_hex": "01010105"
+    },
+    {
+      "format": "hdr_metadata",
+      "name": "maxCLL 1000, maxFALL 400, maxLum 10000000, minLum 5",
+      "max_cll": 1000,
+      "max_fall": 400,
+      "max_luminance": 10000000,
+      "min_luminance": 5,
+      "expected_hex": "e80390018096980005000000"
+    },
+    {
+      "format": "cursor_authority",
+      "name": "client-rendered cursor owner",
+      "owner": "client",
+      "expected_hex": "01"
+    },
+    {
+      "format": "clipboard_offer",
+      "name": "offer all clipboard kinds",
+      "kinds": 7,
+      "expected_hex": "07"
+    },
+    {
+      "format": "privacy_request",
+      "name": "enable privacy, blank + block-input",
+      "enable": true,
+      "protections": 3,
+      "expected_hex": "0103"
+    },
+    {
+      "format": "file_cancel",
+      "name": "cancel transfer 7, policy_denied",
+      "transfer_id": 7,
+      "reason": 5,
+      "expected_hex": "0700000005"
+    }
+  ]
+}

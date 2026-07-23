@@ -23,6 +23,8 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use common::desktop_control::cursor::CursorOwner;
+use common::desktop_control::{ControlGeneration, OwnershipLease};
 
 pub const CURSOR_KIND_POS: u8 = 0;
 pub const CURSOR_KIND_SHAPE: u8 = 1;
@@ -194,6 +196,104 @@ impl CursorShared {
     /// Latest host cursor shape, if any has arrived this session.
     pub fn shape(&self) -> Option<std::sync::Arc<CursorShape>> {
         self.shape.lock().expect("cursor shape lock").clone()
+    }
+}
+
+/// G010 client-render authority decision (pure, timer-free). Consumes the G009
+/// desktop-control cursor-authority domain — a generation-stamped [`CursorOwner`]
+/// admitted through an [`OwnershipLease`] — plus cursor shape ids, and decides
+/// exactly one visual: the host-baked cursor OR a client-rendered cursor, never
+/// both (no double cursor). It dedups shape application by id and restores the
+/// last shape across a reconnect once client authority is re-established.
+#[derive(Debug)]
+pub struct ClientCursorAuthority {
+    lease: OwnershipLease,
+    owner: CursorOwner,
+    latest_shape_id: u32,
+    applied_shape_id: Option<u32>,
+    visible: bool,
+}
+
+impl Default for ClientCursorAuthority {
+    fn default() -> Self {
+        // Host bakes the cursor until authority is negotiated to the client.
+        Self {
+            lease: OwnershipLease::new(),
+            owner: CursorOwner::Host,
+            latest_shape_id: 0,
+            applied_shape_id: None,
+            visible: true,
+        }
+    }
+}
+
+impl ClientCursorAuthority {
+    /// Applies a generation-stamped authority message. Returns `true` when it was
+    /// admitted (first claim / same-generation refresh / strictly newer), `false`
+    /// when the generation is stale — in which case the owner is left unchanged.
+    pub fn apply_authority(&mut self, generation: ControlGeneration, owner: CursorOwner) -> bool {
+        if self.lease.admit(generation) {
+            self.owner = owner;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The side that currently renders the cursor.
+    pub fn owner(&self) -> CursorOwner {
+        self.owner
+    }
+
+    /// Whether the client should render the cursor from shape messages.
+    pub fn render_client(&self) -> bool {
+        matches!(self.owner, CursorOwner::Client)
+    }
+
+    /// Whether the host-baked cursor is the visual (mutually exclusive with
+    /// [`Self::render_client`] — this pair is the "no double cursor" invariant).
+    pub fn host_baked(&self) -> bool {
+        matches!(self.owner, CursorOwner::Host)
+    }
+
+    /// Records the latest cursor shape id (retained across reconnect so it can be
+    /// restored). `0` means "none/unknown".
+    pub fn note_shape(&mut self, shape_id: u32) {
+        self.latest_shape_id = shape_id;
+    }
+
+    /// Records host cursor visibility.
+    pub fn set_visible(&mut self, visible: bool) {
+        self.visible = visible;
+    }
+
+    /// Host cursor visibility.
+    pub fn visible(&self) -> bool {
+        self.visible
+    }
+
+    /// Returns the shape id the client should render now, or `None` when the host
+    /// is baking, there is no shape, or the current shape was already applied
+    /// (dedup). Calling it marks the returned id as applied.
+    pub fn take_shape_change(&mut self) -> Option<u32> {
+        if !self.render_client() || self.latest_shape_id == 0 {
+            return None;
+        }
+        if self.applied_shape_id == Some(self.latest_shape_id) {
+            return None;
+        }
+        self.applied_shape_id = Some(self.latest_shape_id);
+        Some(self.latest_shape_id)
+    }
+
+    /// Reconnect: authority must be re-negotiated, so ownership reverts to the
+    /// host-baked cursor (never leave a client cursor rendering while the host
+    /// may also bake). The last shape id is retained and the applied marker is
+    /// cleared so it re-renders (restoration) once the client re-claims authority.
+    pub fn on_reconnect(&mut self) {
+        self.lease.release();
+        self.owner = CursorOwner::Host;
+        self.applied_shape_id = None;
     }
 }
 
@@ -407,5 +507,67 @@ mod tests {
         });
         assert!(shared.visible());
         assert_eq!(shared.pos(), (i32::MIN, i32::MAX));
+    }
+
+    #[test]
+    fn cursor_authority_defaults_to_host_baked() {
+        let auth = ClientCursorAuthority::default();
+        assert_eq!(auth.owner(), CursorOwner::Host);
+        assert!(auth.host_baked());
+        assert!(!auth.render_client());
+        // Exactly one visual is ever chosen (no double cursor).
+        assert_ne!(auth.host_baked(), auth.render_client());
+    }
+
+    #[test]
+    fn cursor_authority_generation_gates_ownership() {
+        let mut auth = ClientCursorAuthority::default();
+        assert!(auth.apply_authority(ControlGeneration(5), CursorOwner::Client));
+        assert!(auth.render_client());
+        assert!(!auth.host_baked());
+        // A stale generation is rejected and leaves ownership unchanged.
+        assert!(!auth.apply_authority(ControlGeneration(3), CursorOwner::Host));
+        assert!(auth.render_client());
+        // A strictly newer generation takes over.
+        assert!(auth.apply_authority(ControlGeneration(6), CursorOwner::Host));
+        assert!(auth.host_baked());
+        assert_ne!(auth.host_baked(), auth.render_client());
+    }
+
+    #[test]
+    fn cursor_authority_dedups_shape_and_gates_on_owner() {
+        let mut auth = ClientCursorAuthority::default();
+        // Host-baked: the client never renders a shape.
+        auth.note_shape(7);
+        assert_eq!(auth.take_shape_change(), None);
+        // Client authority: the shape renders once, then dedups.
+        auth.apply_authority(ControlGeneration(1), CursorOwner::Client);
+        assert_eq!(auth.take_shape_change(), Some(7));
+        assert_eq!(auth.take_shape_change(), None);
+        // A new shape id renders once.
+        auth.note_shape(8);
+        assert_eq!(auth.take_shape_change(), Some(8));
+        assert_eq!(auth.take_shape_change(), None);
+        // shape_id 0 (none) never renders.
+        auth.note_shape(0);
+        assert_eq!(auth.take_shape_change(), None);
+    }
+
+    #[test]
+    fn cursor_authority_reconnect_reverts_to_host_and_restores_shape() {
+        let mut auth = ClientCursorAuthority::default();
+        auth.apply_authority(ControlGeneration(2), CursorOwner::Client);
+        auth.note_shape(42);
+        assert_eq!(auth.take_shape_change(), Some(42));
+        // Reconnect reverts to host-baked (no double cursor during the gap) and
+        // keeps the last shape for restoration.
+        auth.on_reconnect();
+        assert!(auth.host_baked());
+        assert_eq!(auth.take_shape_change(), None);
+        // Re-claiming client authority (a fresh, even lower, generation is fine
+        // after release) restores the retained shape exactly once.
+        assert!(auth.apply_authority(ControlGeneration(1), CursorOwner::Client));
+        assert_eq!(auth.take_shape_change(), Some(42));
+        assert_eq!(auth.take_shape_change(), None);
     }
 }

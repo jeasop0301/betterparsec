@@ -15,20 +15,26 @@
 mod audio;
 #[cfg(all(windows, feature = "video"))]
 mod cursor_icon;
+mod frame_pacer;
 mod host;
+mod host_authority;
 mod identity;
 #[cfg(all(windows, feature = "video"))]
 mod immersive;
 #[cfg(all(windows, feature = "video"))]
 mod input;
+mod output_registry;
 #[cfg(all(windows, feature = "video"))]
 mod present;
+mod privacy_mode;
+mod qu_composition;
 mod settings;
 mod sunshine;
 mod supervisor;
 mod update;
 #[cfg(feature = "video")]
 mod video;
+mod virtual_device_policy;
 
 #[cfg(feature = "video")]
 use std::sync::Condvar;
@@ -80,14 +86,14 @@ fn main() -> eframe::Result {
             None => registry.init(),
         }
     }
-    tracing::info!("=== betterparsec build 07-17h starting ===");
+    tracing::info!("=== betterparsec build 07-17i starting ===");
     #[cfg(all(windows, feature = "video"))]
     tracing::info!(elevated = is_elevated(), "process integrity");
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
-            .with_title("BetterParsec — build 07-17h (Ctrl+Tab = host Alt+Tab)"),
+            .with_title("BetterParsec — build 07-17i (driver Alt+Tab test)"),
         ..Default::default()
     };
     eframe::run_native(
@@ -188,6 +194,10 @@ impl FpsWindow {
 #[cfg(feature = "video")]
 #[derive(Default)]
 struct VideoShared {
+    /// The decoder and presenter share this exact device/context. `None`
+    /// means D3D11 setup failed, so decode/present stay on RGBA fallback.
+    #[cfg(windows)]
+    d3d11: Option<Arc<video::SharedD3d11>>,
     /// Newest decoded picture; the presenter takes it (newest-wins).
     frame: Mutex<Option<video::DecodedFrame>>,
     /// Signaled per stored frame; the raw present thread blocks here.
@@ -204,6 +214,10 @@ struct VideoShared {
     decoded: AtomicU64,
     decode_errors: AtomicU64,
     hw_device: AtomicBool,
+    /// Render thread confirmed the shared D3D11 device was removed/reset.
+    /// The pump consumes this once and replaces its FFmpeg decoder in the
+    /// only thread that owns it.
+    device_removed: AtomicBool,
     /// Client-side sharpen strength, integer percent 0..100 (0 = off).
     /// Live-adjustable from the shell UI; the present thread reads it each
     /// frame. Seeded from `BP_SHARPEN` at surface creation.
@@ -227,7 +241,27 @@ struct VideoShared {
 
 #[cfg(feature = "video")]
 impl VideoShared {
-    /// The raw D3D11 present path is (still) responsible for drawing.
+    #[cfg(windows)]
+    fn new() -> Self {
+        let d3d11 = match video::SharedD3d11::new() {
+            Ok(device) => Some(device),
+            Err(e) => {
+                tracing::warn!(err = %e, "shared D3D11 unavailable — RGBA fallback");
+                None
+            }
+        };
+        Self {
+            d3d11,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// The raw D3D11 surface is responsible for drawing.
     fn raw_present_active(&self) -> bool {
         cfg!(windows) && !self.raw_present_failed.load(Ordering::Acquire)
     }
@@ -270,7 +304,14 @@ struct DecodeState {
 #[cfg(feature = "video")]
 impl DecodeState {
     fn new(shared: &VideoShared) -> Self {
-        let decoder = match video::Decoder::new() {
+        #[cfg(windows)]
+        let decoder_result = match shared.d3d11.clone() {
+            Some(d3d11) => video::Decoder::new_with_d3d11(d3d11),
+            None => video::Decoder::new(),
+        };
+        #[cfg(not(windows))]
+        let decoder_result = video::Decoder::new();
+        let decoder = match decoder_result {
             Ok(d) => {
                 shared.hw_device.store(d.hw_device, Ordering::Relaxed);
                 tracing::info!(hw = d.hw_device, "video decoder ready");
@@ -369,6 +410,40 @@ impl DecodeState {
             }
         }
     }
+    #[cfg(windows)]
+    fn demote_removed_device(&mut self, core: &RxCore, shared: &VideoShared) {
+        if !shared.device_removed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        shared.hw_device.store(false, Ordering::Release);
+        shared.nv12.store(false, Ordering::Release);
+        self.decoder = match video::Decoder::new() {
+            Ok(decoder) => {
+                tracing::warn!("shared D3D11 device removed — switched to software decode");
+                Some(decoder)
+            }
+            Err(e) => {
+                tracing::error!(err = %e, "software decoder replacement failed");
+                None
+            }
+        };
+        self.wait_for_key = self.epoch;
+        core.request_idr();
+    }
+
+    #[cfg(windows)]
+    fn demote_if_device_removed(&mut self, core: &RxCore, shared: &VideoShared) -> bool {
+        let removed = shared
+            .d3d11
+            .as_ref()
+            .is_some_and(|device| device.is_removed());
+        if !removed {
+            return false;
+        }
+        shared.device_removed.store(true, Ordering::Release);
+        self.demote_removed_device(core, shared);
+        true
+    }
 
     fn on_unit(
         &mut self,
@@ -377,6 +452,8 @@ impl DecodeState {
         egui_ctx: &eframe::egui::Context,
         unit: &DecodeUnit,
     ) {
+        #[cfg(windows)]
+        self.demote_removed_device(core, shared);
         if self.decoder.is_none() {
             return;
         }
@@ -405,7 +482,7 @@ impl DecodeState {
             && shared.sharpen_pct.load(Ordering::Relaxed) == 0;
         let dec = self.decoder.as_mut().expect("checked above");
         let decoded = if want_nv12 {
-            dec.decode_nv12(unit.epoch, unit.frame_id, &unit.data)
+            dec.decode_gpu(unit.epoch, unit.frame_id, &unit.data)
                 .map(|o| o.map(|d| (d.frame, d.meta)))
         } else {
             dec.decode(unit.epoch, unit.frame_id, &unit.data)
@@ -443,6 +520,21 @@ impl DecodeState {
             Ok(Some(_)) | Ok(None) => {}
             Err(e) => {
                 shared.decode_errors.fetch_add(1, Ordering::Relaxed);
+                #[cfg(windows)]
+                if self.demote_if_device_removed(core, shared) {
+                    tracing::warn!(
+                        err = %e,
+                        frame_id = unit.frame_id,
+                        "hardware decoder device removed — switched to software and requested IDR"
+                    );
+                    return;
+                }
+                if want_nv12 {
+                    // A retained-surface failure is not silently relabelled
+                    // zero-copy. Stop requesting GPU frames; later units use
+                    // the established RGBA path.
+                    shared.nv12.store(false, Ordering::Release);
+                }
                 self.wait_for_key = self.epoch;
                 core.request_idr();
                 tracing::warn!(err = %e, frame_id = unit.frame_id, "decode failed — requesting IDR");
@@ -456,6 +548,8 @@ impl DecodeState {
     /// still reports its [`video::DecodeMeta`] so a real decoded key
     /// hiding in the backlog still clears recovery.
     fn drop_unit(&mut self, core: &RxCore, shared: &VideoShared, unit: &DecodeUnit) {
+        #[cfg(windows)]
+        self.demote_removed_device(core, shared);
         if self.decoder.is_none() {
             return;
         }
@@ -480,6 +574,15 @@ impl DecodeState {
             Ok(_) => {}
             Err(e) => {
                 shared.decode_errors.fetch_add(1, Ordering::Relaxed);
+                #[cfg(windows)]
+                if self.demote_if_device_removed(core, shared) {
+                    tracing::warn!(
+                        err = %e,
+                        frame_id = unit.frame_id,
+                        "hardware decoder device removed during backlog decode — switched to software and requested IDR"
+                    );
+                    return;
+                }
                 self.wait_for_key = self.epoch;
                 core.request_idr();
                 tracing::warn!(err = %e, frame_id = unit.frame_id, "decode(drop) failed — requesting IDR");
@@ -619,7 +722,7 @@ impl Running {
         let fps = Arc::new(FpsWindow::default());
         let started = Instant::now();
         #[cfg(feature = "video")]
-        let video_shared = Arc::new(VideoShared::default());
+        let video_shared = Arc::new(VideoShared::new());
 
         let session = Session::start(
             SessionConfig {
@@ -1016,7 +1119,8 @@ impl App {
         let spawned = std::thread::Builder::new()
             .name("bp-host-boot".into())
             .spawn(move || {
-                let result = host::start(std::path::Path::new(host::DEFAULT_CONFIG_PATH), &settings);
+                let result =
+                    host::start(std::path::Path::new(host::DEFAULT_CONFIG_PATH), &settings);
                 let _ = tx.send(result);
             });
         if let Err(e) = spawned {
@@ -1217,8 +1321,11 @@ impl App {
             egui::ComboBox::from_id_salt("role-select")
                 .selected_text(Self::role_label(new_role))
                 .show_ui(ui, |ui| {
-                    for role in [settings::Role::Client, settings::Role::Host, settings::Role::Both]
-                    {
+                    for role in [
+                        settings::Role::Client,
+                        settings::Role::Host,
+                        settings::Role::Both,
+                    ] {
                         ui.selectable_value(&mut new_role, role, Self::role_label(role));
                     }
                 });
@@ -1263,7 +1370,10 @@ impl App {
             }
             Some(h) => {
                 restart_clicked = ui
-                    .add_enabled(self.host_starting.is_none(), egui::Button::new("Restart host"))
+                    .add_enabled(
+                        self.host_starting.is_none(),
+                        egui::Button::new("Restart host"),
+                    )
                     .clicked();
                 let snapshot = h.foundation_health();
                 ui.label(format!(
@@ -1353,12 +1463,7 @@ fn apply_role_action<T>(
 /// stopped immediately, so a role flip during the boot window can never
 /// leave a host running under a client-only role and an occupied slot is
 /// never silently replaced (the late duplicate is torn down instead).
-fn apply_host_delivery<T>(
-    install: bool,
-    delivered: T,
-    slot: &mut Option<T>,
-    stop: impl FnOnce(T),
-) {
+fn apply_host_delivery<T>(install: bool, delivered: T, slot: &mut Option<T>, stop: impl FnOnce(T)) {
     if install {
         *slot = Some(delivered);
     } else {

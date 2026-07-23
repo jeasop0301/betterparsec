@@ -8,4 +8,5 @@ pub mod fec_ratio;
 pub mod fec_wire;
 pub mod mode;
 pub mod resolution;
+pub mod slice;
 pub mod video_rx;

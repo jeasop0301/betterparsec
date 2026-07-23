@@ -55,31 +55,52 @@
 
 # G007 — P0 2머신 라이브 클로저 캠페인 (통합, 수치 기준 완화 금지)
 
-G001–G006 헤드리스 게이트 전부 그린 이후에만 실행. 각 크리티컬 셀 **15분**. 증거(로그/incident snapshot/판정)는 셀별로 보존.
+G001–G006 헤드리스 게이트 전부 그린 이후에만 실행. G007은 **실제 Alt+Tab 전달**과
+소크 증거가 모두 PASS하기 전까지 **BLOCK**이다. `Ctrl+Tab`은 진단·운영상 대체 입력일
+뿐이며 G007을 통과시키거나 실제 Alt+Tab 실패를 덮을 수 없다. 증거(로그/incident
+snapshot/판정)는 셀별로 보존.
 
 ## 사전 조건
-- [ ] 호스트에 최신 `streamer.exe`(+`web-server.exe` 갱신 시 함께) 배포 + 서비스 재시작 (커밋 `1bc7b99` 이후 빌드 — FEC v2/IDR 게이트/`FecSenderExit` 포함)
-- [ ] 클라이언트 타이틀바가 **`build 07-17a (FEC v2 + watchdog + host role)`** 인지 확인 — `07-16m` 이하면 G001–G006 미포함 구버전
+- [ ] 호스트에 최신 `streamer.exe`(+`web-server.exe` 갱신 시 함께) 배포 + 서비스 재시작
+- [ ] 클라이언트가 현재 소스의 `betterparsec.exe`인지 시작 로그의 build marker로 확인
 - [ ] `RUST_LOG=info` + `betterparsec.log` 확보 경로 확인. 스톨 시 incident snapshot(23필드) 캡처 방법 숙지
+- [ ] **전용 테스트 클라이언트에서 캡처 경로 설치**:
+      `cargo build -p input-broker --release` →
+      `drivers\betterparsec-kbdflt\build-test.cmd` →
+      관리자 PowerShell에서 `sign-test.ps1 -EnableTestSigning` →
+      `install-test.ps1` → 재부팅. TESTSIGNING/커널 필터는 일상 사용 머신에 적용하지 않는다.
+- [ ] 재부팅 뒤 `BetterParsecInput` 서비스가 Running이고 앱 로그에
+      `keyboard capture armed through LocalSystem broker`가 찍히는지 확인. 이 로그가 없으면
+      C5를 시작하지 말고 필터/브로커 상태를 수정한다.
+- [ ] 실제 키 입력으로 Alt+Tab 로컬 억제·원격 전달과 Alt+F4/Win/긴급 탈출
+      로컬 경로를 함께 검증한다. 합성 `SendInput`만으로 C5를 통과시키지 않는다.
+- [ ] **호스트 입력 주입 경로 구분**: VHF는 필요할 때만 쓰는 호스트 측 선택적 injection 방식이며, 클라이언트 캡처 filter나 broker의 대체물이 아니다.
 
-## 크리티컬 셀 (각 15분, 전 셀 통과 = P0 클로저)
+## 필수 크리티컬 셀 (C1–C5 각 15분, C6–C7은 명시된 소크 시간; 전 셀 통과 = P0 클로저)
 | 셀 | 조건 | 판정 기준 |
 |---|---|---|
 | C1 | 클린 링크, 1080p60 고모션 | **2초 초과 가시 스톨 0회**, 복구 p95 **≤500ms**, 영속 corruption 0 |
 | C2 | ≤5% 랜덤 손실 | C1과 동일 기준 |
 | C3 | 20% 버스트 손실 (간헐) | 복구 p95 **≤1.5s**, 영속 corruption 0 |
 | C4 | 재정렬/중복 (가능한 도구 범위 내) | 영속 corruption 0, 워치독 오탐 0 |
-| C5 | 입력/오디오 집중 | 호스트 Alt+Tab(정상 머신)/**Ctrl+Tab(훅 차단 머신 대체 경로)**/키/마우스/오디오 반응성 정상, 스턱 키 0 |
+| C5 | 입력/오디오 집중 — **실제 Alt+Tab** | 클라이언트에서 누른 실제 Alt+Tab이 호스트 작업 전환을 연다. 키/마우스/오디오 반응성 정상, 스턱 키 0 |
+| C6 | 2시간 고모션 소크 (유튜브/게임) | 스톨/누수/워치독 이력 보존 |
+| C7 | 8시간 혼합/유휴 소크 | 스톨/누수/워치독 이력 보존 |
+
+## 비클로저 대체 경로 관찰
+| 셀 | 조건 | 판정 기준 |
+|---|---|---|
+| F1 | 입력/오디오 집중 — Ctrl+Tab 대체 경로 | Ctrl+Tab/Ctrl+Shift+Tab이 원격 Alt+Tab/Alt+Shift+Tab으로 전달되고 스턱 키 0. **PASS여도 C5 실패 또는 미시도를 통과로 바꾸지 않는다.** |
 
 - "가시 스톨" = 화면 정지 체감 2초 초과. "복구" = discontinuity → 다음 완전 키프레임 표시까지.
 - 판정 근거: 클라 incident telemetry + `betterparsec.log` + 체감 관찰 병기.
+- C5, C6, C7 중 하나라도 FAIL 또는 미시도면 G007은 **BLOCK**이며 호스트 배포 게이트는 열리지 않는다.
 
 ## 클로저 이후에만 (호스트 배포 게이트 해제)
 - [ ] **host/both 카나리아**: 통합 앱 host 롤 상시 가동 → 클라 접속/종료 반복 (스트리머 수명주기 이벤트 패널 확인)
 - [ ] **크래시 복구**: Foundation 강제 종료 → 슈퍼바이저 재시작 래더 (30초 안정화 창, 예산 소진 시 Failed) 실측
 - [ ] **롤백**: `-HostBundle` 세트 스테이징 → `betterparsec-updater swap` → `install.prev-*` 존재 확인 → 수동 롤백 리허설
 - [ ] **재접속/시작-정지**: 세션 10회 연속 접속-종료, 좀비/포트 누수 0 (Job Object 확인)
-- [ ] **2시간 고모션 소크** (유튜브/게임) + **8시간 혼합/유휴 소크**: 스톨/누수/워치독 이력 기록
 
 ## 금지
 - 수치 기준(500ms/1.5s/2s/15분/2h/8h) 완화 금지. 미달 셀은 FAIL 기록 후 원인 수정 → 셀 재실행.

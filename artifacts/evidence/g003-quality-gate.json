@@ -1,0 +1,145 @@
+{
+  "architectReview": {
+    "architectureStatus": "CLEAR",
+    "productStatus": "CLEAR",
+    "codeStatus": "CLEAR",
+    "recommendation": "APPROVE",
+    "evidence": "Two-lane cleanup sweep of the frozen G003 diff. Client lane (agent://93-CleanG003Client) verified the retry ladder, exactly-once RequestIdr mirror, RestartIce escalation, recovery-latched NeedsIdr cadence, and epoch-keyed newest-wins ACK; its two MEDIUM advisories (bare NeedsIdr drop while gated, ladder escalation with zero attempts) were fixed by the parent (NeedsIdrLatch::close refuses unsent latches; granted-but-unattempted retry rung closes the episode) and re-confirmed CLEARED. Host lane (agent://94-CleanG003Host) verified typed exit reasons, Superseded-never-terminal, AwaitingIdr rejection, code-table consistency, and prompt graceful stop; its HIGH blocker (exit latch drainable while live reads true) was fixed with a liveness-gated take_terminal_exit plus a take-first/derive-live call site, re-confirmed ZERO BLOCKERS/ZERO RESIDUALS with the discard pair unrepresentable by construction.",
+    "commands": [
+      "agent://93-CleanG003Client",
+      "agent://94-CleanG003Host"
+    ],
+    "blockers": []
+  },
+  "executorQa": {
+    "status": "passed",
+    "e2eStatus": "passed",
+    "redTeamStatus": "passed",
+    "evidence": "Executor QA/red-team lane agent://95-G003QaRedTeam verified every G003 obligation with file:line evidence and adversarial falsification attempts: ladder order and one-mirror-per-episode, NeedsIdr persistence until decoded-key ack, newest-wins epoch ACK, exactly-once terminal under racing exits, Superseded never terminal, AwaitingIdr delta rejection with key re-admission, legacy clients unaffected, no silent RTP fallback for FEC-only clients, and a character-identical Rust/TS ConnectionTerminated code table. All 16 namedEvidence tests located verbatim; two additional regression tests were added after the sweep fixes and pass in the final rerun.",
+    "e2eCommands": [
+      "cargo test -p transport-core -p client-transport -p streamer",
+      "cargo test -p common",
+      "cargo test -p app-native --features video --bins"
+    ],
+    "redTeamCommands": [
+      "cargo test -p client-transport --lib",
+      "cargo test -p streamer --bin streamer"
+    ],
+    "artifactRefs": [
+      {
+        "id": "g003-control-report",
+        "kind": "algorithm-boundary-test-report",
+        "path": "target/g003-control-test-report.json",
+        "description": "Parent-run Rust test/lint evidence with named G003 adversarial tests"
+      }
+    ],
+    "contractCoverage": [
+      {
+        "id": "g003-client-controls",
+        "contractRef": "G003 client control reliability",
+        "obligation": "Newest-wins epoch ACK; NeedsIdr latched until decoded-key ack; RequestIdr mirror + 100/250/500ms retries then RestartIce then Failed; no control silently dropped",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["g003-client-surface"],
+        "adversarialCaseRefs": ["g003-ladder", "g003-latch", "g003-ack"]
+      },
+      {
+        "id": "g003-host-terminal",
+        "contractRef": "G003 sender fail-closed",
+        "obligation": "Every sender failure clears active state, yields exactly one typed terminal reason through src/api/stream.rs, rejects deltas while AwaitingIdr, terminates the session; no silent RTP fallback",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["g003-host-surface"],
+        "adversarialCaseRefs": ["g003-racing-exit", "g003-superseded", "g003-awaiting-idr", "g003-legacy"]
+      }
+    ],
+    "surfaceEvidence": [
+      {
+        "id": "g003-client-surface",
+        "contractRef": "G003 client session/control surface",
+        "surface": "api",
+        "invocation": "cargo test -p client-transport --lib (89 tests incl. ladder/latch/ack state machines)",
+        "verdict": "passed",
+        "artifactRefs": ["g003-control-report"]
+      },
+      {
+        "id": "g003-host-surface",
+        "contractRef": "G003 host sender/terminal surface",
+        "surface": "api",
+        "invocation": "cargo test -p streamer --bin streamer (224 tests incl. exit latch, liveness gate, terminal seam) plus common 83 code-table serialization",
+        "verdict": "passed",
+        "artifactRefs": ["g003-control-report"]
+      }
+    ],
+    "adversarialCases": [
+      {
+        "id": "g003-ladder",
+        "contractRef": "G003 client control reliability",
+        "scenario": "Repeated control-send failures; granted retry rung with nothing pending",
+        "expectedBehavior": "One RequestIdr mirror per episode; exact 100/250/500 escalation; moot episode closes instead of false RestartIce/Fail",
+        "verdict": "passed",
+        "artifactRefs": ["g003-control-report"]
+      },
+      {
+        "id": "g003-latch",
+        "contractRef": "G003 client control reliability",
+        "scenario": "Bare decode-flag NeedsIdr drained while sends are gated; recovery open across many ticks",
+        "expectedBehavior": "Unsent latch survives close(); persistent cadence until decoded-key ack",
+        "verdict": "passed",
+        "artifactRefs": ["g003-control-report"]
+      },
+      {
+        "id": "g003-ack",
+        "contractRef": "G003 client control reliability",
+        "scenario": "Newer cumulative ACK behind an unsent stale value; epoch change",
+        "expectedBehavior": "Newest value wins within an epoch; epoch change replaces the slot outright",
+        "verdict": "passed",
+        "artifactRefs": ["g003-control-report"]
+      },
+      {
+        "id": "g003-racing-exit",
+        "contractRef": "G003 sender fail-closed",
+        "scenario": "Eight concurrent claimants racing a dying sender; store landing between liveness load and take",
+        "expectedBehavior": "Exactly one typed terminal reason; liveness-gated take plus take-first call site make the discard pair unrepresentable",
+        "verdict": "passed",
+        "artifactRefs": ["g003-control-report"]
+      },
+      {
+        "id": "g003-superseded",
+        "contractRef": "G003 sender fail-closed",
+        "scenario": "Renegotiation/generation-bump retirement of the old sender task",
+        "expectedBehavior": "No terminal code, no IDR latch, no session teardown",
+        "verdict": "passed",
+        "artifactRefs": ["g003-control-report"]
+      },
+      {
+        "id": "g003-awaiting-idr",
+        "contractRef": "G003 sender fail-closed",
+        "scenario": "Deltas enqueued while needs_idr latched; key frame arrival",
+        "expectedBehavior": "Deltas rejected before any queue logic; keys always accepted and re-admit deltas via the consume path",
+        "verdict": "passed",
+        "artifactRefs": ["g003-control-report"]
+      },
+      {
+        "id": "g003-legacy",
+        "contractRef": "G003 sender fail-closed",
+        "scenario": "Dead FEC sender for a non-FEC-only (RTP) client",
+        "expectedBehavior": "Never terminates; recovery via IDR on the RTP path",
+        "verdict": "passed",
+        "artifactRefs": ["g003-control-report"]
+      }
+    ],
+    "blockers": []
+  },
+  "iteration": {
+    "status": "passed",
+    "evidence": "The host lane's HIGH blocker (drainable exit latch while live) and the client lane's two MEDIUM advisories were fixed by the parent with regression tests (take_terminal_exit_is_gated_on_liveness, needs_idr_latch_close_never_drops_an_unsent_bare_signal, moot-episode close), followed by full gate reruns and reviewer re-confirmation to CLEAR/APPROVE on both lanes.",
+    "fullRerun": true,
+    "rerunCommands": [
+      "cargo test -p transport-core -p client-transport -p streamer",
+      "cargo test -p common",
+      "cargo test -p app-native --features video --bins",
+      "npm run build-light",
+      "cargo clippy -p transport-core -p client-transport -p streamer -p app-native -p common --all-targets -- -D warnings"
+    ],
+    "blockers": []
+  }
+}

@@ -100,7 +100,10 @@ fn main() {
             },
         };
         unsafe {
-            SendInput(&[mk(KEYBD_EVENT_FLAGS(0)), mk(KEYEVENTF_KEYUP)], size_of::<INPUT>() as i32);
+            SendInput(
+                &[mk(KEYBD_EVENT_FLAGS(0)), mk(KEYEVENTF_KEYUP)],
+                size_of::<INPUT>() as i32,
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }

@@ -8,8 +8,15 @@ pub mod api_bindings;
 pub mod api_bindings_ext;
 pub mod buffer;
 pub mod config;
+pub mod desktop_control;
+pub mod file_transfer;
 pub mod input_wire;
 pub mod ipc;
+pub mod latency;
+pub mod media_caps;
+pub mod mic;
+pub mod pen_touch;
+pub mod surround;
 pub mod turn;
 
 /// Applies the permissions / restrictions to the current settings of the user.

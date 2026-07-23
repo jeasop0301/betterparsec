@@ -1,0 +1,20 @@
+[package]
+name = "parsec-vdd-keepalive"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "상시 Parsec 가상 디스플레이 유지 데몬 (의존성 0, 초경량). 이미 설치된 Parsec VDD 드라이버를 직접 제어."
+
+# 부모 betterparsec 워크스페이스에서 분리 — 메인 빌드/Cargo.lock 에 영향 없음.
+[workspace]
+
+[[bin]]
+name = "parsec-vdd-keepalive"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

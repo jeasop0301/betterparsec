@@ -1,0 +1,170 @@
+{
+  "architectReview": {
+    "architectureStatus": "CLEAR",
+    "productStatus": "CLEAR",
+    "codeStatus": "CLEAR",
+    "recommendation": "APPROVE",
+    "evidence": "Two-lane cleanup sweep of the frozen G004 diff. Watchdog/incident lane (agent://99-CleanG004Watchdog) found two P1 blockers (pause dropped by dog.start at ConnectionComplete; decorative generation guard with a constant-1 dead incident field) which were fixed — pause re-applied after start, real SessionGeneration lease threaded through supervisor/snapshot/latches with stale-latch drops — and re-confirmed ZERO BLOCKERS/CLEAR/APPROVE with all advisories resolved (arm-rationale doc corrected, catch-alls hardened, latch seam and 23-field CtIncidentSnapshot round-trip tests added, present_max_attempts 2->4 verified lockstep with the native ladder so the R8/egui Fallback rung is reachable). Native/matrix lane (agent://100-CleanG004NativeMatrix) reported ZERO BLOCKERS: heartbeats fed only at genuine progress points, edge-triggered stall relay loses/duplicates nothing, PresentStallLadder bounded/latched/reset, all fault-matrix cells assert real invariants, documented reaches honest, seeds fixed; its P2 tuning advisory and the test P3s (header overclaim, seeded no-op guards) were fixed by the parent.",
+    "commands": [
+      "agent://99-CleanG004Watchdog",
+      "agent://100-CleanG004NativeMatrix"
+    ],
+    "blockers": []
+  },
+  "executorQa": {
+    "status": "passed",
+    "e2eStatus": "passed",
+    "redTeamStatus": "passed",
+    "evidence": "Executor QA/red-team lane agent://101-G004QaRedTeam verified every G004 obligation with file:line evidence: per-stage independence and arming, heartbeat authenticity (decode/present cannot be faked by submission/queueing/symbol arrival — negative tests assert counters stay zero), routing correctness for all three stages, pause rebase, incident snapshot completeness with live values, fault-matrix determinism (fixed seeds, synthetic clocks), invariant strength (no delta while recovery open, discontinuity-recovery pairing, per-push 16MiB cap assertions, 100-generation isolation, bounded runtime), and honesty of documented modeling choices. All namedEvidence tests located verbatim; seven additional regression tests were added after the sweep fixes and pass in the final rerun.",
+    "e2eCommands": [
+      "cargo test -p transport-core -p client-transport -p streamer -p common",
+      "cargo test -p client-transport --test video_fault_matrix",
+      "cargo test -p app-native --features video --bins",
+      "node --experimental-default-type=module --test tests/fec_fault_matrix.test.mjs tests/fec_pipe.test.mjs tests/fec_decoder.test.mjs tests/fec_cross_vectors.test.mjs"
+    ],
+    "redTeamCommands": [
+      "cargo test -p client-transport --lib",
+      "cargo test -p client-transport --test video_fault_matrix"
+    ],
+    "artifactRefs": [
+      {
+        "id": "g004-watchdog-report",
+        "kind": "algorithm-boundary-test-report",
+        "path": "target/g004-watchdog-test-report.json",
+        "description": "Parent-run Rust/TS test/lint evidence with named G004 adversarial tests"
+      }
+    ],
+    "contractCoverage": [
+      {
+        "id": "g004-heartbeats",
+        "contractRef": "G004 three-stage supervision",
+        "obligation": "Independent receive/decoded-output/successful-present heartbeats, per-stage arming, pause rebase, generation guards, one action per tick",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["g004-watchdog-surface"],
+        "adversarialCaseRefs": ["g004-fake-heartbeat", "g004-pause-start", "g004-stale-latch"]
+      },
+      {
+        "id": "g004-routing",
+        "contractRef": "G004 stall routing",
+        "obligation": "receive->IDR/ICE/reconnect, decode->flush+IDR, present->recreate/R8-egui fallback/reconnect with bounded ladders",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["g004-native-surface"],
+        "adversarialCaseRefs": ["g004-present-ladder"]
+      },
+      {
+        "id": "g004-incident",
+        "contractRef": "G004 incident telemetry",
+        "obligation": "One snapshot per action with epoch/frame/symbol, parser/loss/reorder/queue/FEC bounds, ACK/IDR, three heartbeat ages, audio age, recovery outcome, live generation",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["g004-watchdog-surface"],
+        "adversarialCaseRefs": ["g004-snapshot-roundtrip"]
+      },
+      {
+        "id": "g004-matrix",
+        "contractRef": "G004 deterministic fault matrix",
+        "obligation": "clean/reorder/loss 0.1-5%/GE burst 20%/malformed/CRC/overload/epoch/failed-key/100-generation cells proving caps, no corrupt delta, no orphan, bounded runtime in Rust and TS",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["g004-matrix-surface"],
+        "adversarialCaseRefs": ["g004-noop-guards", "g004-cap-assertion"]
+      }
+    ],
+    "surfaceEvidence": [
+      {
+        "id": "g004-watchdog-surface",
+        "contractRef": "G004 supervisor/session/ABI surface",
+        "surface": "api",
+        "invocation": "cargo test -p client-transport --lib (104 tests incl. 9 supervisor + 4 latch-seam + snapshot round-trip)",
+        "verdict": "passed",
+        "artifactRefs": ["g004-watchdog-report"]
+      },
+      {
+        "id": "g004-native-surface",
+        "contractRef": "G004 native heartbeat/stall-consumption surface",
+        "surface": "algorithm",
+        "invocation": "cargo test -p app-native --features video --bins (90+6 tests incl. heartbeat negatives and ladder tests, FFmpeg/D3D11 executed)",
+        "verdict": "passed",
+        "artifactRefs": ["g004-watchdog-report"]
+      },
+      {
+        "id": "g004-matrix-surface",
+        "contractRef": "G004 fault matrix surface",
+        "surface": "algorithm",
+        "invocation": "cargo test -p client-transport --test video_fault_matrix (14 cells) + fec_rig 14 + node fec_fault_matrix 15 cells",
+        "verdict": "passed",
+        "artifactRefs": ["g004-watchdog-report"]
+      }
+    ],
+    "adversarialCases": [
+      {
+        "id": "g004-fake-heartbeat",
+        "contractRef": "G004 three-stage supervision",
+        "scenario": "Packet submission, gated delta, stale-epoch backlog, texture upload without Present",
+        "expectedBehavior": "Decoded/present counters stay at zero; only real FFmpeg output/successful Present feed them",
+        "verdict": "passed",
+        "artifactRefs": ["g004-watchdog-report"]
+      },
+      {
+        "id": "g004-pause-start",
+        "contractRef": "G004 three-stage supervision",
+        "scenario": "Pause active at ConnectionComplete (minimize during connect/reconnect)",
+        "expectedBehavior": "Pause survives dog.start; no escalation while minimized",
+        "verdict": "passed",
+        "artifactRefs": ["g004-watchdog-report"]
+      },
+      {
+        "id": "g004-stale-latch",
+        "contractRef": "G004 three-stage supervision",
+        "scenario": "Stall latch recorded under a stale generation polled after restart",
+        "expectedBehavior": "Stale latch dropped at poll; generation reflects the real session lease",
+        "verdict": "passed",
+        "artifactRefs": ["g004-watchdog-report"]
+      },
+      {
+        "id": "g004-present-ladder",
+        "contractRef": "G004 stall routing",
+        "scenario": "Repeated present stalls; recreate failures; recovery mid-ladder",
+        "expectedBehavior": "Bounded recreates (3) then R8/egui fallback reachable under default tuning (present_max_attempts=4) before Reconnect; success resets",
+        "verdict": "passed",
+        "artifactRefs": ["g004-watchdog-report"]
+      },
+      {
+        "id": "g004-snapshot-roundtrip",
+        "contractRef": "G004 incident telemetry",
+        "scenario": "Full 23-field IncidentSnapshot -> CtIncidentSnapshot conversion",
+        "expectedBehavior": "Every field round-trips with live values including lease generation",
+        "verdict": "passed",
+        "artifactRefs": ["g004-watchdog-report"]
+      },
+      {
+        "id": "g004-noop-guards",
+        "contractRef": "G004 deterministic fault matrix",
+        "scenario": "Fault injectors silently degrading to no-ops",
+        "expectedBehavior": "Seeded no-op guards fail the reorder/loss cells if the fault pipeline stops engaging",
+        "verdict": "passed",
+        "artifactRefs": ["g004-watchdog-report"]
+      },
+      {
+        "id": "g004-cap-assertion",
+        "contractRef": "G004 deterministic fault matrix",
+        "scenario": "Every push across GE/reorder/duplication cells checked against the 16MiB cap; cap constant pinned to the real receiver constant",
+        "expectedBehavior": "Panic on any over-cap retention; lockstep constant test",
+        "verdict": "passed",
+        "artifactRefs": ["g004-watchdog-report"]
+      }
+    ],
+    "blockers": []
+  },
+  "iteration": {
+    "status": "passed",
+    "evidence": "Both P1 sweep blockers (pause drop, decorative generation) plus the P2 present tuning and test-lane advisories were fixed with regression tests, followed by a full gate rerun (transport-core 151+14, client-transport 104+14, streamer 224, common 83, app-native 90+6, 97 Node FEC tests, clippy -D warnings clean) and reviewer re-confirmation to ZERO BLOCKERS/CLEAR/APPROVE.",
+    "fullRerun": true,
+    "rerunCommands": [
+      "cargo test -p transport-core -p client-transport -p streamer -p common",
+      "cargo test -p client-transport --test video_fault_matrix",
+      "cargo test -p app-native --features video --bins",
+      "node --experimental-default-type=module --test tests/fec_fault_matrix.test.mjs tests/fec_pipe.test.mjs tests/fec_decoder.test.mjs tests/fec_cross_vectors.test.mjs",
+      "cargo clippy -p transport-core -p client-transport -p streamer -p app-native -p common --all-targets -- -D warnings"
+    ],
+    "blockers": []
+  }
+}

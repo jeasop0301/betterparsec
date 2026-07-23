@@ -117,7 +117,9 @@ impl UpdateStatus {
             UpdateStatus::Idle => "No update staged".to_string(),
             UpdateStatus::Checking => "Checking staged update…".to_string(),
             UpdateStatus::Staged { version } => format!("Update staged: {version} (verified)"),
-            UpdateStatus::VerifyFailed { reason } => format!("Staged update failed verification: {reason}"),
+            UpdateStatus::VerifyFailed { reason } => {
+                format!("Staged update failed verification: {reason}")
+            }
         }
     }
 }

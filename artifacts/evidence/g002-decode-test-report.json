@@ -1,0 +1,93 @@
+{
+  "schemaVersion": 1,
+  "kind": "algorithm-boundary-test-report",
+  "goalId": "G002",
+  "contract": "G002 only: ordered Frame|Discontinuity events with epoch through frame_queue/capi/C header/native video; queue overflow atomically places reset before retained data; FFmpeg discontinuity flush clears pending output and gates deltas; only a successfully output matching-epoch decoded key acknowledges recovery (generation-keyed); failed/no-output key stays latched. G003 retry/fail-closed controls and G004 watchdogs are excluded.",
+  "commands": [
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "transport-core",
+        "-p",
+        "client-transport",
+        "-p",
+        "streamer"
+      ],
+      "exitCode": 0,
+      "summary": "transport-core 151 passed/1 ignored; client-transport 83 passed; streamer 215 passed; fec_rig 8 passed",
+      "namedEvidence": [
+        "frame_queue::tests::overflow_flushes_backlog_and_latches_idr",
+        "frame_queue::tests::multiple_discontinuities_stay_ordered_with_frames",
+        "frame_queue::tests::same_epoch_double_discontinuity_generation_prevents_stale_ack_aliasing",
+        "frame_queue::tests::overflow_recovery_generation_is_reported_by_push_frame_reporting_overflow",
+        "frame_queue::tests::discontinuity_recovery_is_visible_before_a_blocked_consumer_observes_the_reset",
+        "frame_queue::tests::wait_pop_compat_skips_discontinuities_but_never_reorders",
+        "frame_queue::tests::frame_epoch_survives_the_queue",
+        "capi::tests::discontinuity_enters_queue_before_later_frames_and_opens_recovery",
+        "capi::tests::queue_overflow_discontinuity_precedes_retained_frame_and_opens_recovery",
+        "capi::tests::same_epoch_double_discontinuity_generation_prevents_stale_ack_aliasing",
+        "capi::tests::fresh_negotiation_clears_open_recovery",
+        "capi::tests::c_abi_event_pull_and_decoded_key_ack",
+        "capi::tests::c_abi_event_pull_null_inputs_are_safe"
+      ]
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "app-native",
+        "--features",
+        "video",
+        "--bins"
+      ],
+      "exitCode": 0,
+      "summary": "app-native betterparsec 83 passed (FFmpeg linked; integration tests executed, not skipped); quality_probe 6 passed",
+      "namedEvidence": [
+        "g002_recovery_tests::admit_epoch_adopts_first_unit_epoch_instead_of_assuming_zero",
+        "g002_recovery_tests::drain_newest_poisons_the_pre_reset_unit_across_a_same_epoch_reset",
+        "g002_recovery_tests::drain_newest_processes_reset_before_later_retained_frame",
+        "g002_recovery_tests::clears_recovery_only_for_matching_epoch_real_key",
+        "g002_recovery_tests::clears_recovery_false_for_stale_epoch",
+        "g002_recovery_tests::delta_is_key_false_never_clears_recovery_even_if_mislabelled",
+        "g002_recovery_tests::on_meta_never_clears_latch_for_non_key_output",
+        "g002_recovery_tests::on_meta_clears_local_latch_without_ack_when_no_recovery_open",
+        "g002_recovery_tests::discontinuity_arms_wait_for_key_for_new_epoch",
+        "video::tests::flush_clears_reference_chain",
+        "video::tests::garbage_input_never_yields_a_frame",
+        "video::tests::decodes_synthetic_openh264_stream",
+        "g002_recovery_tests::drain_newest_trailing_reset_abandons_the_pre_reset_unit_and_returns_none"
+      ]
+    },
+    {
+      "argv": [
+        "cargo",
+        "clippy",
+        "-p",
+        "transport-core",
+        "-p",
+        "client-transport",
+        "-p",
+        "streamer",
+        "-p",
+        "app-native",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exitCode": 0,
+      "summary": "All changed packages pass; five pre-existing dependency warnings originate in vendor/moonlight-common-rust"
+    }
+  ],
+  "artifactRefs": [
+    "client-transport/src/frame_queue.rs",
+    "client-transport/src/capi.rs",
+    "client-transport/include/client_transport.h",
+    "app-native/src/video.rs",
+    "app-native/src/main.rs"
+  ],
+  "result": "passed"
+}

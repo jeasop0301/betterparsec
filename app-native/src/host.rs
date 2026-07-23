@@ -707,15 +707,30 @@ fps = 60
 
     #[test]
     fn health_state_label_covers_every_state_with_exact_text() {
-        assert_eq!(health_state_label(supervisor::SupervisorState::Stopped), "stopped");
-        assert_eq!(health_state_label(supervisor::SupervisorState::Starting), "starting");
-        assert_eq!(health_state_label(supervisor::SupervisorState::Healthy), "healthy");
-        assert_eq!(health_state_label(supervisor::SupervisorState::Degraded), "degraded");
+        assert_eq!(
+            health_state_label(supervisor::SupervisorState::Stopped),
+            "stopped"
+        );
+        assert_eq!(
+            health_state_label(supervisor::SupervisorState::Starting),
+            "starting"
+        );
+        assert_eq!(
+            health_state_label(supervisor::SupervisorState::Healthy),
+            "healthy"
+        );
+        assert_eq!(
+            health_state_label(supervisor::SupervisorState::Degraded),
+            "degraded"
+        );
         assert_eq!(
             health_state_label(supervisor::SupervisorState::Restarting),
             "restarting"
         );
-        assert_eq!(health_state_label(supervisor::SupervisorState::Failed), "failed");
+        assert_eq!(
+            health_state_label(supervisor::SupervisorState::Failed),
+            "failed"
+        );
     }
 
     #[test]
@@ -757,12 +772,21 @@ fps = 60
             !hint.contains("0.0.0.0"),
             "0.0.0.0 is not something a user can type into a browser: {hint}"
         );
-        assert!(hint.starts_with("http://"), "no certificate => http: {hint}");
+        assert!(
+            hint.starts_with("http://"),
+            "no certificate => http: {hint}"
+        );
         assert!(hint.ends_with(":8080/"), "port must be preserved: {hint}");
 
         let unspecified_v6: std::net::SocketAddr = "[::]:8080".parse().expect("addr");
         let hint_v6 = pairing_hint(unspecified_v6, true);
-        assert!(!hint_v6.contains("[::]"), "[::] must be substituted: {hint_v6}");
-        assert!(hint_v6.starts_with("https://"), "certificate => https: {hint_v6}");
+        assert!(
+            !hint_v6.contains("[::]"),
+            "[::] must be substituted: {hint_v6}"
+        );
+        assert!(
+            hint_v6.starts_with("https://"),
+            "certificate => https: {hint_v6}"
+        );
     }
 }

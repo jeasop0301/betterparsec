@@ -1,0 +1,97 @@
+{
+  "schemaVersion": 1,
+  "kind": "algorithm-boundary-test-report",
+  "goalId": "G005",
+  "contract": "G005 only: betterparsec.exe owns the embedded server and exactly one global Foundation process; embedded server owns per-session streamer through an injected typed StreamerLauncher and consumes the P0 terminal-event seam; Windows Job Object containment, bounded graceful stop, restart budgets/backoff, truthful global/session health, redacted consolidated logs, fake-child 100-cycle tests; central settings extended with client/host/both role and host paths/network/update fields with atomic child-config generation; backup-first hash/parse-verified identity migration with complete rollback, unknown-field preservation and corruption/interruption tests. Role UI and packaging/update are G006; live canary/soak is G007.",
+  "commands": [
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "app-native",
+        "--features",
+        "video",
+        "--bins"
+      ],
+      "exitCode": 0,
+      "summary": "app-native 121 passed (betterparsec) + 6 (quality_probe); includes supervisor spawn-concurrency/backoff-ladder/kill-only-stop/transient-retry tests, stderr secret-leak test, extra-args forwarding tests, nested-host unknown-key and corrupt-backup pin tests",
+      "namedEvidence": [
+        "supervisor::tests::one_hundred_start_stop_crash_cycles_stay_truthful",
+        "supervisor::tests::start_stop_never_leaves_an_orphan_process",
+        "supervisor::tests::crash_triggers_restart_within_budget",
+        "supervisor::tests::restart_budget_allows_up_to_max_then_denies",
+        "supervisor::tests::restart_budget_backoff_grows_exponentially",
+        "supervisor::tests::restart_budget_forgets_attempts_outside_the_window",
+        "supervisor::tests::job_container_creates_and_assigns_without_error",
+        "supervisor::tests::redact_strips_password_and_token_values",
+        "supervisor::tests::redact_strips_bearer_tokens",
+        "supervisor::tests::redact_is_multiline",
+        "identity::tests::migrate_copies_bytes_identically_and_cleans_up",
+        "identity::tests::interrupted_migration_rolls_back_to_last_known_good_on_next_start",
+        "identity::tests::corrupt_source_json_fails_verification_and_rolls_back",
+        "identity::tests::successful_migration_keeps_backup_of_prior_state",
+        "identity::tests::no_op_when_nothing_to_migrate",
+        "settings::tests::role_and_host_schema_roundtrip",
+        "settings::tests::legacy_store_missing_role_and_host_defaults_client",
+        "settings::tests::role_serializes_as_lowercase_strings",
+        "settings::tests::generated_child_config_is_deterministic",
+        "settings::tests::write_child_config_atomic_writes_content_and_leaves_no_temp_file",
+        "settings::tests::write_child_config_atomic_regeneration_is_idempotent",
+        "settings::tests::unknown_fields_preserved_roundtrip",
+        "host::tests::host_role_boots_and_stops",
+        "sunshine::tests::spawn_copies_identity_into_a_fresh_live_dir",
+        "sunshine::tests::stderr_tail_never_leaks_a_secret_to_last_error_or_disk",
+        "sunshine::tests::launch_args_append_extra_overrides_after_the_contract_args",
+        "supervisor::tests::concurrent_start_never_double_spawns_and_health_never_blocks_on_an_in_flight_spawn",
+        "supervisor::tests::poll_backoff_ladder_grows_when_children_never_stay_up_long_enough_to_stabilize",
+        "supervisor::tests::stop_skips_the_deadline_poll_and_kills_immediately_for_a_kill_only_child",
+        "supervisor::tests::transient_respawn_failure_retries_instead_of_permanently_failing",
+        "host::tests::extra_launch_args_forward_child_config_values_except_port",
+        "host::tests::sunshine_config_carries_settings_derived_extra_args",
+        "settings::tests::unknown_keys_nested_under_host_are_preserved",
+        "settings::tests::parse_error_backs_up_the_corrupt_file_before_regenerating"
+      ]
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "web-server",
+        "--lib"
+      ],
+      "exitCode": 0,
+      "summary": "web-server 44 passed including embedded_server_boots_serves_and_stops and spawn_embedded_* exercising the injected StreamerLauncher/LifecycleSink Data wiring end-to-end"
+    },
+    {
+      "argv": [
+        "cargo",
+        "clippy",
+        "-p",
+        "app-native",
+        "-p",
+        "web-server",
+        "-p",
+        "common",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exitCode": 0,
+      "summary": "Clean with zero blanket dead-code allows: the entire new API surface is consumed by real wiring (host start migration/child-config, background foundation-monitor thread, redacted log pump, streamer-events UI counter); five pre-existing dependency warnings originate in vendor/moonlight-common-rust"
+    }
+  ],
+  "artifactRefs": [
+    "src/lib.rs",
+    "src/api/stream.rs",
+    "app-native/src/supervisor.rs",
+    "app-native/src/host.rs",
+    "app-native/src/sunshine.rs",
+    "app-native/src/settings.rs",
+    "app-native/src/identity.rs",
+    "docs/design/config-model.md"
+  ],
+  "result": "passed"
+}

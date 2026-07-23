@@ -1,0 +1,21 @@
+{
+  "goal": "G014",
+  "title": "Host authority lease and rollback foundation",
+  "scope": "Headless only (per the story objective). The focused host-authority foundation module + fake-clock/journal tests. Live consumption by the host lifecycle (host.rs/supervisor/settings/api-stream) is the downstream physically-gated feature integration (G015 multi-monitor, G016 privacy, G017 virtual devices).",
+  "module": "app-native/src/host_authority.rs",
+  "invariants": {
+    "one_owner": "A different owner is denied while a live lease is held (a_different_owner_is_denied_while_the_lease_is_live).",
+    "bounded_renewal": "Each grant/renew sets deadline = now + lease_ms; no unbounded hold (acquire_grants_then_bounded_renews_and_rejects_stale_generation).",
+    "single_owner_generation": "Same owner refreshes only with a same-or-newer ControlGeneration; a stale generation is denied (shared with the G009 contract).",
+    "watchdog_expiry": "poll(now) expires a lease at/after its deadline and fails open to Local (watchdog_expiry_fails_open_and_lets_a_new_owner_in).",
+    "fail_open_local_control": "Local and Degraded are local control; only a live Held lease is not. Expiry/release/fault/reboot all return to local control.",
+    "operator_visible_degraded": "fault(reason) -> Degraded (local control retained), degraded_reason() exposes it, clear_fault() returns to Local (fault_is_degraded_local_control_and_blocks_acquire_until_cleared).",
+    "reboot_uninstall_recovery": "journal() records the holder (no absolute deadline); recover() ALWAYS fails open to Local and reports the dropped owner. Uninstall = empty journal = Local (journal_records_the_holder_and_recovery_always_fails_open)."
+  },
+  "gates": {
+    "cargo_test_app_native": "73 passed (7 host_authority fake-clock/journal tests; 66 pre-existing, no regression)",
+    "cargo_clippy_app_native_bin": "exit 0 (-D warnings)",
+    "git_diff_check": "clean"
+  },
+  "notes": "Pure and clock-injected (watchdog pattern): the caller supplies a monotonic millisecond timestamp; no timers. Reuses common::desktop_control ControlGeneration/DowngradeReason so one-owner/stale-generation/typed-reason semantics stay consistent with the G009 contract. Marked #[allow(dead_code)] (repo deferred-wire-in pattern) since live wiring is the downstream physically-gated stories."
+}

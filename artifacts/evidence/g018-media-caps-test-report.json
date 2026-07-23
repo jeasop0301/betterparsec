@@ -1,0 +1,26 @@
+{
+  "goal": "G018",
+  "title": "Media color and display capability schema",
+  "scope": "Headless contract predecessor for the media train (G019 HDR10, G020 AV1/HEVC 4:4:4, G021 4K120/144+VRR). Defines the fine-grained video-mode descriptors and the negotiation downgrade matrix; the actual HDR/codec/high-refresh encode/decode/present is the downstream physically-gated work.",
+  "module": {
+    "rust": "common/src/media_caps.rs",
+    "ts": "web/stream/media_caps.ts",
+    "ts_tests": "tests/media_caps.test.mjs"
+  },
+  "descriptors": "VideoCodec (H264/HEVC/AV1), ChromaSubsampling (4:2:0/4:4:4), BitDepth (8/10), ColorPrimaries (BT709/BT2020), TransferFunction (BT709/PQ/HLG), MatrixCoefficients (BT709/BT2020NCL), ColorRange (Limited/Full), HdrMetadata (maxCLL/maxFALL/luminance), VideoMode, Capabilities. All descriptor codes are stable with forward-compatible from_u8 (unknown -> None).",
+  "negotiation": "negotiate(client, host, requested) -> (VideoMode, Option<DowngradeReason>): keeps the exact request when both peers support it; otherwise downgrades codec (AV1>HEVC>H264 floor), 4:4:4->4:2:0, 10-bit->8-bit, HDR->deterministic SDR (BT.709 primaries/transfer/matrix, Limited range, no metadata), clamps refresh to the mutual max, and disables VRR — recording the first typed DowngradeReason. best_common_codec is the shared-bitset floor.",
+  "evidence_categories": {
+    "rust_ts_truth_vectors": "Identical negotiation outcomes pinned in Rust unit tests and TypeScript node tests (full match, HDR->SDR fallback, codec/chroma/bit-depth/refresh/vrr downgrade matrix, H.264 baseline floor).",
+    "downgrade_matrix": "codec_chroma_bitdepth_refresh_vrr_downgrade_matrix exercises every downgrade axis at once.",
+    "malformed_property": "descriptor_codes_round_trip_and_reject_unknown proves every descriptor's from_u8 rejects unknown codes and round-trips known ones; transfer.is_hdr() classification.",
+    "c_contract": "The Rust schema is the source of the generated C/TS bindings (existing capi/ts-rs mechanism); the descriptor codes are the C truth values."
+  },
+  "gates": {
+    "cargo_test_common": "107 passed (5 media_caps tests)",
+    "cargo_clippy_common": "exit 0 (-D warnings)",
+    "tsc_build_light": "clean",
+    "node_media_caps_tests": "5 passed",
+    "git_diff_check": "clean"
+  },
+  "notes": "Finer-grained than and complementary to the coarse shipped StreamColorspace / StreamSettings.hdr; does not replace the existing moonlight VideoFormats negotiation. Reuses the G009 DowngradeReason for a consistent typed downgrade vocabulary."
+}

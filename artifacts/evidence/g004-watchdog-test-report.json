@@ -1,0 +1,135 @@
+{
+  "schemaVersion": 1,
+  "kind": "algorithm-boundary-test-report",
+  "goalId": "G004",
+  "contract": "G004 only: three independent receive/decoded-output/successful-present heartbeats supervised outside workers, armed after ConnectionComplete plus per-stage first progress, pause/visibility rebasing, generation guards, one idempotent action per tick; receive->IDR/ICE/reconnect, decode->flush/IDR, present->device recreate/R8-egui fallback/reconnect routing; one incident snapshot with epoch/frame/symbol, parser/loss/reorder/queue/FEC bounds, ACK/IDR, three video heartbeats, audio heartbeat and recovery outcome; deterministic clean/reorder/loss/burst/malformed/CRC/overload/epoch/failed-key/100-generation fault matrix proving caps, no corrupt delta, no orphan, bounded runtime. Live two-machine cells are G007.",
+  "commands": [
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "transport-core",
+        "-p",
+        "client-transport",
+        "-p",
+        "streamer",
+        "-p",
+        "common"
+      ],
+      "exitCode": 0,
+      "summary": "transport-core 151+fec_rig 14; client-transport 104 lib; streamer 224; common 83",
+      "namedEvidence": [
+        "watchdog::supervisor_tests::decode_stage_stalls_independently_while_receive_and_present_progress",
+        "watchdog::supervisor_tests::present_stage_stalls_independently_while_receive_and_decode_progress",
+        "watchdog::supervisor_tests::receive_stall_is_routed_and_reported_before_downstream_stages",
+        "watchdog::supervisor_tests::decode_and_present_stages_stay_unarmed_until_first_progress",
+        "watchdog::supervisor_tests::pause_rebases_all_three_stage_clocks",
+        "watchdog::supervisor_tests::stale_generation_action_is_rejected_by_is_current",
+        "watchdog::supervisor_tests::stop_silences_all_three_stages",
+        "fec_rig tests::gilbert_elliott_partial_good_state_loss_still_drops_in_good_state",
+        "fec_rig tests::fault_matrix_cells_stay_within_the_16mib_cap_and_recover_something",
+        "fec_rig tests::sixteen_mib_cap_matches_the_real_receiver_cap",
+        "fec_rig tests::reorder_permutes_but_never_drops_or_duplicates",
+        "watchdog::supervisor_tests::pause_active_at_start_must_be_reapplied_by_caller_to_survive_start",
+        "watchdog::supervisor_tests::is_current_detects_a_generation_change_between_two_start_calls",
+        "session::tests::watchdog_status_drops_a_stall_latch_recorded_under_a_stale_generation",
+        "session::tests::watchdog_status_poll_decode_and_present_stall_are_poll_and_clear",
+        "session::tests::watchdog_status_note_counter_increments_drive_supervisor_progress",
+        "capi::tests::ct_incident_snapshot_round_trips_every_field_from_incident_snapshot",
+        "capi::tests::session_generation_value_reflects_the_lease_and_is_stable_across_uses"
+      ]
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "client-transport",
+        "--test",
+        "video_fault_matrix"
+      ],
+      "exitCode": 0,
+      "summary": "14 deterministic seeded end-to-end RxCore scenarios passed (run twice by the lane for determinism)",
+      "namedEvidence": [
+        "clean_stream_all_frames_deliver_in_order_zero_discontinuities",
+        "reorder_within_window_gates_then_still_makes_forward_progress",
+        "random_loss_0_1_percent_recovers_via_fec",
+        "random_loss_5_percent_recovers_via_fec",
+        "gilbert_elliott_burst_loss_20_percent_recovers_or_gates_cleanly",
+        "malformed_and_truncated_messages_are_silently_ignored",
+        "crc_corrupt_v2_frame_triggers_typed_discontinuity",
+        "queue_overflow_reset_precedes_its_retained_frame_and_opens_recovery",
+        "renegotiation_same_epoch_starts_a_clean_generation",
+        "renegotiation_new_epoch_starts_a_clean_generation",
+        "failed_key_never_acked_gates_deltas_forever",
+        "hundred_sequential_lease_generations_carry_no_orphan_state"
+      ]
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "app-native",
+        "--features",
+        "video",
+        "--bins"
+      ],
+      "exitCode": 0,
+      "summary": "app-native 90+6 passed incl. heartbeat-feed negative tests and stall-consumption ladders (D3D11 + FFmpeg present, tests executed)",
+      "namedEvidence": [
+        "g002_recovery_tests::on_unit_never_feeds_decoded_heartbeat_without_reaching_the_decoder",
+        "g002_recovery_tests::on_unit_never_feeds_decoded_heartbeat_for_a_delta_gated_while_armed",
+        "g002_recovery_tests::drop_unit_never_feeds_decoded_heartbeat_for_stale_epoch_backlog",
+        "g002_recovery_tests::on_decode_stall_arms_wait_for_key_and_requests_idr_without_a_generation",
+        "present::tests::present_stall_ladder_recreates_up_to_the_bound_then_falls_back",
+        "present::tests::present_stall_ladder_resets_on_a_real_present_success"
+      ]
+    },
+    {
+      "argv": [
+        "node",
+        "--experimental-default-type=module",
+        "--test",
+        "tests/fec_fault_matrix.test.mjs"
+      ],
+      "exitCode": 0,
+      "summary": "15 TS FecDecodePipe mirror cells passed incl. 16 MiB accounting cell (run twice by the lane for determinism)"
+    },
+    {
+      "argv": [
+        "cargo",
+        "clippy",
+        "-p",
+        "transport-core",
+        "-p",
+        "client-transport",
+        "-p",
+        "streamer",
+        "-p",
+        "app-native",
+        "-p",
+        "common",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exitCode": 0,
+      "summary": "All changed packages pass; five pre-existing dependency warnings originate in vendor/moonlight-common-rust"
+    }
+  ],
+  "artifactRefs": [
+    "client-transport/src/watchdog.rs",
+    "client-transport/src/session.rs",
+    "client-transport/src/capi.rs",
+    "client-transport/include/client_transport.h",
+    "client-transport/tests/video_fault_matrix.rs",
+    "app-native/src/main.rs",
+    "app-native/src/present.rs",
+    "transport-core/src/bin/fec_rig.rs",
+    "tests/fec_fault_matrix.test.mjs"
+  ],
+  "result": "passed"
+}

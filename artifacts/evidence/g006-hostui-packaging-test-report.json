@@ -1,0 +1,109 @@
+{
+  "goal": "G006 \u2014 Unified host role UI and complete-set packaging foundations",
+  "date": "2026-07-16",
+  "gates": {
+    "cargo test -p betterparsec-updater": {
+      "result": "passed",
+      "counts": "46 passed / 0 failed",
+      "highlights": [
+        "canon: JCS-subset canonicalization (sorted keys, no whitespace, minimal escaping, UTF-8 literal), float rejection loud + named in error",
+        "manifest: sign/verify roundtrip, tamper-component, tamper-metadata, wrong-key, mixed-version rejection, protocol match/mismatch, component-name traversal/absolute rejection",
+        "verify: correct set, tampered file, missing component, planted extra file (top-level and nested) rejected, manifest self allow-listed, idempotent re-verify",
+        "swap: decision-table recovery states, fresh install, upgrade-keeps-prev, interrupted-mid-swap exact previous-set restore, interrupted-after-move no-op, idempotent recovery, version sanitization, prev-dir collision timestamp fallback",
+        "lib: pinned dev trust root hex (independently derived), parse_trust_root_hex roundtrip/malformed/wrong-length"
+      ]
+    },
+    "cargo test -p app-native --features video --bins": {
+      "result": "passed",
+      "counts": "139 + 6 passed / 0 failed",
+      "highlights": [
+        "update:: idle/staged/wrong-key/protocol-mismatch/tamper at the UI-status boundary; staged_dir/manifest_path layout pin; cache Idle-fast-path, Checking-then-settle, invalidate-recheck",
+        "g006_role_tests:: role_transitions_never_disturb_an_active_client_session (via shared apply_role_action seam), role_label exact strings",
+        "host:: role_transition_covers_every_pair, role_wants_host, health_state_label exact text, lifecycle event exact fragments, pairing_hint http/https + unspecified-bind substitution, host_role_boots_and_stops with injected &Settings"
+      ]
+    },
+    "cargo test -p web-server --lib": {
+      "result": "passed",
+      "counts": "44 passed / 0 failed"
+    },
+    "cargo clippy -p app-native -p web-server -p betterparsec-updater -p common --all-targets -- -D warnings": {
+      "result": "passed",
+      "notes": "Clean; only the 5 pre-existing vendor moonlight-common warnings, unrelated to this work"
+    },
+    "package-portable.ps1 parse check": {
+      "result": "passed",
+      "notes": "PowerShell AST parse clean with the -HostBundle addition; client-only zip path byte-identical when the switch is omitted"
+    }
+  },
+  "constraints": {
+    "noPublishNoDeploy": "No network/publish path exists anywhere in the G006 diff: updater CLI is sign+swap local-only; package-portable.ps1 -HostBundle stages locally and never uploads; cf/src/worker.js has no host route (explicit comment defers to G007 P0 live closure).",
+    "uacNote": "tools/updater/build.rs embeds an asInvoker manifest (MSVC linker args) because Windows UAC installer detection otherwise blocks any *updater*.exe (os error 740), including the cargo test harness."
+  },
+  "cliReplay": {
+    "note": "Manually executed argv CLI replay of the real betterparsec-updater binary (cargo is outside the checkpoint validator's live-replay allowlist, so this is recorded as evidence rather than a re-executable replay record).",
+    "steps": [
+      {
+        "argv": [
+          "cargo",
+          "run",
+          "-q",
+          "-p",
+          "betterparsec-updater",
+          "--",
+          "sign",
+          "--staged",
+          "<tmp>/staged",
+          "--spec",
+          "<tmp>/component-spec.json",
+          "--set-version",
+          "2026.7.16-cli-replay",
+          "--out",
+          "<tmp>/staged/manifest.json"
+        ],
+        "exit": 0,
+        "stdout": "dev-signed manifest: <tmp>/staged/manifest.json (2 components, set_version \"2026.7.16-cli-replay\") -- DEV KEY ONLY, release signing happens outside this repo"
+      },
+      {
+        "argv": [
+          "cargo",
+          "run",
+          "-q",
+          "-p",
+          "betterparsec-updater",
+          "--",
+          "swap",
+          "--staged",
+          "<tmp>/staged",
+          "--install",
+          "<tmp>/install",
+          "--manifest",
+          "<tmp>/staged/manifest.json"
+        ],
+        "exit": 0,
+        "stdout": "swapped in set_version \"2026.7.16-cli-replay\" at <tmp>/install",
+        "verified": "installed contents byte-exact (betterparsec.exe='v2 app bytes', streamer.exe='v2 streamer bytes'); previous set retained byte-identically at install.prev-2026.7.16-cli-replay (betterparsec.exe='v1 app bytes')"
+      },
+      {
+        "argv": [
+          "cargo",
+          "run",
+          "-q",
+          "-p",
+          "betterparsec-updater",
+          "--",
+          "swap",
+          "--staged",
+          "<tmp>/staged",
+          "--install",
+          "<tmp>/install",
+          "--manifest",
+          "<tmp>/staged/manifest.json"
+        ],
+        "precondition": "fresh set re-signed, then betterparsec.exe tampered AFTER signing",
+        "exit": "nonzero",
+        "stderr": "Error: staged set failed verification -- refusing to swap / component \"betterparsec.exe\" size mismatch: manifest=12 actual=8",
+        "verified": "install left byte-identical (zero mutation)"
+      }
+    ]
+  }
+}

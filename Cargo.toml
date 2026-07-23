@@ -2,7 +2,7 @@ cargo-features = ["profile-rustflags"]
 
 [workspace]
 resolver = "3"
-members = ["common", "streamer", "transport-core", "client-transport", "app-native", "tools/updater", "./"]
+members = ["common", "streamer", "transport-core", "client-transport", "app-native", "tools/updater", "tools/betterparsec-kbdflt-core", "tools/betterparsec-installer", "input-broker", "./"]
 default-members = ["streamer", "transport-core", "./"]
 
 [profile.release]

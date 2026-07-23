@@ -1,0 +1,35 @@
+{
+  "goal": "G009",
+  "title": "Desktop control and ownership contract",
+  "scope": "Headless, off-by-default versioned capability schema. No live product wiring (that is the feature stories G010+); no physical activation (gated by G007).",
+  "module": {
+    "rust": "common/src/desktop_control.rs",
+    "ts": "web/stream/desktop_control.ts",
+    "ts_tests": "tests/desktop_control.test.mjs"
+  },
+  "domains": [
+    "contract base: ControlEnvelope (u8 version|u8 domain|u16 kind|u32 generation|u32 payload_len|payload, 12B header, 256KiB cap), ControlGeneration (RFC1982 wrap-safe), DowngradeReason (forward-compatible), ControlDomain, shared TransitionStatus, single-owner OwnershipLease",
+    "cursor authority: CursorOwner host/client",
+    "output identity/mode (display): ModeRequest, ModeResult (status + downgrade)",
+    "privacy/display lease: PrivacyRequest, transactional PrivacyState with protection bitflags",
+    "clipboard kinds: offer bitset + single-kind request",
+    "file-transfer control: FileOffer (bounded UTF-8 name), accept, cancel(reason), progress"
+  ],
+  "evidence_categories": {
+    "golden_vectors": "byte-pinned encode vectors identical across Rust and TS (envelope, display mode request/result, privacy state, file offer/cancel)",
+    "unknown_version": "decode_envelope rejects any version != 1",
+    "malformed": "truncation, unknown status/owner codes, reserved protection/clipboard bits, invalid UTF-8 name all rejected",
+    "oversize": "envelope payload over 256KiB and file name over 1024B refused on encode; oversize declared payload_len rejected on decode",
+    "wrap": "ControlGeneration.supersedes correct across the u32 wrap and half-range boundary",
+    "reconnect": "OwnershipLease.release admits a fresh (even lower) generation after a clean teardown",
+    "ownership_invariant": "stale generation is rejected by admit() without mutating the lease; generation-gated envelope test proves a stale Display mode-request is dropped"
+  },
+  "gates": {
+    "cargo_test_common": "100 passed (17 desktop_control tests)",
+    "cargo_clippy_common": "exit 0 (-D warnings)",
+    "tsc_build_light": "clean",
+    "node_desktop_control_tests": "14 passed",
+    "git_diff_check": "clean"
+  },
+  "notes": "Implemented as one dedicated contract module rather than scattered edits into common/src/config.rs / input_wire.rs / client-transport/src/cursor.rs / streamer/src/transport/cursor_wire.rs / web/stream/cursor_wire.ts (the planner's guessed surfaces). A single versioned schema module is cleaner and is the predecessor the feature stories (G010 cursor, G011 display, G015 privacy, G011/G012 clipboard/file) consume."
+}

@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "kind": "algorithm-boundary-test-report",
+  "goalId": "G001",
+  "contract": "G001 only: exact FEC v2/v1 negotiation and wire integrity, bounded rolling algebra, bounded frame reorder, Rust/TS parity, runtime carriage integration, and web FEC lifecycle ownership. G002-G004 are explicitly excluded.",
+  "commands": [
+    {
+      "argv": ["cargo", "test", "-p", "transport-core", "-p", "client-transport", "-p", "streamer"],
+      "exitCode": 0,
+      "summary": "transport-core 151 passed/1 ignored; client-transport 71 passed; streamer 215 passed; fec_rig 8 passed; doc tests passed",
+      "namedEvidence": [
+        "fec::tests::rt_stale_repair_ignored",
+        "fec::tests::rt_same_base_shorter_end_reordered_repair_ignored",
+        "fec::tests::rejected_forward_repair_leaves_nonempty_decoder_unchanged",
+        "fec::tests::decoder_rolls_after_repair_cap_and_recovers_late_loss",
+        "fec::tests::pin_decoder_handles_wrap_around_repair_window",
+        "fec::tests::pin_repair_window_cap_boundary_128_accepted_129_rejected",
+        "fec::tests::ack_wraps_and_rejects_half_range",
+        "video_rx::tests::epoch_transition_resets_ack_cadence_and_wrap_ack_progresses",
+        "video_rx::tests::same_batch_loss_and_keyframe_admits_the_keyframe",
+        "video_rx::tests::key_after_incomplete_earlier_delta_becomes_the_reorder_anchor_immediately",
+        "capi::tests::selected_v2_generation_requires_a_keyframe_before_delivery",
+        "capi::tests::selected_v2_uses_epoch_controls_and_rejects_other_wire_epochs",
+        "tests::selected_v2_without_sender_epoch_returns_error_without_v1_capabilities"
+      ]
+    },
+    {
+      "argv": ["npm", "run", "build-light"],
+      "exitCode": 0,
+      "summary": "TypeScript compilation and static copy passed"
+    },
+    {
+      "argv": ["node", "--experimental-default-type=module", "--test", "tests/fec_cross_vectors.test.mjs", "tests/fec_decoder.test.mjs", "tests/fec_pipe.test.mjs"],
+      "exitCode": 0,
+      "summary": "82 algorithm/wire/boundary/lifecycle tests passed",
+      "namedEvidence": [
+        "stale repair leaves decoder accounting and stats unchanged",
+        "decoder aggregate 16 MiB accounting accepts exact cap and evicts at cap plus one",
+        "selected v2 pipe rejects later v1 and malformed v2 packets without fallback",
+        "key after incomplete earlier delta becomes the reorder anchor immediately",
+        "v2 completed reorder retains four records and evicts on the fifth",
+        "v2 reassembly and reorder aggregate accepts 16 MiB and rejects cap plus one",
+        "resolveFecCapability: valid v2 tuple + no pipe -> typed fatal",
+        "resolveFecCapability: legacy/missing tuple + no pipe -> fallback",
+        "handleFecDataMessage: rejected ArrayBuffer submits once but never fires progress",
+        "handleFecDataMessage: accepted Blob normalizes to ArrayBuffer and fires progress once",
+        "cleanup() clears the real ACK timer, is idempotent, and forwards base cleanup exactly once"
+      ]
+    },
+    {
+      "argv": ["cargo", "clippy", "-p", "transport-core", "-p", "client-transport", "-p", "streamer", "--all-targets", "--", "-D", "warnings"],
+      "exitCode": 0,
+      "summary": "Changed packages passed; five pre-existing dependency warnings originate in vendor/moonlight-common-rust"
+    }
+  ],
+  "artifactRefs": [
+    "tests/fixtures/fec_vectors.json",
+    "transport-core/src/fec_wire.rs::cross_vector_tests",
+    "tests/fec_cross_vectors.test.mjs",
+    "tests/fec_decoder.test.mjs",
+    "tests/fec_pipe.test.mjs",
+    "web/stream/video/fec_session.ts"
+  ],
+  "result": "passed"
+}
